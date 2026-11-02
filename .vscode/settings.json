@@ -1,0 +1,27 @@
+{
+  // ── Python (uv) ─────────────────────────────────────────────
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.terminal.activateEnvironment": false,
+  "jupyter.jupyterServerType": "local",
+  "files.associations": { "*.Rmd": "rmd" },
+  "r.sessionWatcher": true,
+  "r.lsp.enabled": true,
+
+  // ── Terminals (VS Code and Positron) ────────────────────────
+  // Put ./env/bin first in integrated terminals: R, jupyter, samtools, compilers.
+  // Use `uv run` for Python.
+  "terminal.integrated.env.osx":   { "PATH": "${workspaceFolder}/env/bin:${env:PATH}" },
+  "terminal.integrated.env.linux": { "PATH": "${workspaceFolder}/env/bin:${env:PATH}" },
+  "r.rpath.mac":     "${workspaceFolder}/env/bin/R",
+  "r.rpath.linux":   "${workspaceFolder}/env/bin/R",
+  "r.rterm.mac":     "${workspaceFolder}/env/bin/R",
+  "r.rterm.linux":   "${workspaceFolder}/env/bin/R",
+  // --no-restore-data (not --no-restore) so R still reloads .Rhistory
+  "r.rterm.option": ["--no-save", "--no-restore-data"],
+
+  // ── Positron only ───────────────────────────────────────────
+  // Positron doesn't look in conda envs for R by default (experimental feature).
+  // With this on, ./env's R appears in the interpreter picker as "R 4.5.3 (Conda: env)";
+  // choose it by its path. VS Code ignores positron.* settings.
+  "positron.r.interpreters.condaDiscovery": true
+}

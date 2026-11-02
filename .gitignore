@@ -1,0 +1,53 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Environments
+/env/
+.venv/
+.micromamba/
+
+# Jupyter / marimo
+.ipynb_checkpoints/
+__marimo__/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# Inputs: symlinks are machine-specific; only the README is shared
+# (the reviewed data catalogue lives in metadata/catalogue_data.tsv)
+data/*
+!data/README.md
+
+# Everything generated (rendered reports, archive, targets store) is ignored; only the README and the
+# folder structure (a README in each folder) are shared
+output/**
+!output/**/
+!output/README.md
+!output/reports/latest/README.md
+!output/reports/archive/README.md
+!output/objects/README.md
+# the targets store, whole (targets puts its own .gitignore inside it, which would expose meta/)
+output/_targets/
+/.quarto/
+**/*.quarto_ipynb
+# Temporary files Quarto and knitr write next to a report while it renders (deleted afterwards)
+*.rmarkdown
+*.knit.md
+notebooks/**/*_files/
+
+# Machine-generated metadata (review it, then keep a copy without the auto_ prefix)
+metadata/auto_*
+
+# Container images: rebuilt from scripts/containers/*.def
+*.sif
+
+# Files that macOS and R create on their own
+.DS_Store
+Rplots.pdf

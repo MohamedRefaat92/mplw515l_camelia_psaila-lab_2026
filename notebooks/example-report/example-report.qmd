@@ -1,0 +1,42 @@
+---
+title: "Example report"
+subtitle: "Mock expression data: treated vs. control"
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r}
+#| label: setup
+#| include: false
+library(targets)
+source("tools/R/provenance.R")
+out <- report_dir()   # this report's folder in output/reports/latest/: save its figures and tables there
+```
+
+## Data
+
+```{r}
+samples <- tar_read(samples)
+samples
+```
+
+`r nrow(tar_read(counts))` genes measured in `r nrow(samples)` samples, normalised to log2 counts per million.
+
+## Genes that change most
+
+```{r}
+top <- head(tar_read(gene_summary), 20)
+write.csv(top, file.path(out, "top-genes.csv"), row.names = FALSE)
+top
+```
+
+## Treated vs. control
+
+```{r}
+#| fig-cap: "Mean expression per condition; red: genes changing more than two-fold."
+p <- tar_read(gene_plot)
+ggplot2::ggsave(file.path(out, "treated-vs-control.png"), p, width = 6, height = 5)
+p
+```
+
+{{< include ../_session-info.qmd >}}

@@ -1,0 +1,11 @@
+## Session info {.unnumbered}
+
+::: {.callout-note collapse="true"}
+## R session that rendered this report
+
+```{r}
+#| label: session-info
+#| echo: false
+sessionInfo()
+```
+:::

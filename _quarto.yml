@@ -1,0 +1,33 @@
+# Quarto project: reports in notebooks/ are rendered (by targets, via tar_quarto) into output/reports/latest/.
+project:
+  output-dir: output/reports/latest   # snapshots go to output/reports/archive/ (tools/snapshot-report.sh)
+  execute-dir: project        # code runs from the project root, so tar_read() finds _targets.yaml
+
+# Shown at the top of every report (a report can override these in its own front matter).
+# Set your own name and email here when you start a project from this template.
+author:
+  - name: Your Name
+    email: you@example.org
+date: today                   # the render date
+date-format: long
+language:
+  title-block-published: "Rendered"   # label for `date`: it is the render date, not a publication date
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-location: right
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true          # the "</> Code" menu: show/hide all code, view the source
+    df-print: paged           # data frames as paged, sortable tables
+    fig-width: 7
+    fig-height: 5
+    anchor-sections: true
+    smooth-scroll: true
+    embed-resources: false    # keep large reports fast; always share the whole report folder
+
+execute:
+  message: false              # keep package startup messages out of reports

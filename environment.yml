@@ -1,0 +1,29 @@
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  # R runtime only. renv owns every R package.
+  - r-base=4.5
+  # build toolchain for renv source installs
+  - compilers
+  - make
+  - cmake           # packages that build a bundled library (e.g. nloptr)
+  - pkg-config
+  # C libraries commonly needed by R packages
+  - libcurl
+  - openssl
+  - libxml2-devel   # libxml2 + xml2-config / libxml-2.0.pc (igraph, xml2); without it builds use a libxml2 from PATH
+  - zlib
+  - icu
+  - libuv           # fs (used by most of the tidyverse, devtools, renv tooling)
+  - zeromq          # IRkernel -> pbdZMQ
+  - gettext
+  - pandoc          # rmarkdown
+  # Jupyter front end (kernels come from uv and renv)
+  - jupyterlab
+  - jupyterlab-lsp
+  # Reports (rendered by targets via tar_quarto)
+  - quarto>=1.9
+  # CLI tools
+  - shellcheck

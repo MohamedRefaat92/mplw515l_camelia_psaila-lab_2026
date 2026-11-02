@@ -1,0 +1,43 @@
+<!-- Provenance: where this report comes from. A checklist (code, R packages, pipeline, input   -->
+<!-- data) coloured green / amber / red, then the input files and the pipeline graph.             -->
+<!-- Code: tools/R/provenance.R                                                                  -->
+
+```{r}
+#| label: provenance
+#| echo: false
+#| output: asis
+source("tools/R/provenance.R")
+prov <- collect_provenance()
+cat(render_summary(prov))
+```
+
+::: {.callout-note collapse="true"}
+## Input data
+
+```{r}
+#| label: provenance-data
+#| echo: false
+#| output: asis
+cat(render_inputs(prov))
+```
+:::
+
+<!-- Not collapsed: graphs drawn inside a collapsed section render blank -->
+::: {.callout-note collapse="false"}
+## Pipeline
+
+This report and the targets it depends on.
+
+```{r}
+#| label: provenance-pipeline
+#| echo: false
+#| output: asis
+cat(pipeline_mermaid(prov), "\n\n_Interactive: drag, zoom, click a node to highlight its neighbours_\n\n")
+```
+
+```{r}
+#| label: provenance-graph
+#| echo: false
+pipeline_graph(prov)
+```
+:::
