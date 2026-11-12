@@ -20,6 +20,23 @@ dependencies:
   - zeromq          # IRkernel -> pbdZMQ
   - gettext
   - pandoc          # rmarkdown
+  # C libraries the single-cell R packages compile against
+  - hdf5            # hdf5r
+  - gsl             # DirichletMultinomial (TFBSTools)
+  - glpk            # igraph
+  - fftw            # qqconf (metap)
+  - gdal            # sf (spdep)
+  - geos
+  - proj
+  - udunits2        # units (sf)
+  - imagemagick     # magick
+  - cairo           # Cairo
+  - fontconfig
+  - libgit2         # gert (devtools)
+  - bzip2           # Rhtslib (Rsamtools, BSgenome)
+  - xz
+  - zstd
+  - libnetcdf
   # Jupyter front end (kernels come from uv and renv)
   - jupyterlab
   - jupyterlab-lsp
@@ -27,3 +44,15 @@ dependencies:
   - quarto>=1.9
   # CLI tools
   - shellcheck
+  # Genomics tools (bioconda)
+  - samtools
+  - bwa
+  # fonts and images: systemfonts, textshaping, ragg (pulled in by devtools/pkgdown, ggplot2 extensions)
+  - freetype        # headers + freetype2.pc (./env has only the runtime libfreetype)
+  - harfbuzz        # textshaping
+  - fribidi         # textshaping
+  - libpng          # ragg
+  - libjpeg-turbo   # ragg
+  - libtiff         # ragg
+  - libwebp         # ragg
+  - expat
