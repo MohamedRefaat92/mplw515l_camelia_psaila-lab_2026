@@ -1,0 +1,124 @@
+project:
+  name: mpn_10x_camelia
+  description: MPN 10x scRNA-seq analysis
+
+# Inputs are file targets in _targets.R (data/, metadata/); these are where outputs go.
+paths:
+  output_dir: output
+  output_table_dir: output/tables
+  output_figure_dir: output/figures
+  objects_dir: output/objects
+
+qc:
+  mt_pattern: "^mt-"
+  rp_pattern: "^Rp[sl]"
+  hb_pattern: "^Hb[^pes]"
+  hsp_pattern: "^Hsp"
+  mito_percent_max: 7
+  hb_percent_max: 20
+  min_cells_per_gene: 20
+  min_counts_per_cell_per_gene: 3
+  hto_demux_positive_quantile: 0.99
+  stress_genes: [Fosb, Fos, Jun, Junb, Jund, Atf3, Egr1, Hspa1a, Hspa1b, Hsp90ab1,
+                 Hspa8, Hspb1, Ier3, Ier2, Btg1, Btg2, Dusp1]
+  compartment_qc:
+    Stroma:
+      nFeature_min: 400
+      nFeature_max: 5000
+      ribo_percent_min: 0
+      ribo_percent_max: 15
+    HSC:
+      nFeature_min: 2500
+      nFeature_max: 6000
+      ribo_percent_min: 5
+      ribo_percent_max: 30
+    MNC:
+      nFeature_min: 1200
+      nFeature_max: 6000
+      ribo_percent_min: 1
+      ribo_percent_max: 20
+
+features:
+  keep_biotypes: [protein_coding, lncRNA, TR_V_gene, TR_D_gene, TR_J_gene, TR_C_gene,
+                  IG_LV_gene, IG_V_gene, IG_J_gene, IG_D_gene]
+  # Features of the transduced LeGO vector's transcript, split out of RNA into the Transgene assay
+  # when a sample is loaded (read_10x_sample), so they can never reach variable features, PCA or the
+  # RNA QC metrics. WPRE-LTR is its 3' UTR and carries nearly all the reads; mCherry and DRE are far
+  # from the polyA site and are detected only where expression is high.
+  transgene_features: [mCherry, DRE, WPRE-LTR]
+
+reduction:
+  ref_assay: SCT
+  n_features: 3000
+  n_pca_dims: 50
+  k_neighbors: 30
+  n_umap_neighbors: 30
+
+clustering:
+  resolutions: [0.1, 0.3, 0.5, 0.7, 0.9, 1.0, 1.2, 1.3, 1.5]
+
+markers:
+  resolution: 0.1
+  min_pct: 0.25
+  logfc_threshold: 0.25
+  max_cells_per_ident: 500
+
+dim_grid:
+  dims: [15, 30, 50]
+  k: [20, 30]
+  res_scan: [0.1, 0.2, 0.3, 0.5, 0.6, 0.7]
+
+subclusters:
+  - name: hsc_c1
+    compartment: HSC        # matches compartment_qc spelling
+    resolution: 0.9
+    clusters: ["1"]
+
+annotation:
+  cell_types:
+    MSC: [Lepr, Cxcl12, Adipoq]
+    Fibroblast: [Dcn, Pdgfra, Pdgfrb]
+    Osteolineage: [Bglap, Bglap2, Alpl]
+    Chondrocyte: [Acan, Sox9]
+    Pericyte: [Myh11, Rgs5]
+    Neuronal: [Ncam1]
+    Endothelial_arteriolar: [Bcam, C1qtnf9]
+    Endothelial_sinusoidal: [Plvap, Lrg1]
+    HSC_MPP: [Cd34, Ly6a, Cd27]
+    Megakaryocyte: [Pf4]
+    T_cell: [Lck]
+    B_cell: [Cd79a, Ebf1, Vpreb3]
+    Eosinophil_Basophil_Mast: [Prss34, Fcer1a]
+    Erythroid: [Car2, Gata1]
+    Promonocyte: [Mpo, Elane]
+    Monocyte_Macrophage: [Ms4a6c]
+    Neutrophil: [Camp, Retnlg]
+
+plotting:
+  colours:
+    Mono: "#35978f"
+    Mono_pre: "#c7eae5"
+    Mono_CD16-: "#9cdff0"
+    Mono_CD16+: "#35978f"   # same as Mono
+    Mac: "#01665e"
+    HSPC: "#fcc5c0"
+    Gran_pre: "#dfc27d"
+    Gran_cycling: "#60824f"
+    Mast: "#a64027"
+    Baso/Eosino: "#fbdf72"
+    MK/Ery_pre: "#d4b9da"
+    MK/Ery_early: "#df65b0"
+    Ery_late: "#e31a1c"     # same as Ery
+    Ery: "#e31a1c"
+    MK: "#725ca5"
+    MK_late: "#725ca5"      # same as MK
+    B_cell: "#4393c3"
+    T_cell: "#74c476"
+    MSC: "#bf812d"
+    Fibroblast: "#e08214"
+    Osteolineage: "#fde0a2"
+    Chondrocyte: "#fee391"
+    Pericyte: "#998ec3"
+    Neuronal: "#d8daeb"
+    Endo_art: "#f4a582"
+    Endo_sin: "#d6604d"
