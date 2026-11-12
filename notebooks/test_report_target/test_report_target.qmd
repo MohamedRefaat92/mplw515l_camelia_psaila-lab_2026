@@ -1,0 +1,48 @@
+---
+title: "Test report target"
+subtitle: "Throwaway report to test quarto_report() in _targets.R — delete with its outputs"
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r}
+#| label: setup
+#| include: false
+library(targets)
+library(ggplot2)
+source("tools/R/provenance.R")
+out <- report_dir()   # this report's folder in output/reports/latest/
+```
+
+## Data
+
+The upstream target `test_report_data` (random values, made in the pipeline):
+
+```{r}
+df <- tar_read(test_report_data)
+head(df)
+summary(df)
+```
+
+## A function call inside the report
+
+```{r}
+summarise_groups <- function(d) {
+  aggregate(value ~ group, data = d, FUN = function(v) c(mean = mean(v), var = var(v)))
+}
+summarise_groups(df)
+```
+
+## Plot
+
+```{r}
+#| fig-cap: "Random values per group."
+p <- ggplot(df, aes(group, value, fill = group)) +
+  geom_violin(alpha = 0.5) +
+  geom_jitter(width = 0.15, size = 1) +
+  theme_minimal()
+ggsave(file.path(out, "test-plot.png"), p, width = 6, height = 4)
+p
+```
+
+{{< include ../_session-info.qmd >}}

@@ -1,0 +1,4 @@
+# Environment variables Quarto sets for every render in this project (pipeline, Positron preview, CLI).
+# Quarto keeps its SASS cache in a SQLite file under $XDG_CACHE_HOME (default ~/.cache), and SQLite
+# cannot open it on GPFS ("unable to open database file: .../sass.kv"): use the node's local /tmp.
+XDG_CACHE_HOME=/tmp/${USER}/xdg-cache

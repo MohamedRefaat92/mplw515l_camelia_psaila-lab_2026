@@ -1,0 +1,86 @@
+---
+title: "deMULTIplex2 diagnostics"
+subtitle: "Per-tube HTO assignment plots, drawn from the stored demultiplexing results"
+---
+
+{{< include ../_provenance.qmd >}}
+
+deMULTIplex2 (`demultiplexTags()`, run per tube in `demux_res_<compartment>`) writes these plots
+to a PDF; the pipeline discards that PDF and keeps the full result instead, so the plots are
+redrawn here from it (`dm2_summary_plot()`, `dm2_diagnostic_plots()` in `src/R/scrna-seq_utilities.R`).
+
+- **Summary**: UMAP of the HTO counts, coloured by the final assignment (tag, multiplet, negative)
+  and by the number of tags called per cell.
+- **Per tag**: the EM fit for one tag: tag UMIs against cosine similarity and total UMIs, the
+  residual, and the posterior probability of being tag-positive (called if > 0.5), on the UMAP too.
+
+```{r}
+#| label: setup
+#| include: false
+library(targets)
+source("src/R/scrna-seq_utilities.R")
+
+demux <- list(
+  Stroma = tar_read(demux_res_stroma),
+  HSC    = tar_read(demux_res_hsc),
+  MNC    = tar_read(demux_res_mnc)
+)
+
+draw <- function(g) { grid::grid.newpage(); grid::grid.draw(g) }
+```
+
+## Assignment counts
+
+```{r}
+#| label: counts
+counts <- do.call(rbind, lapply(names(demux), function(cmp) {
+  do.call(rbind, lapply(names(demux[[cmp]]), function(rx) {
+    tab <- table(demux[[cmp]][[rx]]$assign_table$droplet_type)
+    data.frame(compartment = cmp, tube = rx,
+               singlet   = as.integer(tab["singlet"]),
+               multiplet = as.integer(tab["multiplet"]),
+               negative  = as.integer(tab["negative"]))
+  }))
+}))
+counts[is.na(counts)] <- 0L
+counts$singlet_pct <- round(100 * counts$singlet / rowSums(counts[, c("singlet", "multiplet", "negative")]), 1)
+counts
+```
+
+## Summary per tube
+
+```{r}
+#| label: summary
+#| output: asis
+#| fig-width: 15
+#| fig-height: 8
+cat("::: {.panel-tabset}\n\n")
+for (cmp in names(demux)) for (rx in names(demux[[cmp]])) {
+  cat("## ", cmp, " — ", rx, "\n\n", sep = "")
+  draw(dm2_summary_plot(demux[[cmp]][[rx]]))
+  cat("\n\n")
+}
+cat(":::\n")
+```
+
+## Per-tag diagnostics
+
+```{r}
+#| label: diagnostics
+#| output: asis
+#| fig-width: 15
+#| fig-height: 8
+cat("::: {.panel-tabset}\n\n")
+for (cmp in names(demux)) for (rx in names(demux[[cmp]])) {
+  cat("## ", cmp, " — ", rx, "\n\n", sep = "")
+  plots <- dm2_diagnostic_plots(demux[[cmp]][[rx]])
+  for (tag in names(plots)) {
+    cat("**", tag, "**\n\n", sep = "")
+    draw(plots[[tag]])
+    cat("\n\n")
+  }
+}
+cat(":::\n")
+```
+
+{{< include ../_session-info.qmd >}}

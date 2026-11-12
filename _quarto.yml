@@ -2,12 +2,19 @@
 project:
   output-dir: output/reports/latest   # snapshots go to output/reports/archive/ (tools/snapshot-report.sh)
   execute-dir: project        # code runs from the project root, so tar_read() finds _targets.yaml
+  # The project's files are the pipeline's reports only. Quarto reads every file in the project for
+  # each render, so the exploration notebooks and the archive stay out: they run interactively, and
+  # a broken or unrunnable one there would otherwise stop every report.
+  render:
+    - "notebooks/*/*.qmd"
+    - "!notebooks/exploration/"
+    - "!notebooks/archive/"
 
 # Shown at the top of every report (a report can override these in its own front matter).
 # Set your own name and email here when you start a project from this template.
 author:
-  - name: Your Name
-    email: you@example.org
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
 date: today                   # the render date
 date-format: long
 language:
