@@ -67,6 +67,11 @@ if [[ -s $work/support.fa ]]; then
   $bwa samse "$index" "$work/support.sai" "$work/support.fa" > "$work/support.sam"
 fi
 
+# The 5' channel, same treatment as discovery: these clips are long enough to place on their own.
+if [[ -s $work/five_prime.fa ]]; then
+  $bwa mem -k 16 -t "$threads" "$index" "$work/five_prime.fa" > "$work/five_prime.sam"
+fi
+
 echo "=== 3/3 call the sites ==="
 $rscript scripts/R/call-integration-sites.R call "$out" "$gtf"
 

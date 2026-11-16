@@ -40,6 +40,16 @@ if (stage == "extract") {
   n_disc <- write_clip_fasta(classified, "discovery", file.path(work, "discovery.fa"))
   n_supp <- write_clip_fasta(classified, "support",   file.path(work, "support.fa"))
   message("=== discovery clips: ", n_disc, "   support clips: ", n_supp)
+
+  # Second channel: the provirus's 5' junction, read off the same BAMs.
+  five <- lapply(tubes, function(tube) {
+    bam <- file.path(bam_dir, paste0("cellranger_", tube), "sample_alignments.bam")
+    classify_five_prime_clips(read_five_prime_clips(bam, tube))
+  })
+  five <- dplyr::bind_rows(five)
+  readr::write_csv(clip_waterfall(five), file.path(out, "clip_waterfall_5p.csv"))
+  n_five <- write_clip_fasta(five, "discovery", file.path(work, "five_prime.fa"))
+  message("=== 5-prime clips: ", n_five)
   print(as.data.frame(clip_waterfall(classified)), row.names = FALSE)
 
 } else {
@@ -47,8 +57,9 @@ if (stage == "extract") {
   tubes <- readLines(file.path(work, "tubes.txt"))
   stopifnot(file.exists(gtf))
 
-  discovery <- read_bwa_hits(file.path(work, "discovery.sam"))
-  support   <- read_bwa_hits(file.path(work, "support.sam"))
+  discovery <- read_bwa_hits(file.path(work, "discovery.sam"), channel = "three_prime")
+  support   <- read_bwa_hits(file.path(work, "support.sam"),   channel = "three_prime")
+  five      <- read_bwa_hits(file.path(work, "five_prime.sam"), channel = "five_prime")
   message(">>> ", nrow(discovery), " discovery and ", nrow(support),
           " support clips placed uniquely (MAPQ >= ", IS_DEFAULTS$min_mapq, ")")
 
@@ -57,6 +68,14 @@ if (stage == "extract") {
 
   site_table <- summarise_sites(hits, gtf, tubes)
   cell_table <- summarise_cells(hits)
+
+  # Target-site duplication: the independent check on every called site.
+  tsd <- tsd_check(site_table, five)
+  readr::write_csv(tsd, file.path(out, "tsd_check.csv"))
+  if (nrow(tsd)) {
+    message("=== target-site duplication (expect delta = 4)")
+    print(as.data.frame(tsd), row.names = FALSE)
+  }
 
   readr::write_csv(site_table, file.path(out, "integration_sites.csv"))
   readr::write_csv(cell_table, file.path(out, "cell_site_assignments.csv"))

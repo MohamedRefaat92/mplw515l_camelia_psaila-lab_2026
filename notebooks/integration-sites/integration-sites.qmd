@@ -151,6 +151,7 @@ waterfall   <- readr::read_csv(file.path(sites_dir, "clip_waterfall.csv"), show_
 sites       <- readr::read_csv(file.path(sites_dir, "integration_sites.csv"), show_col_types = FALSE)
 assign      <- readr::read_csv(file.path(sites_dir, "cell_site_assignments.csv"), show_col_types = FALSE)
 summary_tbl <- readr::read_csv(file.path(sites_dir, "site_calling_summary.csv"), show_col_types = FALSE)
+tsd         <- readr::read_csv(file.path(sites_dir, "tsd_check.csv"), show_col_types = FALSE)
 
 # One factor with every site as a level, so a clone keeps the same colour in every panel even where
 # it has no cells. As a bare character it would be re-levelled per panel and the colours would shift.
@@ -347,6 +348,68 @@ sites %>%
 
 A site falling in an intergenic desert is not thereby wrong, but it is the kind of call to treat with
 more caution — particularly at low cell counts.
+
+## The other end of the provirus
+
+Everything above comes from one end of the provirus — reads running off its 3′ terminus. There is a
+second, independent channel at the **5′** end, and it exists for the same reason the ψ artefact does:
+reverse transcription makes both proviral LTRs identical and the contig keeps a single copy, so a
+read crossing the **host → 5′ LTR** junction also lands on that copy, clipping host sequence to its
+*left* instead of its right.
+
+The anchor is contig 2736. The contig reads `…GGGGGG AC TGGAAGG…`, and integrase removes that `AC`
+during 3′ processing, leaving the `TG` that partners the `CA` ending the contig at 3236 — the
+canonical retroviral inverted repeat.
+
+Unlike the 3′ end these anchors **smear**. The contig continues upstream of 2736, so host bases at the
+clip's end that happen to match it are absorbed into the alignment by greedy extension and the
+reported start slides left; a `GGGGGG` run at 2728–2733 makes this common. Anchoring on 2736 exactly
+returns one clip; accepting a ten-base window and adding the absorbed bases back returns 150. The 3′
+channel is immune because the contig simply stops at 3236, which is why 510 reads pile on one base
+there.
+
+### Target-site duplication
+
+This is the strongest check in the report. Integrase cuts the two host strands with a **5 bp
+stagger**, and repair fills the overhang, so those five bases are duplicated onto *both* flanks of
+every provirus:
+
+```
+         ┌──────── 5 bp duplicated ────────┐
+host ────┴──┬ CA ─── provirus ─── CA ┬─────┴──── host
+            └─ 5′ junction           └─ 3′ junction
+```
+
+The two junction coordinates therefore differ by **4** (a 5 bp shared span). Two independent read
+populations, from opposite ends of the provirus, must agree to the base. Nothing that merely
+resembles a junction can produce that.
+
+```{r tsd-table}
+tsd |>
+  dplyr::mutate(site_id = tidyr::replace_na(site_id, "—")) |>
+  DT::datatable(rownames = FALSE,
+                colnames = c("site", "chrom", "3′ junction", "5′ junction", "Δ", "verdict",
+                             "5′ reads", "5′ cells"),
+                options = list(dom = "t", pageLength = 15)) |>
+  DT::formatStyle("tsd", target = "row",
+                  backgroundColor = DT::styleEqual("PASS", "#e8f5e9"))
+```
+
+Every site with enough 5′ reads to test passes at exactly 4. The rest of the table is as informative
+as the passes:
+
+- **`no 3′ site nearby`** — a 5′ junction with no called site within 2 kb. These are candidate sites
+  the 3′ channel missed, not errors. They are reported rather than dropped.
+- **`distinct locus`** — a junction more than 50 bp from the nearest site. It is a separate feature
+  that happens to lie nearby, *not* a failed duplication for that site. chr19:38,932,385 carries more
+  reads than IS03's own 5′ junction while sitting 1.4 kb away, and remains unexplained; it is kept
+  out of the arithmetic deliberately.
+
+The check has already earned its place. It caught a coordinate bug in the 3′ channel — minus-strand
+junctions were being reported about 48 bp from their true position, and worse, clips from one
+junction were scattering far enough that clustering split them and dropped cells. Every filter in the
+3′ channel was blind to it, because each fragment still clustered tightly on its own. Only the
+disagreement with the 5′ end revealed it.
 
 ## Sharing between tubes
 

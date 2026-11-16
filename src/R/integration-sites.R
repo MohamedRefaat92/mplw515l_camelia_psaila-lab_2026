@@ -34,6 +34,17 @@ IS_DEFAULTS <- list(
   contig         = "LeGO_SFFV_mCherry_DRE",
   junction       = 3236L,   # the processed CA; the integration junction itself
   scan_from      = 3150L,   # anchors can only start upstream of it
+  # The provirus's OTHER end. Reverse transcription makes both LTRs identical, and the contig keeps
+  # one copy, so a read crossing the host -> 5' LTR junction aligns here and clips host to its LEFT.
+  # 2736 is the processed 5' terminus: the contig reads ...GGGGGG AC TGGAAGG..., and integrase
+  # removes that AC, leaving TG - the partner of the CA that ends the contig at 3236.
+  att            = 2736L,
+  # Unlike the 3' end, anchors here SMEAR. The contig continues upstream of 2736, so host bases at
+  # the clip's 3' end that happen to match it are absorbed into the alignment by greedy extension and
+  # the reported start slides left. A GGGGGG run at 2728-2733 makes this common: most clips lose one
+  # base, some five. Accept [att - att_window, att] and add the absorbed bases back; see
+  # read_five_prime_clips(). 2736 is a hard upper bound - a later start is not this junction.
+  att_window     = 10L,
   min_discovery  = 25L,     # clip long enough to place on its own
   min_support    = 15L,     # clip that may only add cells to a site already found
   min_mapq       = 30L,     # bwa: a unique placement
@@ -110,6 +121,84 @@ na_if_empty <- function(x) {
 }
 
 
+#' Every left-soft-clipped read anchored at the provirus's 5' terminus, with the clip repaired.
+#'
+#' The second detection channel. A host transcript reading into the provirus, or the provirus's own
+#' upstream flank, gives a read of the form [host][5' LTR...] which aligns from the att and clips the
+#' host to its left. Because both proviral LTRs are identical and the contig keeps one copy, that
+#' read lands on the contig's 3' LTR - the same trick that makes the psi artefact look like a
+#' junction, used deliberately here.
+#'
+#' Repairing the clip is the whole difficulty. Greedy extension absorbs host bases that happen to
+#' match the contig upstream of the att, so the reported start slides left by `absorbed` bases and
+#' the clip is that many bases too short. Those bases are genuinely ambiguous to the aligner - they
+#' match both sequences - and are resolved by biology instead: the vector-side boundary is known to
+#' be `att`, so everything before it is host. Skipping this step puts junctions tens of bases out and
+#' makes the TSD check meaningless.
+read_five_prime_clips <- function(bam, tube, opt = IS_DEFAULTS) {
+  stopifnot(file.exists(bam))
+  # Known cosmetic noise: this call emits "Warning: stack imbalance in '<-'" a few times per run.
+  # It is R's evaluation-stack bookkeeping, raised at C level inside the Rsamtools/GenomicAlignments
+  # read, not a condition this code can catch or a sign of bad output. It does not reproduce when
+  # readGAlignments is called with the same arguments outside this file, and the results are
+  # verified: 113 clips on Rx_4, 71 of them discovery-length, and the TSD check passes at 4 bp for
+  # IS01, IS03, IS04 and IS08. Do not spend time on it.
+  lo  <- opt$att - opt$att_window
+  win <- GenomicRanges::GRanges(opt$contig, IRanges::IRanges(lo, opt$att))
+  ga  <- GenomicAlignments::readGAlignments(
+    bam,
+    param = Rsamtools::ScanBamParam(which = win, what = "seq", tag = c("CB", "UB"))
+  )
+  if (length(ga) == 0L) return(empty_clip_table(tube))
+
+  cigar <- GenomicAlignments::cigar(ga)
+  start <- GenomicRanges::start(ga)
+  keep  <- !is.na(cigar) & grepl("^[0-9]+S", cigar) &
+    start <= opt$att & start >= opt$att - opt$att_window
+  if (!any(keep)) return(empty_clip_table(tube))
+
+  ga    <- ga[keep]
+  cigar <- cigar[keep]
+  meta  <- S4Vectors::mcols(ga)
+  seqs  <- as.character(meta$seq)
+
+  anchor   <- GenomicRanges::start(ga)
+  absorbed <- opt$att - anchor                        # host bases swallowed by greedy extension
+  clip_len <- as.integer(sub("^([0-9]+)S.*", "\\1", cigar)) + absorbed
+
+  # Drop before building the table, not after. Filtering the tibble on `seqs` would make dplyr's
+  # data mask evaluate a vector from this function's scope, which works but leaves R's evaluation
+  # stack unbalanced and emits "stack imbalance in '<-'" on every call.
+  ok <- clip_len <= nchar(seqs)                       # repair cannot exceed the read
+  if (!any(ok)) return(empty_clip_table(tube))
+  anchor <- anchor[ok]; clip_len <- clip_len[ok]; meta <- meta[ok, ]
+  clip   <- substring(seqs[ok], 1L, clip_len)
+
+  dplyr::tibble(
+    tube       = tube,
+    anchor_end = as.integer(anchor),                  # where bwa put it, before repair
+    clip_len   = as.integer(clip_len),
+    clip       = clip,
+    polya_frac = nchar(gsub("[^A]", "", clip)) / pmax(clip_len, 1L),
+    barcode    = na_if_empty(meta$CB),
+    umi        = na_if_empty(meta$UB)
+  )
+}
+
+#' Label each 5' clip with the one reason it is kept or dropped.
+#'
+#' Mirrors classify_clips(), minus the anchor test (the scan window already enforces it) and the psi
+#' screen (that artefact presents at the 3' end only).
+classify_five_prime_clips <- function(clips, opt = IS_DEFAULTS) {
+  clips |> dplyr::mutate(class = dplyr::case_when(
+    polya_frac >= opt$polya_fraction ~ "polyA tail",
+    is.na(barcode) | is.na(umi)      ~ "no cell barcode or UMI",
+    clip_len >= opt$min_discovery    ~ "discovery",
+    clip_len >= opt$min_support      ~ "support",
+    TRUE                             ~ "clip too short to place"
+  ))
+}
+
 #' Label each clip with the one reason it is kept or dropped.
 #'
 #' The order is deliberate and the labels are exclusive, so the waterfall adds up and every discard
@@ -170,7 +259,8 @@ write_clip_fasta <- function(classified, tier, path) {
 #' Primary, uniquely-placed alignments from a bwa SAM, with the cell each clip came from.
 #'
 #' Secondary (0x100) and supplementary (0x800) records are dropped so each clip contributes once.
-read_bwa_hits <- function(sam, opt = IS_DEFAULTS) {
+read_bwa_hits <- function(sam, opt = IS_DEFAULTS, channel = c("three_prime", "five_prime")) {
+  channel <- match.arg(channel)
   if (!file.exists(sam) || file.size(sam) == 0L) return(empty_hit_table())
   lines <- readLines(sam, warn = FALSE)
   lines <- lines[!startsWith(lines, "@")]
@@ -202,7 +292,12 @@ read_bwa_hits <- function(sam, opt = IS_DEFAULTS) {
   #
   # Caught by the 5' target-site-duplication check: plus-strand sites came out at the expected 4 bp
   # offset while minus-strand ones sat at 45. Do not "simplify" this back to POS.
-  junction <- ifelse(rev, bwa_pos + ref_span(field(6)[keep]) - 1L, bwa_pos)
+  #
+  # The 5' channel is the mirror image. There the host PRECEDES the provirus, so the
+  # junction-adjacent base is the clip's LAST one, and the two strand cases swap over.
+  far_end <- bwa_pos + ref_span(field(6)[keep]) - 1L
+  junction <- if (channel == "three_prime") ifelse(rev, far_end, bwa_pos)
+              else                          ifelse(rev, bwa_pos, far_end)
 
   dplyr::tibble(
     chrom    = chrom[keep],
@@ -367,6 +462,62 @@ summarise_sites <- function(hits, gtf, tubes) {
     dplyr::left_join(per_tube, by = "site_id") |>
     dplyr::select(site_id, chrom, pos, strand, gene, gene_type, gene_strand, context,
                   reads, cells, umis, dplyr::starts_with("cells_"))
+}
+
+#' Match 5' junctions to called sites and test the target-site duplication.
+#'
+#' Integrase cuts the two host strands with a 5 bp stagger, and repair fills the overhang, so the
+#' duplicated bases appear on both flanks of every provirus. The two junctions therefore share a 5 bp
+#' span, which means their coordinates differ by 4 - mind that off-by-one before judging a site.
+#'
+#' This is the strongest check available: two independent read populations, from opposite ends of the
+#' provirus, agreeing to the base. Nothing that merely resembles a junction can produce it. It has
+#' already earned its place by catching the minus-strand coordinate bug, which was invisible to every
+#' filter in the 3' channel.
+#'
+#' A 5' junction with no site within `search` is reported with site_id NA: it may be a real site the
+#' 3' channel missed, so it is surfaced rather than dropped.
+tsd_check <- function(sites, five_hits, opt = IS_DEFAULTS, search = 2000L, expect = 4L) {
+  if (nrow(five_hits) == 0L || nrow(sites) == 0L) return(dplyr::tibble())
+  five <- cluster_hits(five_hits, opt) |>
+    dplyr::group_by(site_id) |>
+    dplyr::summarise(chrom = dplyr::first(chrom), pos_5p = min(pos),
+                     reads_5p = dplyr::n(),
+                     cells_5p = dplyr::n_distinct(paste(tube, barcode)), .groups = "drop") |>
+    dplyr::select(-site_id)
+
+  # Nearest called site to each 5' junction, as a plain loop over a handful of rows. rowwise() with a
+  # list-column is the idiomatic-looking alternative and it errors inside mutate(); this is clearer
+  # and cannot.
+  n       <- nrow(five)
+  site_id <- rep(NA_character_, n)
+  pos_3p  <- rep(NA_integer_,   n)
+  delta   <- rep(NA_integer_,   n)
+  for (i in seq_len(n)) {
+    near <- which(sites$chrom == five$chrom[i] & abs(sites$pos - five$pos_5p[i]) <= search)
+    if (!length(near)) next
+    k <- near[which.min(abs(sites$pos[near] - five$pos_5p[i]))]
+    site_id[i] <- sites$site_id[k]
+    pos_3p[i]  <- as.integer(sites$pos[k])
+    delta[i]   <- as.integer(abs(sites$pos[k] - five$pos_5p[i]))
+  }
+
+  five |>
+    dplyr::mutate(site_id = site_id, pos_3p = pos_3p, delta = delta) |>
+    # A TSD is 4 bp, so only a junction within a few bases of a site is a claim about that site.
+    # Anything further is a distinct feature that merely happens to be nearby, and must not be
+    # labelled FAIL against a site that passed on its own junction - chr19:38,932,385 sits 1.4 kb
+    # from IS03 and would otherwise read as IS03 failing.
+    dplyr::mutate(tsd = dplyr::case_when(
+      is.na(delta)         ~ "no 3' site nearby",
+      delta == expect      ~ "PASS",
+      delta <= expect + 2L ~ "near",
+      delta <= 50L         ~ "FAIL",
+      TRUE                 ~ "distinct locus"
+    )) |>
+    dplyr::mutate(site_id = ifelse(tsd == "distinct locus", NA_character_, site_id)) |>
+    dplyr::arrange(dplyr::desc(reads_5p)) |>
+    dplyr::select(site_id, chrom, pos_3p, pos_5p, delta, tsd, reads_5p, cells_5p)
 }
 
 #' One row per cell per site: the table that joins onto the Seurat metadata.

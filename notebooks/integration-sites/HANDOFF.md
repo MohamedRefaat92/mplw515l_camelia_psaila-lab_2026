@@ -76,6 +76,9 @@ They are three windows onto **one mRNA**, not three genes. Do not sum or average
 
 ## 4. The method as it stands
 
+Two channels, both off the same BAMs. The 3' channel below is the primary one and defines the site
+list; the 5' channel (§4a) is a smaller, independent confirmation.
+
 ```
 BAM → extract clips → bwa → cluster → sites
 ```
@@ -98,6 +101,30 @@ The two-tier design is empirical: of 15–24 bp clips, only 24% reach MAPQ 30, a
 landed on a site the long clips had already found**. So the short tier recovers cells without being
 able to invent loci. Its real yield is modest — 15 extra cells, ~5%, not the ~30% a coarser earlier
 estimate suggested.
+
+## 4a. The 5' channel and the TSD check
+
+The provirus's other end. Both LTRs are identical and the contig keeps one copy, so a read crossing
+the **host → 5' LTR** junction also lands on that copy, clipping host to its *left*. Anchor: contig
+**2736**, the processed 5' terminus (`...GGGGGG AC TGGAAGG...`; integrase removes the `AC`, leaving
+the `TG` that partners the `CA` at 3236).
+
+**These anchors smear and the repair is mandatory.** The contig continues upstream of 2736, so host
+bases matching it are absorbed by greedy extension and the reported start slides left; a `GGGGGG` run
+at 2728–2733 makes this common. Anchoring on 2736 exactly returns **1 clip**; a ten-base window with
+the absorbed bases added back returns **150**. The 3' channel is immune only because the contig stops
+at 3236. Skip the repair and junctions land tens of bases out.
+
+`read_bwa_hits()` takes a `channel` argument because the convention inverts: the junction-adjacent
+base is the clip's *first* at the 3' end and its *last* at the 5' end, so the two strand cases swap.
+
+**Target-site duplication.** Integrase cuts with a 5 bp stagger and repair duplicates those bases
+onto both flanks, so a provirus's two junction coordinates differ by **4**. IS01, IS03, IS04 and IS08
+all pass at exactly 4. Junctions >50 bp from any site are reported as a distinct locus, not a
+failure. Written to `tsd_check.csv`.
+
+This is the strongest check available and it has already paid for itself — see the minus-strand entry
+in §8, which no 3'-channel filter could have caught.
 
 ## 5. Assumptions — be explicit about these
 
@@ -155,7 +182,7 @@ with any priming event. Left as "refuted, mechanism unresolved" rather than fitt
 Distinguishing RNA from DNA origin would need a DNase/RNase-treated control. Not worth it for a
 contaminant filterable by sequence.
 
-## 7. Results, and the three independent validations
+## 7. Results, and the four independent validations
 
 9 sites, 339 distinct cells labelled.
 
@@ -190,6 +217,12 @@ Three checks the pipeline never used as input, so they are genuinely independent
    | B0304 | IS05 |
 
    And the mapping agrees across compartments. Clone burden is strikingly uneven between animals.
+
+4. **Target-site duplication (§4a).** The two junctions of a provirus must differ by 4 bp. IS01,
+   IS03, IS04 and IS08 all do — two independent read populations from opposite ends agreeing to the
+   base. It also surfaced two candidates the 3' channel missed, chrX:100,691,117 and
+   chr14:62,948,717, and left chr19:38,932,385 unexplained: 25 reads, 1.4 kb from IS03, more than
+   IS03's own 5' junction.
 
 **Both wild-type tubes contribute zero cells to every site** — no false positives across 28,010 cells
 that never saw the vector. Rx_1/2/3/7 contribute 1–2 cells scattered across the large sites; that is
@@ -261,12 +294,20 @@ Read this before debugging anything. Several of these cost hours.
 
 1. **ψ artefact origin** — refuted priming hypothesis, mechanism unknown (§6). Low priority.
 2. **MNC labelled barcodes survive QC at 58% vs 68% overall**, opposite to HSC. Unexplained; n=128.
-3. **IS09** — probably noise, but not formally excluded.
+3. **IS09** — probably noise, and still not formally excluded: it has no 5' junction, so the TSD
+   check cannot rule on it either way.
 4. **IS05 is HSC-only with 23 cells, and its cells look spatially clustered** in the HSC UMAP. Not
    tested for significance; 20 points on a 50,000-cell map can cluster by chance.
 5. **The `≥3 cells and ≥3 UMIs` floor is arbitrary.** The waterfall is printed so it can be revisited.
+   A TSD-verified site arguably needs no floor at all: IS08 passes on one 5' read, and
+   chrX:100,691,117 passes while sitting below the floor in both channels.
 6. **Clonality proper** — site counts per compartment as a diversity measure is the intended
    destination and has not been attempted. Assumption 3 is the obstacle: clone sizes are samples.
+7. **chr19:38,932,385** — 25 reads, 1.4 kb from IS03, not explained by anchor absorption. Test
+   whether those clips share barcodes with IS03's (same clone, same provirus) and whether the host
+   side ends at a splice donor (a spliced vector-host fusion).
+8. **chrX:100,691,117 and chr14:62,948,717** — 5' junctions with no called 3' site. Real sites the
+   3' channel missed, or artefacts?
 
 ## 10. Files
 
@@ -277,7 +318,7 @@ Read this before debugging anything. Several of these cost hours.
 | `scripts/slurm/analysis/integration-sites.sh` | the job. ~1 min, 4.7 GB peak. |
 | `scripts/slurm/setup/bwa-index.sh` | one-off index build, ~50 min |
 | `notebooks/integration-sites/integration-sites.qmd` | the report |
-| `output/objects/integration-sites/*.csv` | 5 output tables |
+| `output/objects/integration-sites/*.csv` | 7 output tables, including `tsd_check.csv` |
 | `data_hub/10x_resources/reference_additions/README.md` | contig derivation and verification — **outside git, not version controlled** |
 
 ```bash
