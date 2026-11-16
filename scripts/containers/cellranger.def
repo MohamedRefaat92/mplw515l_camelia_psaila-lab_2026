@@ -1,0 +1,30 @@
+# Cell Ranger 10.1.0 for scripts/slurm/cellranger/cellranger-multi.sh: the release from 10x's download
+# page (https://www.10xgenomics.com/support/software/cell-ranger/downloads), unpacked onto
+# debian:bookworm-slim (pinned by digest, 2026-10-28).
+#
+#   sbatch scripts/slurm/setup/build-container.sh scripts/containers/cellranger.def \
+#     --build-arg CELLRANGER_TAR=/path/to/cellranger-10.1.0.tar.gz
+#
+# Cell Ranger's licence doesn't allow redistributing it: keep the image private.
+
+Bootstrap: docker
+From: debian@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+
+%arguments
+    CELLRANGER_TAR=cellranger-10.1.0.tar.gz
+    CELLRANGER_VERSION=10.1.0
+
+%files
+    {{ CELLRANGER_TAR }} /opt/cellranger.tar.gz
+
+%post
+    tar -xzf /opt/cellranger.tar.gz -C /opt
+    rm /opt/cellranger.tar.gz
+    ln -s /opt/cellranger-{{ CELLRANGER_VERSION }}/bin/cellranger /usr/local/bin/cellranger
+
+%test
+    # the release is the version this recipe is for
+    cellranger --version | grep -wF {{ CELLRANGER_VERSION }}
+
+%labels
+    org.opencontainers.image.version {{ CELLRANGER_VERSION }}

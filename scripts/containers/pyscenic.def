@@ -1,0 +1,17 @@
+# pySCENIC 0.12.1 (aertslab's image), pinned by digest so every rebuild gives the exact same image.
+# For scripts/slurm/analysis/scenic.sh. pySCENIC needs older numpy / pandas / dask than the project's
+# Python environment has.
+#
+#   sbatch scripts/slurm/setup/build-container.sh scripts/containers/pyscenic.def   (builds output/containers/pyscenic.sif)
+
+Bootstrap: docker
+From: aertslab/pyscenic@sha256:0c06b8b0a00117e1a4b61303e9ad775bf53c9e410d4c344151c15bf0d143a288
+
+%labels
+    org.opencontainers.image.ref.name aertslab/pyscenic:0.12.1
+
+%help
+    pySCENIC 0.12.1 (Python 3.10) with arboreto, ctxcore, loompy and dask.
+
+%test
+    pyscenic --help > /dev/null

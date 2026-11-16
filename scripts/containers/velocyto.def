@@ -1,0 +1,34 @@
+# velocyto 0.17.17 + samtools, for scripts/slurm/velocity/velocyto.sh. velocyto needs an older
+# numpy and a compiler to build, which don't belong in the project's Python environment.
+# Base image pinned by digest (python:3.10-slim-bookworm as of 2026-10-06).
+#
+#   sbatch scripts/slurm/setup/build-container.sh scripts/containers/velocyto.def   (builds output/containers/velocyto.sif)
+
+Bootstrap: docker
+From: python@sha256:5be5aaecb962a41567bc8041f1e9e3432cb085b037fe057f9a562630b2e4b370
+
+%files
+    scripts/containers/velocyto-run.py /opt/velocyto-run.py
+
+%post
+    set -eu
+    # unprivileged builds run as a fake root, where apt can't drop privileges to its own user
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/10sandbox
+    apt-get update
+    apt-get install -y --no-install-recommends build-essential samtools
+    rm -rf /var/lib/apt/lists/*
+    # velocyto compiles Cython code against numpy at install time
+    pip install --no-cache-dir numpy==1.26.4 cython==3.0.11
+    pip install --no-cache-dir --no-build-isolation velocyto==0.17.17
+    # the patched run command (see the header of scripts/containers/velocyto-run.py)
+    cp /opt/velocyto-run.py "$(python -c 'import os, velocyto; print(os.path.dirname(velocyto.__file__))')/commands/run.py"
+
+%labels
+    org.opencontainers.image.ref.name python:3.10-slim-bookworm
+
+%help
+    velocyto 0.17.17 (patched run command) and samtools, for RNA velocity counts from Cell Ranger BAMs.
+
+%test
+    velocyto --version
+    samtools --version | head -1
