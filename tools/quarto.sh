@@ -16,4 +16,16 @@ fi
 # shellcheck source=/dev/null
 source "$activate"
 export PATH="$root/env/bin:$PATH"
-exec "$root/env/bin/quarto" "$@"
+
+if [[ ${1:-} != render ]]; then
+  exec "$root/env/bin/quarto" "$@"
+fi
+
+# render: output/reports/latest/ is overwritten each time, so archive each rendered report
+# (tools/snapshot-report.sh) once Quarto succeeds, as tools/run-pipeline.sh does
+"$root/env/bin/quarto" "$@"
+for arg in "${@:2}"; do
+  if [[ $arg == *.qmd && $arg == *notebooks/* ]]; then
+    "$root/tools/snapshot-report.sh" "$(basename "$arg" .qmd)"
+  fi
+done
