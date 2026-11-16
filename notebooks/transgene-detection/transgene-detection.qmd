@@ -1,0 +1,521 @@
+---
+title: "Transgene detection — comparing mCherry, DRE and WPRE-LTR against the sort"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+# Introduction
+
+The transduced cells carry a lentiviral cassette, `SFFV → mCherry → P2A → DRE`, whose transcript runs
+on through WPRE and the 3′ LTR to a polyadenylation site in the LTR's R region. P2A means mCherry and
+DRE are translated as separate proteins from a **single mRNA**, so the three features annotated on the
+cassette are three windows onto one molecule, not three genes.
+
+| Feature | Position on the contig | Distance from the polyA site |
+|---------|------------------------|------------------------------|
+| `mCherry` | 1–708 | ~2,900 bases |
+| `DRE` | 781–1830 | ~1,360 bases |
+| `WPRE-LTR` | 1939–3236 | 0–1,300 bases |
+
+That last column is what this report is about. 10x 3′ chemistry attaches the cell barcode and UMI at
+the polyA tail during reverse transcription, and the final PCR amplifies only the fragment still
+carrying that barcode — so reads fall within roughly 300–600 bases of the tail. A feature's detection
+rate is therefore set as much by its position as by how much transcript the cell holds.
+
+These cells also come with an **independent ground truth**: they were FACS-sorted on mCherry protein
+before sequencing, and the sort fraction is recorded in `sample.name.long`. That lets us ask not just
+which feature detects most, but which detections are right.
+
+```{r setup}
+library(Seurat)
+library(targets)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(DT)
+library(Matrix)
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+#' Pull the Transgene counts, sort label and UMAP coordinates out of a processed object.
+#' Returns a small tibble so the Seurat objects need not be held in memory together.
+transgene_table <- function(srt) {
+  tg  <- Seurat::GetAssayData(srt, assay = "Transgene", layer = "counts")
+  emb <- Seurat::Embeddings(srt, "umap.nn")
+  tibble::tibble(
+    cell        = colnames(srt),
+    tube        = srt$tube,
+    sample      = srt$sample.name.long,
+    compartment = srt$compartment,
+    pass_cell   = srt$pass_cell,
+    UMAP_1      = emb[, 1],
+    UMAP_2      = emb[, 2]
+  ) %>%
+    dplyr::bind_cols(as.data.frame(as.matrix(Matrix::t(tg)), check.names = FALSE))
+}
+
+hsc <- transgene_table(tar_read(mpn_raw_processed_hsc)); gc()
+mnc <- transgene_table(tar_read(mpn_raw_processed_mnc)); gc()
+
+features <- c("mCherry", "DRE", "WPRE-LTR")
+
+cells <- dplyr::bind_rows(hsc, mnc) %>%
+  dplyr::mutate(
+    # The sort fraction, from the suffix the sample sheet carries
+    sorted = dplyr::case_when(
+      grepl("_positive$", sample)  ~ "FACS mCherry+",
+      grepl("_negative$", sample)  ~ "FACS mCherry−",
+      grepl("wildtype",   sample)  ~ "wild-type (no vector)"
+    ),
+    sorted = factor(sorted, levels = c("FACS mCherry+", "FACS mCherry−",
+                                       "wild-type (no vector)"))
+  )
+rm(hsc, mnc); gc()
+```
+
+## What the sort labels are
+
+```{r truth-table}
+cells %>%
+  dplyr::count(tube, compartment, sample, sorted, name = "cells") %>%
+  dplyr::arrange(tube) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10))
+```
+
+Three groups matter, and they are not interchangeable:
+
+- **wild-type** tubes never saw the vector, so any signal there is assay error — ambient transcript
+  or mismapping. These give the false-positive floor.
+- **FACS mCherry+** cells carry the vector *and* express mCherry protein above the sort gate.
+- **FACS mCherry−** cells failed that gate. That is a statement about protein, not about DNA or RNA,
+  which turns out to matter a great deal.
+
+
+# Comparing the three features
+
+```{r long-form}
+long <- cells %>%
+  tidyr::pivot_longer(dplyr::all_of(features), names_to = "feature", values_to = "umi") %>%
+  dplyr::mutate(feature = factor(feature, levels = features))
+
+per_sample <- long %>%
+  dplyr::group_by(tube, compartment, sorted, feature) %>%
+  dplyr::summarise(cells = dplyr::n(),
+                   pos   = sum(umi > 0),
+                   pct   = 100 * pos / cells,
+                   mean_umi_pos = ifelse(pos > 0, sum(umi) / pos, NA_real_),
+                   .groups = "drop")
+```
+
+```{r detection-plot, fig.width = 10, fig.height = 4.5}
+ggplot(per_sample, aes(tube, pct, fill = feature)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  facet_grid(~ sorted, scales = "free_x", space = "free_x") +
+  labs(x = NULL, y = "cells with ≥1 UMI (%)", fill = NULL,
+       title = "Detection by feature, tube and sort fraction") +
+  theme_bw() + theme(legend.position = "top",
+                     axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r detection-table}
+per_sample %>%
+  dplyr::mutate(label = sprintf("%d (%.2f%%)", pos, pct)) %>%
+  dplyr::select(tube, sorted, cells, feature, label) %>%
+  tidyr::pivot_wider(names_from = feature, values_from = label) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10))
+```
+
+## mCherry against DRE
+
+Both sit on the same mRNA, so in a cell expressing the cassette either could in principle be
+detected. They differ only in distance from the polyA site — DRE is about 1.5 kb closer.
+
+```{r mcherry-vs-dre}
+cells %>%
+  dplyr::group_by(tube, sorted) %>%
+  dplyr::summarise(
+    `mCherry only` = sum(mCherry > 0 & DRE == 0),
+    `DRE only`     = sum(mCherry == 0 & DRE > 0),
+    both           = sum(mCherry > 0 & DRE > 0),
+    `DRE / mCherry rate` = round(sum(DRE > 0) / pmax(1, sum(mCherry > 0)), 2),
+    `expected if independent` = round(sum(mCherry > 0) * sum(DRE > 0) / dplyr::n()),
+    .groups = "drop"
+  ) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10))
+```
+
+DRE is detected in more cells than mCherry, as its position predicts. But the two sets overlap far
+less than one might expect of a single transcript: a large share of mCherry-positive cells are
+DRE-negative and vice versa, and the "both" count, while above the figure expected if the two were
+sampled independently, is nowhere near nesting.
+
+That is informative rather than contradictory. At one or two UMIs per cell, each feature is a
+near-independent Bernoulli draw from the same small pool of molecules — detecting one tells you
+little about whether the other was also captured. Poor overlap is what shallow sampling of a shared
+transcript looks like, and it is a reason not to treat "mCherry⁻ but DRE⁺" as biologically
+meaningful.
+
+## Both against WPRE-LTR
+
+```{r vs-wpre}
+cells %>%
+  dplyr::group_by(tube, sorted) %>%
+  dplyr::summarise(
+    `WPRE-LTR+`                   = sum(`WPRE-LTR` > 0),
+    `mCherry+ and WPRE-LTR+`      = sum(mCherry > 0 & `WPRE-LTR` > 0),
+    `mCherry+ but WPRE-LTR−` = sum(mCherry > 0 & `WPRE-LTR` == 0),
+    `DRE+ but WPRE-LTR−`     = sum(DRE > 0 & `WPRE-LTR` == 0),
+    .groups = "drop"
+  ) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10),
+                caption = "Cells positive for a coding feature are almost always WPRE-LTR positive too")
+```
+
+The nesting is near-complete: a cell positive for mCherry or DRE is almost always positive for
+`WPRE-LTR`, while the reverse fails often. The three features behave as one measurement observed with
+three different sensitivities, ordered exactly by distance from the polyA site.
+
+## Distribution of each reporter across samples
+
+Most cells have no reporter UMI at all, so a violin over all cells collapses onto zero. The violins
+below show how many UMIs a cell carries **where the reporter is detected**; the label above each is
+the share of the sample's cells that have it (and how many cells that is).
+
+```{r sample-labels}
+# One tube per sample: label samples by compartment and sort fraction
+sort_short <- c("FACS mCherry+" = "mCh+", "FACS mCherry−" = "mCh−", "wild-type (no vector)" = "WT")
+long <- long %>%
+  dplyr::mutate(sample_label = factor(paste(compartment, sort_short[as.character(sorted)]),
+                                      levels = as.vector(outer(c("HSC", "MNC"),
+                                                               c("WT", "mCh−", "mCh+"), paste))))
+cells <- cells %>%
+  dplyr::mutate(sample_label = factor(paste(compartment, sort_short[as.character(sorted)]),
+                                      levels = levels(long$sample_label)))
+```
+
+```{r violin-per-sample, fig.width = 11, fig.height = 4.5}
+detected_lab <- long %>%
+  dplyr::group_by(feature, sample_label) %>%
+  dplyr::summarise(label = sprintf("%.1f%%\n(%d)", 100 * mean(umi > 0), sum(umi > 0)),
+                   .groups = "drop")
+
+# A violin needs enough cells to mean anything: below 20 positive cells, show the cells themselves
+min_violin <- 20
+pos <- long %>%
+  dplyr::filter(umi > 0) %>%
+  dplyr::add_count(feature, sample_label, name = "n_pos")
+
+ggplot(pos, aes(sample_label, umi, fill = feature)) +
+  geom_violin(data = ~ dplyr::filter(.x, n_pos >= min_violin),
+              scale = "width", alpha = 0.6, colour = NA) +
+  geom_boxplot(data = ~ dplyr::filter(.x, n_pos >= min_violin),
+               width = 0.15, outlier.shape = NA, fill = "white") +
+  geom_jitter(data = ~ dplyr::filter(.x, n_pos < min_violin), aes(colour = feature),
+              width = 0.15, height = 0.03, size = 1) +
+  geom_text(data = detected_lab, aes(sample_label, Inf, label = label),
+            vjust = 1.2, size = 2.8, inherit.aes = FALSE) +
+  facet_wrap(~ feature, nrow = 1) +
+  scale_x_discrete(limits = levels(long$sample_label)) +   # layers hold different samples: keep the order
+  scale_y_log10(expand = expansion(mult = c(0.05, 0.35))) +
+  labs(x = NULL, y = "UMIs per positive cell (log scale)",
+       title = "Reporter depth in positive cells, per sample",
+       subtitle = sprintf("label: %% of the sample's cells with ≥1 UMI (number of cells); points where fewer than %d cells", min_violin)) +
+  theme_bw() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Pairwise comparisons between reporters
+
+Each pair of reporters, sample by sample. Since the three are windows on one transcript, a cell with
+deep expression should show all of them; at shallow depth each is captured more or less on its own.
+
+```{r pairs-long}
+pairs <- list(c("mCherry", "DRE"), c("mCherry", "WPRE-LTR"), c("DRE", "WPRE-LTR"))
+
+pair_df <- lapply(pairs, function(p) {
+  cells %>%
+    dplyr::transmute(sample_label, pair = paste(p[1], "vs", p[2]),
+                     a = .data[[p[1]]], b = .data[[p[2]]])
+}) %>%
+  dplyr::bind_rows() %>%
+  dplyr::mutate(pair = factor(pair, levels = sapply(pairs, paste, collapse = " vs ")))
+```
+
+```{r pairs-scatter, fig.width = 12, fig.height = 7}
+# Counts are small integers: plot how many cells sit at each (a, b) combination
+pair_df %>%
+  dplyr::filter(a > 0 | b > 0) %>%
+  dplyr::mutate(a = pmin(a, 10), b = pmin(b, 10)) %>%
+  dplyr::count(pair, sample_label, a, b, name = "cells") %>%
+  ggplot(aes(a, b, size = cells, colour = log10(cells))) +
+  geom_point() +
+  facet_grid(pair ~ sample_label) +
+  scale_size_area(max_size = 6) +
+  scale_colour_viridis_c(guide = "none") +
+  scale_x_continuous(breaks = c(0, 5, 10), labels = c("0", "5", "≥10")) +
+  scale_y_continuous(breaks = c(0, 5, 10), labels = c("0", "5", "≥10")) +
+  labs(x = "UMIs of the first reporter (capped at 10)",
+       y = "UMIs of the second reporter (capped at 10)",
+       title = "UMIs of each reporter pair, per sample (cells with either reporter)") +
+  theme_bw() + theme(legend.position = "right")
+```
+
+```{r pairs-table}
+pair_stats <- pair_df %>%
+  dplyr::group_by(pair, sample_label) %>%
+  dplyr::summarise(
+    cells       = dplyr::n(),
+    `first+`    = sum(a > 0),
+    `second+`   = sum(b > 0),
+    both        = sum(a > 0 & b > 0),
+    jaccard     = both / pmax(1, sum(a > 0 | b > 0)),
+    `P(second+ | first+)` = both / pmax(1, `first+`),
+    `P(first+ | second+)` = both / pmax(1, `second+`),
+    # rank correlation among cells carrying either reporter (zeros everywhere else would dominate)
+    spearman    = if (sum(a > 0 | b > 0) >= 10)
+                    suppressWarnings(cor(a[a > 0 | b > 0], b[a > 0 | b > 0], method = "spearman"))
+                  else NA_real_,
+    .groups = "drop"
+  )
+
+pair_stats %>%
+  dplyr::mutate(dplyr::across(c(jaccard, `P(second+ | first+)`, `P(first+ | second+)`, spearman),
+                              ~ round(.x, 3))) %>%
+  DT::datatable(rownames = FALSE, filter = "top",
+                options = list(pageLength = 18, dom = "tip"),
+                caption = "Co-detection per reporter pair and sample")
+```
+
+```{r pairs-conditional, fig.width = 11, fig.height = 4}
+# A rate from a handful of cells is noise: leave out those conditioned on fewer than 20 cells
+min_cond <- 20
+pair_stats %>%
+  dplyr::mutate(`P(second+ | first+)` = ifelse(`first+`  >= min_cond, `P(second+ | first+)`, NA),
+                `P(first+ | second+)` = ifelse(`second+` >= min_cond, `P(first+ | second+)`, NA)) %>%
+  tidyr::pivot_longer(c(`P(second+ | first+)`, `P(first+ | second+)`),
+                      names_to = "direction", values_to = "p") %>%
+  ggplot(aes(sample_label, p, fill = direction)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+  facet_wrap(~ pair, nrow = 1) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(x = NULL, y = "co-detection", fill = NULL,
+       title = "How often one reporter is detected where the other is",
+       subtitle = paste0("e.g. for mCherry vs WPRE-LTR, P(second+ | first+) = share of mCherry+ cells that are WPRE-LTR+;\n",
+                         "no bar: fewer than ", min_cond, " cells to condition on (counts in the table above)")) +
+  theme_bw() +
+  theme(legend.position = "top", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Read the conditional rates against the positions on the transcript: detection of the reporter
+nearer the polyA site (`WPRE-LTR`, then `DRE`) given the farther one should be high in every sample
+that has real expression, while the reverse stays low. In the wild-type samples, where every count is
+assay error, the pairs should show no co-detection beyond chance.
+
+```{r umi-depth, fig.width = 9, fig.height = 4}
+long %>%
+  dplyr::filter(umi > 0, sorted %in% c("FACS mCherry+", "FACS mCherry−")) %>%
+  dplyr::mutate(umi_capped = pmin(umi, 10)) %>%
+  ggplot(aes(factor(umi_capped), fill = feature)) +
+  geom_bar(position = "dodge") +
+  facet_wrap(~ sorted + compartment, scales = "free_y") +
+  scale_y_log10() +
+  labs(x = "UMIs per positive cell (capped at 10)", y = "cells (log scale)", fill = NULL,
+       title = "How deeply each feature is sampled where it is detected") +
+  theme_bw() + theme(legend.position = "top")
+```
+
+# Agreement with the sort
+
+This is the part worth reading carefully. Using `WPRE-LTR` ≥ 1 UMI as the call:
+
+```{r confusion}
+calls <- cells %>%
+  dplyr::mutate(called = `WPRE-LTR` > 0)
+
+conf <- calls %>%
+  dplyr::group_by(compartment, sorted) %>%
+  dplyr::summarise(cells = dplyr::n(),
+                   called_pos = sum(called),
+                   pct = 100 * mean(called),
+                   .groups = "drop")
+
+conf %>%
+  dplyr::mutate(pct = round(pct, 2)) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10),
+                caption = "Transcript-level calls within each sort fraction")
+```
+
+Read down the `wild-type` rows first. Those cells have no vector in their genome at all, so every
+positive there is assay error, and the rate is the honest false-positive floor of the measurement.
+
+Now the two surprises:
+
+**Sorted-positive cells are often transcript-negative.** Only part of the `FACS mCherry+` fraction
+carries a detectable cassette transcript. These are not sorting errors: the cell was red enough to
+pass the gate, so the protein was there. Fluorescent protein accumulates and persists, whereas mRNA
+is present in a few copies and sampled shallowly — a cell can be brightly mCherry⁺ while its handful
+of transcript molecules are missed entirely. This is dropout, and it sets the ceiling on sensitivity.
+
+**Sorted-negative cells carry transcript well above the wild-type floor.** This is the observation
+worth pursuing, and the next section is about what it can and cannot mean.
+
+```{r metrics}
+fp_floor <- conf %>%
+  dplyr::filter(sorted == "wild-type (no vector)") %>%
+  dplyr::summarise(rate = max(pct)) %>% dplyr::pull(rate)
+
+conf %>%
+  dplyr::mutate(`fold over wild-type floor` = round(pct / fp_floor, 1),
+                pct = round(pct, 2)) %>%
+  dplyr::rename(`% called positive` = pct) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10),
+                caption = sprintf("Wild-type false-positive floor: %.2f%% of cells", fp_floor))
+```
+
+# Why do sorted-negative cells carry transcript?
+
+Four explanations are possible, and the UMI depth distinguishes them.
+
+**Ambient contamination within the tube.** Free transcript from lysed cells is captured in other
+droplets. It is tempting to rule this out by pointing at the wild-type tubes, but that reasoning does
+not hold: a wild-type tube contains no vector anywhere, so it bounds only the *cross-tube* and
+mismapping error. A sorted-negative tube that contains even a few genuinely transduced cells has its
+own internal ambient pool, and those cells express the cassette strongly. The wild-type floor
+therefore says nothing about how much ambient a vector-containing tube carries. Ambient produces
+almost exclusively 1-UMI cells.
+
+**Sort impurity** — gate leakage. Flow sorts are typically 95–99% pure, so a few percent of truly
+mCherry⁺ cells in the negative fraction is expected. Leaked cells are ordinary positive cells, so
+their UMI distribution should match the positive fraction.
+
+**Transduced but below the protein gate** — an integrated, transcribed cassette whose mCherry never
+accumulated enough to sort as red, through promoter silencing or low copy number. These would carry
+transcript at levels between ambient and the sorted positives.
+
+**Cre-mediated excision** — the cassette is loxP-flanked, so Cre removes promoter and payload
+together. This explains sorted-positive cells lacking transcript, since protein persists after the DNA
+is gone, but it cannot create transcript in a negative cell.
+
+The first three predict different depths, so the distribution decides between them:
+
+```{r negative-diagnosis, fig.width = 9, fig.height = 4}
+calls %>%
+  dplyr::filter(`WPRE-LTR` > 0, sorted %in% c("FACS mCherry+", "FACS mCherry−")) %>%
+  dplyr::mutate(umi_capped = pmin(`WPRE-LTR`, 12)) %>%
+  ggplot(aes(factor(umi_capped), fill = sorted)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~ compartment) +
+  labs(x = "WPRE-LTR UMIs per positive cell (capped at 12)",
+       y = "proportion of cells at this depth", fill = NULL,
+       title = "Depth of transcript in positive cells, by sort fraction",
+       subtitle = "leaked positives would match the FACS mCherry+ profile; sub-gate expressers sit lower") +
+  theme_bw() + theme(legend.position = "top")
+```
+
+```{r negative-summary}
+calls %>%
+  dplyr::filter(`WPRE-LTR` > 0) %>%
+  dplyr::group_by(compartment, sorted) %>%
+  dplyr::summarise(`positive cells` = dplyr::n(),
+                   `median UMI` = median(`WPRE-LTR`),
+                   `mean UMI` = round(mean(`WPRE-LTR`), 2),
+                   `% with ≥2 UMI` = round(100 * mean(`WPRE-LTR` >= 2), 1),
+                   `% with ≥5 UMI` = round(100 * mean(`WPRE-LTR` >= 5), 1),
+                   .groups = "drop") %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10))
+```
+
+If the sorted-negative positives were leaked positives, these rows would be indistinguishable. They
+are not: in the HSC compartment the sorted-positive fraction has a median of 2 UMIs with 63% of
+positive cells at ≥2, while the sorted-negative fraction sits at a median of 1 with only 15% reaching
+≥2 and almost none reaching 5. The negative fraction's signal is overwhelmingly single-UMI.
+
+That points at **ambient within the tube** as the dominant source, not a large population of
+sub-gate expressers. The cutoff scan below makes the same point more sharply: requiring 2 UMIs
+removes most of the sorted-negative signal while retaining most of the positive signal.
+
+This does not mean the sorted-negative fraction is free of transduced cells — a minority tail does
+reach higher depth, and those cells are real. It means the headline rate of cells with ≥1 UMI
+overstates that population badly, and any analysis treating ≥1 UMI as "transduced" would be mostly
+labelling ambient. The sort fractions remain the better genotype assignment; the transcript adds a
+way to find the leaked minority within them, not a replacement.
+
+# Where the signal sits on the UMAP
+
+```{r umap, fig.width = 11, fig.height = 4.5}
+calls %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::arrange(`WPRE-LTR` > 0) %>%
+  ggplot(aes(UMAP_1, UMAP_2, colour = `WPRE-LTR` > 0)) +
+  geom_point(size = 0.2, alpha = 0.6) +
+  scale_colour_manual(values = c(`FALSE` = "grey85", `TRUE` = "firebrick"),
+                      labels = c("not detected", "WPRE-LTR+")) +
+  facet_grid(compartment ~ sorted) +
+  labs(colour = NULL, title = "Transgene-positive cells across the QC-passing populations") +
+  theme_bw() + theme(legend.position = "top")
+```
+
+Whether the sorted-negative positives form a coherent region or scatter across the embedding is
+informative: leaked positives should sit wherever the positive population sits, while a distinct
+location would suggest a particular cell state loses or silences expression.
+
+# Choosing a call
+
+```{r threshold-scan}
+scan <- lapply(1:5, function(k) {
+  calls %>%
+    dplyr::group_by(sorted) %>%
+    dplyr::summarise(rate = 100 * mean(`WPRE-LTR` >= k), .groups = "drop") %>%
+    dplyr::mutate(cutoff = k)
+}) %>% dplyr::bind_rows()
+
+ggplot(scan, aes(cutoff, rate, colour = sorted)) +
+  geom_line() + geom_point() +
+  scale_y_log10() +
+  labs(x = "WPRE-LTR UMI cutoff", y = "cells called positive (%, log scale)", colour = NULL,
+       title = "Raising the cutoff trades sensitivity for specificity") +
+  theme_bw() + theme(legend.position = "top")
+
+scan %>%
+  tidyr::pivot_wider(names_from = sorted, values_from = rate) %>%
+  dplyr::mutate(dplyr::across(-cutoff, ~ round(.x, 3))) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+The wild-type column is the false-positive rate at each cutoff and the `FACS mCherry+` column the
+sensitivity, so the table is a small ROC — with the `FACS mCherry−` column showing how much of that
+fraction's signal survives.
+
+The step from 1 to 2 UMIs is the one that matters. It costs a modest share of the sorted-positive
+cells while removing the great majority of the sorted-negative signal, which is the behaviour
+expected if that signal is ambient rather than a population. Going beyond 2 buys little further
+specificity and keeps costing sensitivity.
+
+Use `WPRE-LTR` for the call — it is the only feature sensitive enough to threshold — at **≥2 UMIs**
+unless the downstream analysis specifically tolerates contamination in exchange for recall.
+
+# Caveats
+
+The three features are **not independent measurements**. They are three windows on one mRNA, so they
+must not be summed or averaged as separate genes. `WPRE-LTR` is the measurement; `mCherry` and `DRE`
+confirm the sequence is what it should be and, by their ordering, demonstrate the positional effect.
+
+A zero does not mean untransduced. It means no cassette transcript was captured, which covers
+untransduced cells, Cre-recombined cells that lost the cassette, silenced cells, and cells whose
+transcript was simply missed. Only the wild-type tubes are known to be vector-free.
+
+Counts are from `mpn_raw_processed_*`, before the QC filters are applied — the UMAP panel restricts
+to `pass_cell`, but the tables do not, so that the ambient floor is measured on the same unfiltered
+population throughout.
