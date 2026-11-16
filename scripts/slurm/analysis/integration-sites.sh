@@ -52,28 +52,31 @@ done
 
 tubes=$(tail -n +2 "$CR_LIBRARIES" | cut -d, -f1 | tr '\n' ' ')
 
-echo "=== 1/3 extract the clipped tails ==="
+echo "=== 1/5 extract the clipped tails ==="
 # shellcheck disable=SC2086  # tubes is a deliberate word-split list
 $rscript scripts/R/call-integration-sites.R extract "$out" "$PROJ/data" $tubes
 
-echo "=== 2/3 place them on the genome ==="
+echo "=== 2/5 place them on the genome ==="
 # bwa mem with a shortened seed: a 25-48 base query will not seed at the default 19.
 $bwa mem -k 16 -t "$threads" "$index" "$work/discovery.fa" > "$work/discovery.sam"
-
-# bwa aln for the short tier: it was written for reads this length and reports calibrated MAPQ
-# there, where mem becomes erratic. -n 1 allows one mismatch, -l 15 seeds the whole read.
-if [[ -s $work/support.fa ]]; then
-  $bwa aln -n 1 -o 0 -l 15 -t "$threads" "$index" "$work/support.fa" > "$work/support.sai"
-  $bwa samse "$index" "$work/support.sai" "$work/support.fa" > "$work/support.sam"
-fi
 
 # The 5' channel, same treatment as discovery: these clips are long enough to place on their own.
 if [[ -s $work/five_prime.fa ]]; then
   $bwa mem -k 16 -t "$threads" "$index" "$work/five_prime.fa" > "$work/five_prime.sam"
 fi
 
-echo "=== 3/3 call the sites ==="
-$rscript scripts/R/call-integration-sites.R call "$out" "$gtf"
+echo "=== 3/5 call the sites and build the mini-reference ==="
+$rscript scripts/R/call-integration-sites.R sites "$out" "$gtf" "$CR_REF/fasta/genome.fa"
+
+echo "=== 4/5 assign clips against the mini-reference ==="
+# A separate, tiny index: the called flanks only. -k 8 -T 12 because the search space is a few kb
+# rather than 2.7 Gb, so a far shorter clip is decisive here -- and because the real discriminator
+# is position, not score, read_mini_hits() requires the clip to land on the junction base exactly.
+$bwa index "$work/site_flanks.fa" 2>/dev/null
+$bwa mem -k 8 -T 12 -a -t "$threads" "$work/site_flanks.fa" "$work/assign.fa" > "$work/assign.sam"
+
+echo "=== 5/5 cell assignments and the TSD check ==="
+$rscript scripts/R/call-integration-sites.R assign "$out"
 
 echo "=== done ==="
 ls -l "$out"/*.csv

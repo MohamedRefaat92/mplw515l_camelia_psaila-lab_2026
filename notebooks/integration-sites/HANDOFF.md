@@ -91,16 +91,14 @@ Filter chain, in order (each clip counted once, under the first reason it meets)
 | not vector | clip starts `GTGGCGCCCGAACAGG` | see §6, this one is load-bearing |
 | not polyA | <80% A | |
 | has corrected CB and UB | | |
-| discovery tier | clip ≥25 bp | long enough to place alone; **defines** the site list |
-| support tier | clip 15–24 bp | may only **add cells** to a site discovery already found |
-| MAPQ | ≥30 | on the realigned clip |
+| discovery tier | clip ≥25 bp | long enough to place alone genome-wide; **defines** the site list |
+| assignment tier | clip ≥8 bp | placed against the mini-reference only; **adds cells**, see §4b |
+| MAPQ | ≥30 | on the realigned clip, discovery only |
 | cluster | single-linkage, 20 bp | junctions scatter a few bases because clips start wherever the read began |
 | site floor | ≥3 cells and ≥3 UMIs | the one genuinely arbitrary parameter |
 
-The two-tier design is empirical: of 15–24 bp clips, only 24% reach MAPQ 30, and **every one that did
-landed on a site the long clips had already found**. So the short tier recovers cells without being
-able to invent loci. Its real yield is modest — 15 extra cells, ~5%, not the ~30% a coarser earlier
-estimate suggested.
+Discovery and assignment are different questions. Discovery searches 2.7 Gb; assignment searches a
+few kb of already-called flanks and additionally requires an exact position. See §4b.
 
 ## 4a. The 5' channel and the TSD check
 
@@ -126,6 +124,32 @@ failure. Written to `tsd_check.csv`.
 This is the strongest check available and it has already paid for itself — see the minus-strand entry
 in §8, which no 3'-channel filter could have caught.
 
+## 4b. The mini-reference (cell assignment)
+
+Discovery asks "is there an integration anywhere in 2.7 Gb?"; assignment asks "does this clip match
+one of the flanks already called?". Treating those as one question, with one clip-length threshold,
+throws away most of the data.
+
+`write_site_flanks()` cuts ±200 bp around each **discovery-tier** site — seeding it from anything the
+assignment step produced would make the method confirm itself — and `read_mini_hits()` places clips
+against it. The discriminator is **position, not score**: a clip belongs to a site only if its
+junction-adjacent base lands on that site's junction base, at the offset carried in the sequence
+name. One accepted landing site out of ~400 per flank is what makes an 8 bp clip decisive.
+
+Result: cells labelled rise from 339 to **552**. Both wild-type tubes stay at **zero**.
+
+**Two traps, both hit:**
+
+- *Low-complexity flanks attract clips that belong nowhere.* JH584304.1:35,417 has a 23-base
+  homopolymer against 5–6 for every genuine site, and the mini-reference inflated it 3 → 14 cells —
+  all in mCherry-negative tubes, none in the two high-signal ones, 4.7× the gain real sites saw.
+  `max_homopolymer = 12` now keeps such a site out of the mini-reference; it is still reported from
+  discovery, with zero assigned cells.
+- *The two output tables can silently disagree.* The site list and its coordinates come from
+  discovery, but the cell counts must come from assignment. `update_site_counts()` rewrites them in
+  the assign stage; without it the site table reported only the cells that happened to carry a 25 bp
+  clip.
+
 ## 5. Assumptions — be explicit about these
 
 1. **The contig's last base is the processed viral terminus.** 3236 is hardcoded in `IS_DEFAULTS`. If
@@ -136,7 +160,7 @@ in §8, which no 3'-channel filter could have caught.
    of its rare read-through molecules happened to be sequenced. Most members of a real clone carry no
    label. **Clone sizes here are samples, not counts.**
 4. **Per-cell confidence is near-uniform and low.** 96% of assignments rest on a single UMI. Confidence
-   lives at the *site* level (123 independent cells for IS01), not the cell level. Do not use read
+   lives at the *site* level (202 independent cells for IS01), not the cell level. Do not use read
    depth to pick "high-confidence cells" — the variation is mostly PCR.
 5. **Repetitive flanks are silently lost.** A junction whose host sequence is repetitive yields MAPQ-0
    clips. Sites are enriched for integration into unique sequence, which partly confounds the
@@ -162,7 +186,21 @@ de-duplication that makes the contig usable is the same thing that makes this ar
 This is a worked example of a general trap: if the vector architecture changes, look for *any* other
 sequence that can present the LTR terminus as a left arm.
 
-**Origin, unresolved.** A scan of unplaced reads across plasmid 220–700 in Rx_4, Rx_5 and Rx_6:
+**Origin: resolved 2026-11-16 — packaged vector genomic RNA.** Three hypotheses, all tested:
+
+| hypothesis | verdict |
+|---|---|
+| internal oligo-dT priming at plasmid 444 | refuted — no coverage cliff there (below) |
+| 2-LTR circles | refuted — 0 of 1,618 junction clips carry the U5→U3 circle junction, 0 reciprocal in the 5' clips |
+| plasmid carry-over | refuted — coverage stops dead at the bacterial backbone |
+
+The backbone scan is the decisive one. Probing unplaced reads across the plasmid in Rx_4: ψ 490,
+leader 80, RRE/cPPT 570, SFFV promoter 8, and then `backbone` 0, `backbone` 2, `ori` 0, `AmpR` 0,
+`AmpR` 0. Plasmid DNA would cover the backbone — it is the same molecule. Wild-type Rx_5 is ~0
+everywhere. What *is* covered is exactly the packaged genome's footprint: R–U5–ψ–RRE–cPPT through to
+the 3' LTR, no backbone. The low SFFV signal fits too, since a promoter sits upstream of the mRNA.
+
+The original priming scan, kept because it is what refuted hypothesis 1:
 
 ```
 plasmid   Rx_4    Rx_5 (WT)   Rx_6
@@ -174,34 +212,41 @@ plasmid   Rx_4    Rx_5 (WT)   Rx_6
                                        scanned: 141M / 156M / 138M unplaced reads
 ```
 
-The hypothesis was internal oligo-dT priming at an A-rich tract at plasmid 444, predicting a coverage
-cliff there. **Refuted** — coverage runs straight through. The wild-type tube is clean (3 reads in
-156M), so it is vector-derived, not contamination. Broad coverage of the whole packaging region with
-a 5′-leaning gradient is more consistent with packaged vector genomic RNA or residual plasmid than
-with any priming event. Left as "refuted, mechanism unresolved" rather than fitting a second story.
-Distinguishing RNA from DNA origin would need a DNase/RNase-treated control. Not worth it for a
-contaminant filterable by sequence.
+Coverage runs straight through the A-rich tract, so priming there is not the mechanism. The
+wild-type tube is clean (3 reads in 156M), so the material is vector-derived rather than
+contamination. Either way the ψ clips are removed by sequence, so this never affected the results —
+it was a question about what the library contains, now answered.
 
-## 7. Results, and the four independent validations
+## 7. Results, and the validations
 
-9 sites, 339 distinct cells labelled.
+9 sites called, 8 usable, **552 distinct cells labelled**.
 
 | id | locus | gene | cells | note |
 |---|---|---|---|---|
-| IS01 | chr13:83,681,311 | *Mef2c* | 123 | |
-| IS02 | chr9:53,079,916 | *Ddx10* | 84 | |
-| IS03 | chr19:38,933,742 | *Hells* | 50 | |
-| IS04 | chr7:83,792,638 | *Abhd17c* | 48 | |
-| IS05 | chr9:64,711,166 | *Gm36459* | 23 | **Rx_4 (HSC) only** |
-| IS06 | chr1:67,556,980 | intergenic | 5 | |
-| IS07 | chr18:17,071,116 | intergenic | 4 | |
-| IS08 | chr2:31,009,148 | *Fnbp1* | 3 | |
-| IS09 | JH584304.1:35,417 | intergenic | 3 | **probably noise** — at the floor, on an unplaced scaffold, and present *only* in Rx_3 and Rx_7, the lowest-signal tubes. A real site appearing exclusively in low-signal tubes is backwards. |
+| IS01 | chr13:83,681,311 | *Mef2c* | 202 | |
+| IS02 | chr9:53,079,916 | *Ddx10* | 145 | |
+| IS03 | chr19:38,933,742 | *Hells* | 80 | |
+| IS04 | chr7:83,792,638 | *Abhd17c* | 74 | |
+| IS05 | chr9:64,711,166 | *Gm36459* | 44 | **Rx_4 (HSC) only** |
+| IS06 | chr1:67,556,980 | intergenic | 7 | |
+| IS08 | chr18:17,071,116 | intergenic | 6 | |
+| IS09 | chr2:31,009,148 | *Fnbp1* | 6 | |
+| IS07 | JH584304.1:35,417 | intergenic | **0** | **artefact, gated out.** Unplaced scaffold, 23-base homopolymer in its flank, zero cells in both high-signal tubes, no 5' junction. Excluded from the mini-reference by `max_homopolymer`; reported from discovery only. |
+
+**Site IDs are stable but not rank-ordered.** They are assigned from discovery-tier counts with ties
+broken by locus, so IS07 sits between IS06 and IS08 despite having no assigned cells. Do not infer
+importance from the number.
 
 Three checks the pipeline never used as input, so they are genuinely independent:
 
-1. **Integration-site preference.** 6 of 9 intragenic, 5 in protein-coding genes, and *Mef2c*,
-   *Ddx10*, *Hells* are actively transcribed in HSC. Lentivirus prefers active transcription units.
+1. **Integration-site preference — underpowered, do not cite as a validation.** 6 of 8 usable sites
+   are intragenic and *Mef2c*, *Ddx10*, *Hells* are actively transcribed in HSC, which is the
+   expected lentiviral preference. But the honest null is not "the genic fraction of the genome": a
+   site can only be called where a clip places uniquely, and unique sequence is itself enriched in
+   genes. Against 3,000 random positions filtered through the *same* mappability requirement, 49.2%
+   are intragenic, against 75% for the called sites — one-sided binomial **p = 0.135**. Consistent
+   with the literature, not evidence for it at n = 8. The other three validations are unaffected and
+   carry the result.
 2. **FACS agreement.** 220 of 223 labelled cells are in the mCherry⁺ fraction. The sort knows nothing
    about soft-clipped reads. The 3 in mCherry⁻ are expected — that gate is on protein, and a
    provirus-carrying cell below the gate is a true positive the sort got wrong.
@@ -261,6 +306,18 @@ Read this before debugging anything. Several of these cost hours.
   sat at 45. **This is the argument for building the second channel: it is the only thing that caught
   it.**
 
+- **Site IDs silently repointed between runs.** `label_sites()` ordered by cell count and three sites
+  tied at 3, so the tie broke on grouping order: IS07–IS09 named different loci after a rerun, and
+  every document citing them became wrong with nothing to flag it. Ties now break by chromosome and
+  position.
+- **The site table and the cell table disagreed about the same quantity.** `summarise_sites()` was
+  fed discovery hits while `summarise_cells()` was fed assignment hits, so the site table under-
+  reported cells. Both now come from the same hits via `update_site_counts()`.
+- **Lowering a threshold raises the noise floor faster than the signal.** Dropping the assignment
+  floor to 8 bp gained 67% more cells, but 14 of them were one low-complexity artefact — the false
+  site gained 4.7× while real sites gained 1.6×. Always check the per-tube breakdown and the
+  wild-type control before banking a yield improvement, not just the headline count.
+
 **Infrastructure traps**
 
 - **SLURM partition: use `short`, never `short_el9`/`long_el9`.** renv keys its library path on the OS
@@ -292,22 +349,28 @@ Read this before debugging anything. Several of these cost hours.
 
 ## 9. Open questions
 
-1. **ψ artefact origin** — refuted priming hypothesis, mechanism unknown (§6). Low priority.
-2. **MNC labelled barcodes survive QC at 58% vs 68% overall**, opposite to HSC. Unexplained; n=128.
-3. **IS09** — probably noise, and still not formally excluded: it has no 5' junction, so the TSD
-   check cannot rule on it either way.
-4. **IS05 is HSC-only with 23 cells, and its cells look spatially clustered** in the HSC UMAP. Not
+1. **MNC labelled barcodes survive QC at 58% vs 68% overall**, opposite to HSC. Unexplained.
+2. **IS05 is HSC-only with 44 cells, and its cells look spatially clustered** in the HSC UMAP. Not
    tested for significance; 20 points on a 50,000-cell map can cluster by chance.
-5. **The `≥3 cells and ≥3 UMIs` floor is arbitrary.** The waterfall is printed so it can be revisited.
-   A TSD-verified site arguably needs no floor at all: IS08 passes on one 5' read, and
-   chrX:100,691,117 passes while sitting below the floor in both channels.
-6. **Clonality proper** — site counts per compartment as a diversity measure is the intended
+3. **The `≥3 cells and ≥3 UMIs` floor is arbitrary.** A TSD-verified site arguably needs no floor at
+   all: IS09 passes on one 5' read, and chrX:100,691,117 passes while sitting below the floor in
+   both channels. The waterfall is printed so it can be revisited.
+4. **Clonality proper** — site counts per compartment as a diversity measure is the intended
    destination and has not been attempted. Assumption 3 is the obstacle: clone sizes are samples.
-7. **chr19:38,932,385** — 25 reads, 1.4 kb from IS03, not explained by anchor absorption. Test
+5. **chr19:38,932,385** — 25 reads, 1.4 kb from IS03, not explained by anchor absorption. Test
    whether those clips share barcodes with IS03's (same clone, same provirus) and whether the host
    side ends at a splice donor (a spliced vector-host fusion).
-8. **chrX:100,691,117 and chr14:62,948,717** — 5' junctions with no called 3' site. Real sites the
+6. **chrX:100,691,117 and chr14:62,948,717** — 5' junctions with no called 3' site. Real sites the
    3' channel missed, or artefacts?
+
+### Closed
+
+- **ψ artefact origin** — packaged vector genomic RNA (§6). Priming, 2-LTR circles and plasmid all
+  refuted; the backbone scan was decisive.
+- **IS07 / JH584304.1** — artefact, now gated out by flank complexity (§7).
+- **Multi-copy founders** — no. Every informative pair of sites co-occurs *below* chance (IS01+IS02:
+  6 observed vs 26 expected in Rx_4; 2 vs 24 in Rx_6), which is the signature of disjoint clones
+  rather than independent integrations. The ~2% of cells at more than one site read as doublets.
 
 ## 10. Files
 

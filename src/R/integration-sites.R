@@ -45,8 +45,20 @@ IS_DEFAULTS <- list(
   # base, some five. Accept [att - att_window, att] and add the absorbed bases back; see
   # read_five_prime_clips(). 2736 is a hard upper bound - a later start is not this junction.
   att_window     = 10L,
-  min_discovery  = 25L,     # clip long enough to place on its own
-  min_support    = 15L,     # clip that may only add cells to a site already found
+  min_discovery  = 25L,     # clip long enough to place on its own, genome-wide
+  # Assignment is a different question from discovery and gets a different threshold. Discovery asks
+  # "is there an integration anywhere in 2.7 Gb?"; assignment asks "does this clip match one of the
+  # handful of flanks already called?". The second search space is ~3.6 kb, and the clip must land at
+  # one exact offset in it, so a far shorter clip is decisive. 8 bp placed against the mini-reference
+  # is safer than 25 bp placed genome-wide: with it, both wild-type tubes still yield zero cells.
+  min_assign     = 8L,
+  flank          = 200L,    # bases either side of a called site in the mini-reference
+  # A flank containing a long homopolymer attracts clips that belong nowhere. JH584304.1:35,417 has a
+  # 23-base run against 5-6 for every genuine site, and the mini-reference inflated it 3 -> 14 cells,
+  # all in mCherry-NEGATIVE tubes and none in the two high-signal ones. Such a site is still reported
+  # from discovery, but it is kept out of the mini-reference so it cannot collect assignments.
+  max_homopolymer = 12L,
+  max_softclip   = 2L,      # an assignment clip must align end to end, not partially
   min_mapq       = 30L,     # bwa: a unique placement
   cluster_window = 20L,     # hits this close are one site
   min_cells      = 3L,
@@ -194,7 +206,7 @@ classify_five_prime_clips <- function(clips, opt = IS_DEFAULTS) {
     polya_frac >= opt$polya_fraction ~ "polyA tail",
     is.na(barcode) | is.na(umi)      ~ "no cell barcode or UMI",
     clip_len >= opt$min_discovery    ~ "discovery",
-    clip_len >= opt$min_support      ~ "support",
+    clip_len >= opt$min_assign       ~ "assign",
     TRUE                             ~ "clip too short to place"
   ))
 }
@@ -213,7 +225,7 @@ classify_clips <- function(clips, opt = IS_DEFAULTS) {
     polya_frac >= opt$polya_fraction      ~ "polyA tail",
     is.na(barcode) | is.na(umi)           ~ "no cell barcode or UMI",
     clip_len >= opt$min_discovery         ~ "discovery",
-    clip_len >= opt$min_support           ~ "support",
+    clip_len >= opt$min_assign            ~ "assign",
     TRUE                                  ~ "clip too short to place"
   ))
 }
@@ -221,7 +233,7 @@ classify_clips <- function(clips, opt = IS_DEFAULTS) {
 #' Per-tube counts of every class, in a fixed order, for the report's waterfall.
 clip_waterfall <- function(classified) {
   levels <- c("anchor not at the junction", "vector (5' LTR to psi)", "polyA tail",
-              "no cell barcode or UMI", "clip too short to place", "support", "discovery")
+              "no cell barcode or UMI", "clip too short to place", "assign", "discovery")
   classified |>
     dplyr::count(tube, class, name = "reads") |>
     dplyr::mutate(class = factor(class, levels = levels)) |>
@@ -243,12 +255,12 @@ anchor_end_histogram <- function(classified) {
 #' The read name carries provenance the SAM cannot: tube|barcode|umi|serial. The serial only makes
 #' names unique, since one cell can contribute several clips of the same UMI.
 write_clip_fasta <- function(classified, tier, path) {
-  d <- dplyr::filter(classified, class == tier)
+  d <- dplyr::filter(classified, class %in% tier)
   if (nrow(d) == 0L) {
     file.create(path)
     return(invisible(0L))
   }
-  names <- sprintf(">%s|%s|%s|%d", d$tube, d$barcode, d$umi, seq_len(nrow(d)))
+  names <- sprintf(">%s|%s|%s|%d|%d", d$tube, d$barcode, d$umi, seq_len(nrow(d)), d$clip_len)
   writeLines(as.vector(rbind(names, d$clip)), path)
   invisible(nrow(d))
 }
@@ -347,34 +359,103 @@ call_sites <- function(discovery_hits, opt = IS_DEFAULTS) {
     dplyr::ungroup()
 }
 
-#' Join the support tier onto sites discovery already found; discard the rest.
+#' Write the mini-reference: the flanks of the called sites, from the genome FASTA.
 #'
-#' A support clip is too short to place on its own, so it may add a cell to a known site but never
-#' define one. Measured on the two large transduced tubes, every support clip that passed the MAPQ
-#' filter landed on a site the long clips had already found, which is what makes this safe: it
-#' recovers roughly a third more cells at the large sites with no way to invent a locus.
-attach_support <- function(sites, support_hits, opt = IS_DEFAULTS) {
-  if (nrow(support_hits) == 0L || nrow(sites) == 0L) {
-    return(dplyr::mutate(sites, tier = "discovery"))
+#' Phase two of a two-question design. Discovery searched 2.7 Gb and needed a clip long enough to be
+#' unique there. Assignment asks only whether a clip matches one of the flanks already called, so the
+#' search space collapses to a few kb and the required evidence collapses with it.
+#'
+#' Built from DISCOVERY-tier sites only. Seeding it with anything the assignment step produced would
+#' make the method confirm itself.
+write_site_flanks <- function(sites, genome_fa, path, opt = IS_DEFAULTS) {
+  stopifnot(file.exists(genome_fa), nrow(sites) > 0L)
+  fa  <- Rsamtools::FaFile(genome_fa)
+  gr  <- GenomicRanges::GRanges(
+    sites$chrom,
+    IRanges::IRanges(pmax(sites$pos - opt$flank, 1L), sites$pos + opt$flank))
+  seqs <- Rsamtools::scanFa(fa, gr)
+
+  hp   <- max_homopolymer(as.character(seqs))
+  drop <- hp > opt$max_homopolymer
+  if (any(drop)) {
+    message("    excluded from the mini-reference (homopolymer > ", opt$max_homopolymer, "): ",
+            paste(sprintf("%s (%d)", sites$site_id[drop], hp[drop]), collapse = ", "))
+    seqs  <- seqs[!drop]
+    sites <- sites[!drop, , drop = FALSE]
   }
-  anchors <- sites |>
-    dplyr::group_by(site_id) |>
-    dplyr::summarise(chrom = dplyr::first(chrom), pos = min(pos), .groups = "drop")
-
-  near <- GenomicRanges::distanceToNearest(
-    GenomicRanges::GRanges(support_hits$chrom, IRanges::IRanges(support_hits$pos, width = 1L)),
-    GenomicRanges::GRanges(anchors$chrom, IRanges::IRanges(anchors$pos, width = 1L))
-  )
-  joined <- support_hits[S4Vectors::queryHits(near), ] |>
-    dplyr::mutate(site_id  = anchors$site_id[S4Vectors::subjectHits(near)],
-                  distance = S4Vectors::mcols(near)$distance) |>
-    dplyr::filter(distance <= opt$cluster_window) |>
-    dplyr::select(-distance)
-
-  dplyr::bind_rows(dplyr::mutate(sites, tier = "discovery"),
-                   dplyr::mutate(joined, tier = "support"))
+  if (length(seqs) == 0L) stop("every called site's flank is low-complexity; nothing to assign to")
+  # name carries where the junction sits inside the flank, so read_mini_hits() need not recompute it
+  names(seqs) <- sprintf("%s|%s|%d", sites$site_id, sites$strand,
+                         sites$pos - pmax(sites$pos - opt$flank, 1L) + 1L)
+  Biostrings::writeXStringSet(seqs, path)
+  invisible(length(seqs))
 }
 
+#' Longest run of a single base in each sequence.
+max_homopolymer <- function(x) {
+  vapply(regmatches(x, gregexpr("(.)\\1*", x)),
+         function(runs) max(nchar(runs)), numeric(1))
+}
+
+#' Assign clips to sites by alignment against the mini-reference.
+#'
+#' The discriminator is POSITION, not alignment score. A clip belongs to a site only if its
+#' junction-adjacent base lands on that site's junction base inside the flank - offset `j` in the
+#' sequence name. The clip's first base is the junction one (the 3' channel), so a forward alignment
+#' must START at j and a reverse one must END there. That single constraint is what makes an 8 bp
+#' clip safe: it has 400 places to land in each flank and only one is accepted, and in practice both
+#' wild-type tubes return zero cells under it.
+#'
+#' Alignment quality is then only a sanity filter: end-to-end, few mismatches.
+read_mini_hits <- function(sam, opt = IS_DEFAULTS) {
+  if (!file.exists(sam) || file.size(sam) == 0L) return(empty_hit_table())
+  lines <- readLines(sam, warn = FALSE)
+  lines <- lines[!startsWith(lines, "@")]
+  if (length(lines) == 0L) return(empty_hit_table())
+
+  f     <- strsplit(lines, "\t", fixed = TRUE)
+  field <- function(i) vapply(f, function(x) if (length(x) >= i) x[[i]] else NA_character_, "")
+  flag  <- as.integer(field(2))
+  rname <- field(3)
+
+  keep <- bitwAnd(flag, 0x100) == 0L & bitwAnd(flag, 0x800) == 0L & rname != "*"
+  if (!any(keep)) return(empty_hit_table())
+
+  f <- f[keep]; flag <- flag[keep]
+  field <- function(i) vapply(f, function(x) if (length(x) >= i) x[[i]] else NA_character_, "")
+  cigar <- field(6)
+  pos   <- as.integer(field(4))
+  rev   <- bitwAnd(flag, 0x10) != 0L
+  ref   <- do.call(rbind, strsplit(rname[keep], "|", fixed = TRUE))
+  junc  <- as.integer(ref[, 3])
+
+  # NM:i: and the total soft-clipped length, from the optional fields
+  tags <- vapply(f, function(x) paste(x[-(1:11)], collapse = "\t"), "")
+  nm   <- suppressWarnings(as.integer(sub(".*NM:i:([0-9]+).*", "\\1", tags)))
+  nm[is.na(nm)] <- 99L
+  soft <- vapply(regmatches(cigar, gregexpr("[0-9]+S", cigar)),
+                 function(x) sum(as.integer(sub("S$", "", x))), numeric(1))
+
+  prov <- do.call(rbind, strsplit(field(1), "|", fixed = TRUE))
+  clip_len <- as.integer(prov[, 5])
+  span     <- ref_span(cigar)
+
+  at_junction <- ifelse(rev, pos + span - 1L == junc, pos == junc)
+  good <- at_junction & soft <= opt$max_softclip & nm <= pmax(1L, clip_len %/% 10L)
+  if (!any(good)) return(empty_hit_table())
+
+  dplyr::tibble(
+    chrom    = ref[good, 1],          # the site_id; the genomic coordinate comes from the site table
+    pos      = junc[good],
+    strand   = ref[good, 2],
+    mapq     = as.integer(field(5))[good],
+    tube     = prov[good, 1],
+    barcode  = prov[good, 2],
+    umi      = prov[good, 3],
+    clip_len = clip_len[good]
+  ) |>
+    dplyr::rename(site_id = chrom)
+}
 
 # ── Annotation and output ─────────────────────────────────────────────────────────────────────────
 
@@ -424,10 +505,14 @@ annotate_positions <- function(chrom, pos, gtf) {
 #' which site is which.
 label_sites <- function(hits) {
   if (nrow(hits) == 0L) return(hits)
+  # Ties are broken by locus, not left to grouping order. Three sites sat at 3 cells and the labels
+  # reshuffled between runs, silently repointing IS07-IS09 at different loci and invalidating every
+  # document that named them.
   order <- hits |>
     dplyr::group_by(site_id) |>
-    dplyr::summarise(cells = dplyr::n_distinct(paste(tube, barcode)), .groups = "drop") |>
-    dplyr::arrange(dplyr::desc(cells)) |>
+    dplyr::summarise(cells = dplyr::n_distinct(paste(tube, barcode)),
+                     chrom = dplyr::first(chrom), pos = min(pos), .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(cells), chrom, pos) |>
     dplyr::mutate(label = sprintf("IS%02d", dplyr::row_number()))
   hits |>
     dplyr::left_join(dplyr::select(order, site_id, label), by = "site_id") |>
@@ -462,6 +547,36 @@ summarise_sites <- function(hits, gtf, tubes) {
     dplyr::left_join(per_tube, by = "site_id") |>
     dplyr::select(site_id, chrom, pos, strand, gene, gene_type, gene_strand, context,
                   reads, cells, umis, dplyr::starts_with("cells_"))
+}
+
+#' Replace a site table's read/cell/UMI counts with the ones from the assignment stage.
+#'
+#' The site LIST and its coordinates come from discovery; the cell COUNTS come from assignment
+#' against the mini-reference, which reaches far more cells. Without this the site table and
+#' cell_site_assignments.csv disagree about the same quantity - the table reporting only the cells
+#' that happened to carry a 25 bp clip.
+update_site_counts <- function(site_table, mini, tubes) {
+  if (nrow(site_table) == 0L) return(site_table)
+  per_site <- mini |>
+    dplyr::group_by(site_id) |>
+    dplyr::summarise(reads = dplyr::n(),
+                     cells = dplyr::n_distinct(paste(tube, barcode)),
+                     umis  = dplyr::n_distinct(paste(tube, barcode, umi)), .groups = "drop")
+  per_tube <- mini |>
+    dplyr::group_by(site_id, tube) |>
+    dplyr::summarise(n = dplyr::n_distinct(barcode), .groups = "drop") |>
+    tidyr::pivot_wider(names_from = tube, values_from = n, values_fill = 0L,
+                       names_prefix = "cells_")
+  for (t in setdiff(paste0("cells_", tubes), names(per_tube))) per_tube[[t]] <- 0L
+
+  site_table |>
+    dplyr::select(-dplyr::any_of(c("reads", "cells", "umis")),
+                  -dplyr::starts_with("cells_")) |>
+    dplyr::left_join(per_site, by = "site_id") |>
+    dplyr::left_join(per_tube, by = "site_id") |>
+    dplyr::mutate(dplyr::across(c(reads, cells, umis, dplyr::starts_with("cells_")),
+                                ~ tidyr::replace_na(.x, 0L))) |>
+    dplyr::arrange(dplyr::desc(cells), chrom, pos)
 }
 
 #' Match 5' junctions to called sites and test the target-site duplication.

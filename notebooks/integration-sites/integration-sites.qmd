@@ -64,20 +64,26 @@ data/cellranger_<tube>/sample_alignments.bam        8 tubes, ~55 GB each
         │  1. EXTRACT   src/R/integration-sites.R :: read_junction_clips(), classify_clips()
         │     Rsamtools reads a 87-base window of one contig per tube (seconds, despite the
         │     BAM size), keeps reads whose anchor ends exactly at the junction, and splits the
-        │     soft-clipped tails into the discovery and support tiers.
+        │     soft-clipped tails into the discovery and assignment tiers.
         ▼
-   work/discovery.fa   work/support.fa              clipped tails, named tube|barcode|umi|n
+   work/discovery.fa  work/assign.fa  work/five_prime.fa
         │
-        │  2. ALIGN     bwa, in scripts/slurm/analysis/integration-sites.sh
-        │     mem -k 16 for discovery (seed shortened: a 25-48 base query will not seed at 19)
-        │     aln + samse for support  (written for reads this short; mem is erratic there)
+        │  2. ALIGN (genome)   bwa mem -k 16; the seed is shortened because a 25-48 base
+        │                      query will not seed at the default 19.
         ▼
-   work/discovery.sam  work/support.sam
+   work/discovery.sam  work/five_prime.sam
         │
-        │  3. CALL      src/R/integration-sites.R :: call_sites(), attach_support(),
-        │                                            label_sites(), summarise_*()
+        │  3. SITES     call_sites(), label_sites(), summarise_sites(), write_site_flanks()
         │     GenomicRanges clusters placements into sites, the cell and UMI floor is applied,
-        │     support clips join sites discovery already found, rtracklayer annotates the host gene.
+        │     rtracklayer annotates the host gene, and the mini-reference is cut from the flanks.
+        ▼
+   work/site_flanks.fa
+        │
+        │  4. ALIGN (mini-reference)  bwa mem -k 8 -T 12 against the called flanks only
+        ▼
+   work/assign.sam
+        │
+        │  5. ASSIGN    read_mini_hits(), summarise_cells(), update_site_counts(), tsd_check()
         ▼
    output/objects/integration-sites/*.csv           what this report reads
 ```
@@ -173,7 +179,7 @@ site_palette <- stats::setNames(as.character(pals::glasbey(nlevels(assign$site_i
 # Taken from the pipeline rather than restated, so the figures cannot drift from the run.
 JUNCTION <- IS_DEFAULTS$junction
 MIN_DISC <- IS_DEFAULTS$min_discovery
-MIN_SUPP <- IS_DEFAULTS$min_support
+MIN_ASSIGN <- IS_DEFAULTS$min_assign
 CLEAVAGE <- 3152L   # measured from the polyA clips; see reference_additions/README.md
 
 theme_set(theme_minimal(base_size = 11))
@@ -246,7 +252,7 @@ ever sees them.
 # the order classify_clips() applies them in: each clip is counted once, under the first reason it
 # met, so the columns sum to every soft-clipped read in the scan window
 class_order <- c("anchor not at the junction", "vector (5' LTR to psi)", "polyA tail",
-                 "no cell barcode or UMI", "clip too short to place", "support", "discovery")
+                 "no cell barcode or UMI", "clip too short to place", "assign", "discovery")
 
 waterfall %>%
   dplyr::mutate(class = factor(class, levels = class_order)) %>%
@@ -282,25 +288,31 @@ junction_clips <- anchor_ends %>%
 
 ggplot(junction_clips, aes(clip_len, weight = reads)) +
   geom_histogram(binwidth = 2, fill = "steelblue", colour = "white") +
-  geom_vline(xintercept = MIN_SUPP, linetype = "dashed", colour = "grey30") +
+  geom_vline(xintercept = MIN_ASSIGN, linetype = "dashed", colour = "grey30") +
   geom_vline(xintercept = MIN_DISC, linetype = "dashed", colour = "firebrick") +
   labs(x = "clip length (bases of host sequence)", y = "reads",
        title = "How much host sequence the read-through reads deliver",
-       subtitle = sprintf("dashed grey = support threshold (%d); dashed red = discovery threshold (%d)",
-                          MIN_SUPP, MIN_DISC))
+       subtitle = sprintf("dashed grey = assignment threshold (%d); dashed red = discovery threshold (%d)",
+                          MIN_ASSIGN, MIN_DISC))
 ```
 
-Rather than pick one threshold, the pipeline uses two tiers:
+Rather than pick one threshold, the pipeline asks two different questions and gives each its own.
 
-| tier | clip | role |
-|---|---|---|
-| discovery | ≥ `r MIN_DISC` bp | placed on its own; **defines** the site list |
-| support | `r MIN_SUPP`–`r MIN_DISC - 1` bp | may only **add cells** to a site discovery already found |
+| tier | clip | searched against | asks |
+|---|---|---|---|
+| discovery | ≥ `r MIN_DISC` bp | the whole genome, 2.7 Gb | is there an integration *anywhere*? |
+| assignment | ≥ `r MIN_ASSIGN` bp | the called flanks, a few kb | does this clip match a site *already found*? |
 
-The justification is empirical. Of the short clips, only about a quarter reach MAPQ 30 — and when
-tested on the two large transduced tubes, every one that did landed on a locus the long clips had
-already found. So the second tier recovers roughly a third more cells at the large sites while being
-structurally unable to invent a locus: a short clip with nowhere to join is discarded.
+Those are not the same question, and treating them as one is what the old single threshold did.
+Discovery must survive 2.7 Gb of alternatives, so it needs a clip long enough to be unique there.
+Assignment only has to choose among a handful of known flanks — **and the clip must land on the
+junction base exactly**, not merely somewhere in the flank. That positional constraint is the real
+discriminator, and it is strong enough that an 8 bp clip is decisive: it has 400 places to land in
+each flank and one is accepted.
+
+The evidence that this is safe rather than merely generous is the control. Dropping the threshold
+from 25 to 8 raises labelled cells by about two thirds, and **both wild-type tubes stay at exactly
+zero** — 28,010 cells that never saw the vector, none of them labelled.
 
 ```{r tier-contribution}
 summary_tbl %>% DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12))
@@ -348,6 +360,25 @@ sites %>%
 
 A site falling in an intergenic desert is not thereby wrong, but it is the kind of call to treat with
 more caution — particularly at low cell counts.
+
+**This is weaker evidence than it looks, and the obvious null is the wrong one.** Comparing 75%
+intragenic against the genome's genic fraction would overstate the case, because a site can only be
+*called* where a clip places uniquely, and unique sequence is itself concentrated in genes. The
+filter that finds sites is correlated with the feature being tested.
+
+The matched null draws 3,000 random genomic positions, puts a 40-mer from each through the same
+`MAPQ >= 30` requirement a real clip must clear, and asks how many of the survivors are intragenic:
+
+| | intragenic |
+|---|---|
+| mappability-matched random positions (n = 2,302) | **49.2%** |
+| called sites (n = 8) | **75.0%** |
+| | one-sided binomial **p = 0.135** |
+
+The direction matches the literature and the effect may well be real, but at eight sites it does not
+reach significance. Treat the integration preference as *consistent with* expectation rather than as
+evidence for it. The sort agreement, replicate confinement and target-site duplication are
+unaffected, and they are what the result rests on.
 
 ## The other end of the provirus
 
@@ -832,9 +863,46 @@ dplyr::count(amb, n_sites_in_cell, name = "cells") %>%
 ```
 
 These are flagged rather than resolved, deliberately. A cell showing two strong junctions is either a
-genuine multi-copy integrant or a doublet, and this assay cannot tell the difference. Treating them as
+genuine multi-copy integrant or a doublet, and no single cell tells you which. Treating them as
 multi-copy clones would inflate clone counts; dropping them would deflate them. They are marked
 `ambiguous` so downstream analyses can make that choice explicitly.
+
+Across all cells, though, the two explanations make opposite predictions, and that *is* testable. If
+sites were distributed over cells independently — multi-copy founders — pairs of sites would
+co-occur at roughly the product of their frequencies. If instead each site marks a distinct clone,
+co-occurrence should fall *below* that, because a cell belongs to one lineage.
+
+```{r cooccurrence}
+cooccur <- function(tube_id) {
+  d    <- dplyr::filter(assign, tube == tube_id)
+  n    <- dplyr::n_distinct(d$barcode)
+  sets <- split(d$barcode, droplevels(d$site_id))
+  sets <- sets[lengths(sets) >= 3]
+  ids  <- names(sets)
+  if (length(ids) < 2) return(NULL)
+  pairs <- utils::combn(ids, 2, simplify = FALSE)
+  dplyr::bind_rows(lapply(pairs, function(p) {
+    a <- unique(sets[[p[1]]]); b <- unique(sets[[p[2]]])
+    dplyr::tibble(tube = tube_id, pair = paste(p, collapse = " + "),
+                  cells_A = length(a), cells_B = length(b),
+                  observed = length(intersect(a, b)),
+                  expected = round(length(a) * length(b) / n, 1))
+  }))
+}
+
+dplyr::bind_rows(lapply(c("Rx_4", "Rx_6"), cooccur)) |>
+  dplyr::arrange(dplyr::desc(cells_A + cells_B)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "tp", pageLength = 8))
+```
+
+Every informative pair falls below expectation, several far below — IS01 and IS02 share 6 cells in
+Rx_4 against 26 expected, and 2 in Rx_6 against 24. **No pair is enriched.** So there is no evidence
+of multi-copy founders, and the sites behave as labels on disjoint clones, which is what makes them
+usable as clone identities at all.
+
+That leaves doublets as the parsimonious reading of the ambiguous cells. They are about 2% of
+labelled cells, which is an unremarkable doublet rate. Note the caveat: this argument is about the
+population, not about any individual flagged cell.
 
 
 # Limitations
