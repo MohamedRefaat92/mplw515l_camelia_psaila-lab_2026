@@ -1,0 +1,800 @@
+---
+title: "Integration sites — reading the host genome out of read-through transcripts"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+# Introduction
+
+The transgene assay tells us *whether* a cell carries the lentiviral cassette. This report asks a
+harder question: **where in the genome did it integrate**, and can that be used as a clone label.
+
+The idea rests on a leak in the vector. Transcription of the cassette is supposed to terminate at the
+polyadenylation site in the 3′ LTR's R region, at contig 3152. Termination is not perfect, and a
+minority of transcripts read through to the end of the provirus and on into the flanking host DNA.
+Such a molecule aligns to the reporter contig as far as its last base and then stops matching, so the
+aligner soft-clips the remainder — and that clipped tail is host sequence that names the integration
+locus. Because the read still carries its 10x cell barcode and UMI, the locus comes attached to a
+**cell**.
+
+## Why the junction is at exactly one position
+
+Integration chemistry fixes it. Reverse transcription makes a blunt double-stranded DNA whose plus
+strand ends `…TGGAAAATCTCTAGCA`**`GT`**. Integrase then performs 3′ processing: it removes that
+terminal `GT`, leaving a recessed 3′-OH on a `CA`, and it is that `CA` which attacks the host DNA in
+the strand-transfer step.
+
+```
+…host host host │ CA ──────── provirus ──────── CA │ host host host…
+                  ↑                                 ↑
+            processed end                      processed end
+```
+
+The reporter contig ends `…TCTCTAG`**`CA`** — exactly that processed terminus. So **contig position
+3236 is the integration junction itself**, and a clip anchored anywhere else cannot be one. That is a
+statement about enzymology rather than a tuning parameter, which is why it is the first filter
+applied and why it costs no sensitivity.
+
+It also does the heavy lifting against artefacts, as the next section shows.
+
+# How these tables were produced
+
+This report does no site calling of its own. It reads five CSVs written by a batch job and plots them,
+so that re-rendering is cheap and the calling is reproducible independently of the report.
+
+## The pipeline
+
+```
+data/cellranger_<tube>/sample_alignments.bam        8 tubes, ~55 GB each
+        │
+        │  1. EXTRACT   src/R/integration-sites.R :: read_junction_clips(), classify_clips()
+        │     Rsamtools reads a 87-base window of one contig per tube (seconds, despite the
+        │     BAM size), keeps reads whose anchor ends exactly at the junction, and splits the
+        │     soft-clipped tails into the discovery and support tiers.
+        ▼
+   work/discovery.fa   work/support.fa              clipped tails, named tube|barcode|umi|n
+        │
+        │  2. ALIGN     bwa, in scripts/slurm/analysis/integration-sites.sh
+        │     mem -k 16 for discovery (seed shortened: a 25-48 base query will not seed at 19)
+        │     aln + samse for support  (written for reads this short; mem is erratic there)
+        ▼
+   work/discovery.sam  work/support.sam
+        │
+        │  3. CALL      src/R/integration-sites.R :: call_sites(), attach_support(),
+        │                                            label_sites(), summarise_*()
+        │     GenomicRanges clusters placements into sites, the cell and UMI floor is applied,
+        │     support clips join sites discovery already found, rtracklayer annotates the host gene.
+        ▼
+   output/objects/integration-sites/*.csv           what this report reads
+```
+
+## Files
+
+| file | role |
+|---|---|
+| [`src/R/integration-sites.R`](../../src/R/integration-sites.R) | all the logic, as functions. Attaches no packages, so it can be `source()`d and stepped through. Every threshold is in `IS_DEFAULTS` at the top. |
+| [`scripts/R/call-integration-sites.R`](../../scripts/R/call-integration-sites.R) | driver with two entry points, `extract` and `call`, because bwa runs between them |
+| [`scripts/slurm/analysis/integration-sites.sh`](../../scripts/slurm/analysis/integration-sites.sh) | the batch job: the two R stages with bwa in the middle. ~1 min, 4.7 GB peak (the index load). |
+| [`scripts/slurm/setup/bwa-index.sh`](../../scripts/slurm/setup/bwa-index.sh) | builds the bwa index once, ~50 min |
+
+Both jobs run on the `short` partition and **not** the `_el9` ones: renv keys its library path on the
+OS release, so on a Rocky 9 node it finds no library and the first `library()` call fails.
+
+## Inputs
+
+| input | where from |
+|---|---|
+| `data/cellranger_<tube>/sample_alignments.bam` | `scripts/slurm/cellranger/cellranger-multi.sh`, linked into `data/` so the provenance catalogue sees it |
+| `$CR_REF/bwa/genome.*` | the mouse genome **plus the reporter contig**, indexed. The contig is included deliberately: a clip landing back on the vector is then recognisable rather than quietly unmapped. |
+| `$CR_REF/genes/genes.gtf.gz` | GRCm39 / GENCODE vM33, for the host-gene annotation |
+| `metadata/cellranger/libraries.csv` | the list of tubes to process |
+
+## Outputs
+
+| file | rows | one row per |
+|---|---|---|
+| `integration_sites.csv` | 9 | **site**: position, strand, host gene, reads/cells/UMIs, and cells per tube |
+| `cell_site_assignments.csv` | 323 | **cell × site**: the table that joins onto Seurat metadata and turns a locus into a clone label |
+| `clip_waterfall.csv` | 33 | tube × filter class — every clip counted once, under the first reason it met |
+| `anchor_ends.csv` | 811 | tube × anchor position × clip length — the coverage view below |
+| `site_calling_summary.csv` | 7 | what each tier contributed |
+
+## Re-running it
+
+```bash
+sbatch scripts/slurm/setup/bwa-index.sh          # once, if the reference changes
+sbatch scripts/slurm/analysis/integration-sites.sh
+```
+
+To change a threshold, edit `IS_DEFAULTS` in `src/R/integration-sites.R` — the job file holds no
+analysis parameters of its own, so the two cannot disagree. To work interactively instead:
+
+```r
+source("src/R/integration-sites.R")
+clips <- read_junction_clips("data/cellranger_Rx_4/sample_alignments.bam", "Rx_4")
+table(classify_clips(clips)$class)
+```
+
+The thresholds used for the tables in this report:
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(DT)
+library(targets)
+
+source("src/R/integration-sites.R")   # IS_DEFAULTS: the thresholds the pipeline actually used
+
+sites_dir <- "output/objects/integration-sites"
+stopifnot(dir.exists(sites_dir))
+
+anchor_ends <- readr::read_csv(file.path(sites_dir, "anchor_ends.csv"), show_col_types = FALSE)
+waterfall   <- readr::read_csv(file.path(sites_dir, "clip_waterfall.csv"), show_col_types = FALSE)
+sites       <- readr::read_csv(file.path(sites_dir, "integration_sites.csv"), show_col_types = FALSE)
+assign      <- readr::read_csv(file.path(sites_dir, "cell_site_assignments.csv"), show_col_types = FALSE)
+summary_tbl <- readr::read_csv(file.path(sites_dir, "site_calling_summary.csv"), show_col_types = FALSE)
+
+# One factor with every site as a level, so a clone keeps the same colour in every panel even where
+# it has no cells. As a bare character it would be re-levelled per panel and the colours would shift.
+assign$site_id <- factor(assign$site_id, levels = sites$site_id)
+
+# Clone colours. These are nominal categories with no order, so a sampled continuous ramp (viridis,
+# turbo) is the wrong tool: neighbouring clones come out as neighbouring hues. glasbey is built by
+# maximising distance in CIELAB, and measurably wins here - the closest pair of colours is 67 dE
+# apart against 28 for the project's .discrete_colours() at n = 9 and 24 for turbo. Its first entry
+# is black, dropped so no clone is confused with text or an axis.
+#
+# The trade-off, stated because it is real: glasbey is not optimised for colour vision deficiency
+# (closest pair under deuteranopia ~9 dE). Okabe-Ito and Tol muted do better there (~17) but are far
+# worse for normal vision (~26 and ~23), and their low chroma washes out at this point size. If a
+# reader needs CVD-safe output, swap this one line.
+site_palette <- stats::setNames(as.character(pals::glasbey(nlevels(assign$site_id) + 1))[-1],
+                                levels(assign$site_id))
+
+# Taken from the pipeline rather than restated, so the figures cannot drift from the run.
+JUNCTION <- IS_DEFAULTS$junction
+MIN_DISC <- IS_DEFAULTS$min_discovery
+MIN_SUPP <- IS_DEFAULTS$min_support
+CLEAVAGE <- 3152L   # measured from the polyA clips; see reference_additions/README.md
+
+theme_set(theme_minimal(base_size = 11))
+```
+
+```{r is-defaults}
+dplyr::tibble(parameter = names(IS_DEFAULTS),
+              value     = vapply(IS_DEFAULTS, as.character, character(1))) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12))
+```
+
+
+# The coverage view
+
+This is the figure that decides whether the whole approach is viable: do enough reads actually reach
+the junction? Each soft-clipped read is placed at the position where its anchor stops matching the
+contig, and coloured by whether its clipped tail is adenine.
+
+```{r anchor-ends, fig.height=6}
+ends_by_tube <- anchor_ends %>%
+  dplyr::group_by(tube, anchor_end, polya) %>%
+  dplyr::summarise(reads = sum(reads), .groups = "drop")
+
+ggplot(ends_by_tube, aes(anchor_end, reads, fill = polya)) +
+  geom_col(width = 1) +
+  geom_vline(xintercept = CLEAVAGE, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = JUNCTION, linetype = "dashed", colour = "firebrick") +
+  facet_wrap(~ tube, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c(`TRUE` = "grey70", `FALSE` = "firebrick"),
+                    labels = c(`TRUE` = "polyA tail", `FALSE` = "non-polyA")) +
+  labs(x = "contig position where the anchor stops matching",
+       y = "reads", fill = NULL,
+       title = "Two populations of soft-clipped reads",
+       subtitle = sprintf("dashed grey = polyA cleavage site (%d); dashed red = integration junction (%d)",
+                          CLEAVAGE, JUNCTION))
+```
+
+Two piles, and they mean completely different things.
+
+The pile at the **cleavage site** is the transcript's own polyA tail: the read reaches the end of the
+mRNA and clips the A's. It says nothing about integration. The pile at the **junction** is the
+read-through population, and its clips are host sequence.
+
+```{r two-populations}
+ends_by_tube %>%
+  dplyr::mutate(pile = dplyr::case_when(
+    anchor_end >= CLEAVAGE - 8 & anchor_end <= CLEAVAGE ~ "cleavage site (3144–3152)",
+    anchor_end == JUNCTION                              ~ "junction (3236)",
+    TRUE                                                ~ "elsewhere")) %>%
+  dplyr::group_by(pile, polya) %>%
+  dplyr::summarise(reads = sum(reads), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = polya, values_from = reads, values_fill = 0,
+                     names_prefix = "polya_") %>%
+  dplyr::mutate(total = polya_TRUE + polya_FALSE,
+                pct_polya = sprintf("%.0f%%", 100 * polya_TRUE / total)) %>%
+  dplyr::select(pile, total, polya = polya_TRUE, non_polya = polya_FALSE, pct_polya) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+The separation is what makes the anchor-position filter worth so much. The non-polyA minority of the
+cleavage-site pile is the dangerous part: those reads have good MAPQ, real barcodes and real UMIs, so
+they would align somewhere in 2.7 Gb and be counted as sites. Nothing downstream would catch them —
+they look exactly like evidence. Requiring the anchor to end at 3236 removes them before the aligner
+ever sees them.
+
+
+# The filter waterfall
+
+```{r waterfall}
+# the order classify_clips() applies them in: each clip is counted once, under the first reason it
+# met, so the columns sum to every soft-clipped read in the scan window
+class_order <- c("anchor not at the junction", "vector (5' LTR to psi)", "polyA tail",
+                 "no cell barcode or UMI", "clip too short to place", "support", "discovery")
+
+waterfall %>%
+  dplyr::mutate(class = factor(class, levels = class_order)) %>%
+  dplyr::arrange(class) %>%
+  tidyr::pivot_wider(names_from = tube, values_from = reads, values_fill = 0) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", scrollX = TRUE))
+```
+
+Three of those discards deserve comment.
+
+**Vector (5′ LTR → ψ).** The plasmid's two LTRs are byte-identical over all 181 bases, and the contig
+deliberately keeps only one copy so that reads landing in the LTR do not multi-map. The side effect is
+that a molecule spanning the **5′** LTR's junction with ψ presents a left arm matching the contig's 3′
+terminus perfectly — so it is placed at 3236, with MAPQ 255, and clips into vector sequence. It is
+structurally indistinguishable from a host junction. No MAPQ or coverage filter sees it, because the
+anchor genuinely *is* a unique alignment; only the sequence of the clip gives it away. This filter is
+load-bearing, not cosmetic.
+
+**polyA.** A small number of polyA clips occur at the junction too, from internal priming.
+
+**Clip too short to place.** Discussed next.
+
+
+# Clip length: how much host sequence is enough
+
+The clip is host genome, so its length is exactly how much flanking sequence the read delivered. Too
+short and it cannot be placed uniquely in a 2.7 Gb genome; the information-theoretic floor is about 16
+bases, and in practice mismatches and repeats push the usable threshold higher.
+
+```{r clip-length}
+junction_clips <- anchor_ends %>%
+  dplyr::filter(anchor_end == JUNCTION, !polya)
+
+ggplot(junction_clips, aes(clip_len, weight = reads)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = MIN_SUPP, linetype = "dashed", colour = "grey30") +
+  geom_vline(xintercept = MIN_DISC, linetype = "dashed", colour = "firebrick") +
+  labs(x = "clip length (bases of host sequence)", y = "reads",
+       title = "How much host sequence the read-through reads deliver",
+       subtitle = sprintf("dashed grey = support threshold (%d); dashed red = discovery threshold (%d)",
+                          MIN_SUPP, MIN_DISC))
+```
+
+Rather than pick one threshold, the pipeline uses two tiers:
+
+| tier | clip | role |
+|---|---|---|
+| discovery | ≥ `r MIN_DISC` bp | placed on its own; **defines** the site list |
+| support | `r MIN_SUPP`–`r MIN_DISC - 1` bp | may only **add cells** to a site discovery already found |
+
+The justification is empirical. Of the short clips, only about a quarter reach MAPQ 30 — and when
+tested on the two large transduced tubes, every one that did landed on a locus the long clips had
+already found. So the second tier recovers roughly a third more cells at the large sites while being
+structurally unable to invent a locus: a short clip with nowhere to join is discarded.
+
+```{r tier-contribution}
+summary_tbl %>% DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12))
+```
+
+
+# The sites
+
+```{r site-table}
+sites %>%
+  DT::datatable(rownames = FALSE, filter = "top",
+                options = list(pageLength = 20, scrollX = TRUE)) %>%
+  DT::formatStyle("cells", fontWeight = "bold")
+```
+
+```{r site-plot, fig.height=5}
+cells_long <- sites %>%
+  dplyr::select(site_id, gene, context, dplyr::starts_with("cells_")) %>%
+  tidyr::pivot_longer(dplyr::starts_with("cells_"),
+                      names_to = "tube", values_to = "cells",
+                      names_prefix = "cells_") %>%
+  dplyr::filter(cells > 0) %>%
+  dplyr::mutate(label = ifelse(is.na(gene) | gene == "",
+                               site_id, paste0(site_id, " · ", gene)))
+
+ggplot(cells_long, aes(reorder(label, cells, sum), cells, fill = tube)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "cells carrying the junction", fill = "tube",
+       title = "Integration sites by the number of cells supporting them")
+```
+
+## What the gene context tells us
+
+Lentivirus does not integrate at random: it strongly prefers the bodies of actively transcribed
+genes. That gives an internal control the analysis never assumed, so if the called sites are real they
+should be enriched for intragenic positions in genes this tissue expresses.
+
+```{r context}
+sites %>%
+  dplyr::count(context = sub(",.*", "", context), gene_type, name = "sites") %>%
+  dplyr::arrange(dplyr::desc(sites)) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+A site falling in an intergenic desert is not thereby wrong, but it is the kind of call to treat with
+more caution — particularly at low cell counts.
+
+## Sharing between tubes
+
+Tubes that are different sorted fractions of the same animal should share clones; tubes from different
+animals should not. A wild-type tube should show nothing at all, and whatever it does show sets the
+cross-tube background — index hopping and ambient contamination — against which small sites in the
+other tubes have to be judged.
+
+```{r sharing, fig.height=5}
+ggplot(cells_long, aes(tube, reorder(label, cells, sum), fill = cells)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = cells), size = 3) +
+  scale_fill_gradient(low = "grey95", high = "firebrick", trans = "sqrt") +
+  labs(x = NULL, y = NULL, fill = "cells",
+       title = "Which tubes each site appears in")
+```
+
+
+# Cell-level clone labels
+
+`cell_site_assignments.csv` is the table that matters downstream: one row per cell per site, which
+joins onto the Seurat metadata and turns a genomic locus into a clone label.
+
+The two compartments are embedded separately, so each keeps its own UMAP: the HSC panel comes from
+`mpn_processed_hsc_fullcc` (tubes Rx_3, Rx_4, Rx_5) and the MNC panel from `mpn_processed_mnc` (Rx_6,
+Rx_7, Rx_8). Both carry the `umap.nn` reduction. The extraction's `tube` and `barcode` concatenate to
+exactly the Seurat cell name, so the join needs no barcode surgery.
+
+```{r join-metadata}
+#' Cell names, sort label and UMAP coordinates for one processed compartment.
+#' Returns a small tibble, so the Seurat object can be dropped immediately.
+cell_embedding <- function(srt, panel) {
+  emb <- Seurat::Embeddings(srt, "umap.nn")
+  tibble::tibble(
+    cell        = colnames(srt),
+    panel       = panel,
+    tube        = as.character(srt$tube),
+    sample_name = as.character(srt$sample.name),
+    sample      = as.character(srt$sample.name.long),
+    # the hashtag demultiplex call: which replicate mouse this cell came from. "multiplet" and
+    # "negative" are failures of the call, not animals, and appear mostly before QC.
+    replicate   = factor(as.character(srt$dm2_class),
+                         levels = c("TotalSeq-B0301", "TotalSeq-B0302", "TotalSeq-B0303",
+                                    "TotalSeq-B0304", "negative", "multiplet")),
+    compartment = as.character(srt$compartment),
+    pass_cell   = srt$pass_cell,
+    UMAP_1      = emb[, 1],
+    UMAP_2      = emb[, 2]
+  )
+}
+
+# Read one at a time: literal tar_read() so tar_knitr_deps() registers both as dependencies of this
+# report, and sequential so the two objects are never resident together.
+hsc <- cell_embedding(tar_read(mpn_processed_hsc_fullcc), "HSC"); gc(verbose = FALSE)
+mnc <- cell_embedding(tar_read(mpn_processed_mnc),        "MNC"); gc(verbose = FALSE)
+
+embedding <- dplyr::bind_rows(hsc, mnc) %>%
+  # A factor with all three levels, not a character: the wild-type samples contain no labelled cells,
+  # so as a character the facet below would silently drop the column that matters most.
+  dplyr::mutate(sorted = factor(
+    dplyr::case_when(
+      grepl("_positive$", sample) ~ "FACS mCherry+",
+      grepl("_negative$", sample) ~ "FACS mCherry−",
+      grepl("wildtype",   sample) ~ "wild-type (no vector)"),
+    levels = c("FACS mCherry+", "FACS mCherry−", "wild-type (no vector)")))
+rm(hsc, mnc); gc(verbose = FALSE)
+
+# tube + barcode is the Seurat cell name, e.g. Rx_4 + AAACCAAAGAATCATC-1 -> Rx_4_AAACCAAAGAATCATC-1
+labelled <- assign %>%
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) %>%
+  dplyr::inner_join(dplyr::select(embedding, -tube), by = "cell")
+
+dplyr::tibble(
+  metric = c("cell-site assignments in the table",
+             "in a tube these two objects cover",
+             "matched to a cell in them",
+             "of those, cells passing QC",
+             "distinct cells with a clone label"),
+  value  = c(nrow(assign),
+             sum(assign$tube %in% unique(embedding$tube)),
+             nrow(labelled),
+             sum(labelled$pass_cell, na.rm = TRUE),
+             dplyr::n_distinct(labelled$cell))
+) %>% DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+Two separate drops are expected. Assignments in tubes these objects do not cover — the stroma tubes —
+fall out at the second row. The larger drop is at the third: the extraction uses every barcode Cell
+Ranger corrected, which is a substantially bigger set than the cells that survived calling and QC.
+The fourth row equals the third because these processed objects are already QC-filtered, so it is a
+consistency check rather than a further filter.
+
+## Do the labels land where the sort says they should?
+
+An independent check that costs nothing. These cells were FACS-sorted on mCherry protein before
+sequencing, and that sort knows nothing about soft-clipped reads. If the junctions are genuine vector
+integrations, labelled cells should sit almost entirely in the mCherry⁺ fraction.
+
+```{r sort-check}
+labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::count(sorted, name = "labelled cells") %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+A handful in the mCherry⁻ fraction is expected rather than alarming: the sort gates on protein, and a
+transduced cell expressing below the gate still carries the provirus. The same cells drove the
+false-negative discussion in the transgene-detection report.
+
+## Where the clones sit on the UMAP
+
+### Before QC filtering
+
+The embedding used everywhere else in this report is built from cells that passed QC. It is worth
+looking at the unfiltered one first, from `mpn_raw_processed_hsc` and `mpn_raw_processed_mnc`, for one
+reason: a clone label is attached to a *barcode*, and the extraction never consulted the QC flags. If
+labelled cells were concentrated in the part of the manifold that QC later removes — debris, dying
+cells, ambient-heavy droplets — that would undercut the whole analysis.
+
+```{r raw-embedding}
+raw_hsc <- cell_embedding(tar_read(mpn_raw_processed_hsc), "HSC"); gc(verbose = FALSE)
+raw_mnc <- cell_embedding(tar_read(mpn_raw_processed_mnc), "MNC"); gc(verbose = FALSE)
+embedding_raw <- dplyr::bind_rows(raw_hsc, raw_mnc)
+rm(raw_hsc, raw_mnc); gc(verbose = FALSE)
+
+labelled_raw <- assign |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::inner_join(dplyr::select(embedding_raw, -tube), by = "cell")
+```
+
+```{r umap-raw, fig.height=6, fig.width=11}
+raw_umap <- function(panel_name) {
+  bg <- dplyr::filter(embedding_raw, panel == panel_name)
+  fg <- dplyr::filter(labelled_raw,  panel == panel_name)
+  ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(colour = "grey88", size = 0.25, stroke = 0) +
+    geom_point(data = fg, aes(colour = site_id), size = 1.5, alpha = 0.9) +
+    scale_colour_manual(values = site_palette, drop = FALSE) +
+    labs(title = panel_name, colour = "clone",
+         subtitle = sprintf("%s barcodes before QC, %s carrying a detected integration site",
+                            scales::comma(nrow(bg)), scales::comma(nrow(fg)))) +
+    theme(axis.text = element_blank(), panel.grid = element_blank())
+}
+
+raw_umap("HSC") | raw_umap("MNC")
+```
+
+```{r raw-vs-clean}
+labelled_raw |>
+  dplyr::count(panel, pass_cell, name = "labelled barcodes") |>
+  tidyr::pivot_wider(names_from = pass_cell, values_from = `labelled barcodes`,
+                     values_fill = 0L, names_prefix = "pass_cell_") |>
+  dplyr::mutate(`% kept by QC` = sprintf("%.0f%%", 100 * pass_cell_TRUE /
+                                           (pass_cell_TRUE + pass_cell_FALSE))) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+Labelled barcodes are spread across the manifold rather than piled into one corner, so the labels are
+not an artefact of low-quality droplets. Their QC survival, though, does not simply track the overall
+rate, and the two compartments disagree about the direction:
+
+| | labelled barcodes kept | all barcodes kept |
+|---|---|---|
+| HSC | **82%** | 69% |
+| MNC | **58%** | 68% |
+
+In HSC, labelled barcodes are *enriched* for cells that pass. That is the expected direction and has
+a mechanical explanation: detection requires capturing one of a few read-through molecules, which is
+likelier in a deeply sequenced cell, and deeply sequenced cells also pass QC more often. Labelling is
+partly a depth assay.
+
+MNC runs the other way, modestly. I do not have an explanation for that, and with 128 labelled
+barcodes it is not a large enough sample to pursue one. It is recorded rather than explained, and it
+is worth remembering before treating HSC and MNC clone sizes as directly comparable — the two
+compartments do not lose labelled cells at the same rate.
+
+### After QC filtering
+
+This is the embedding the rest of the report uses.
+
+```{r umap-clones, fig.height=6, fig.width=11}
+clone_umap <- function(panel_name) {
+  bg  <- dplyr::filter(embedding, panel == panel_name, pass_cell)
+  fg  <- dplyr::filter(labelled,  panel == panel_name, pass_cell)
+  ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(colour = "grey88", size = 0.25, stroke = 0) +
+    geom_point(data = fg, aes(colour = site_id), size = 1.5, alpha = 0.9) +
+    # viridis rather than Set1: Set1 caps at 9 colours and we are already at 9 sites
+    scale_colour_manual(values = site_palette, drop = FALSE) +
+    labs(title = panel_name, colour = "clone",
+         subtitle = sprintf("%s cells, %s carrying a detected integration site",
+                            scales::comma(nrow(bg)), scales::comma(nrow(fg)))) +
+    theme(axis.text = element_blank(), panel.grid = element_blank())
+}
+
+clone_umap("HSC") | clone_umap("MNC")
+```
+
+Grey is every cell passing QC in that compartment; colour is the few hundred carrying a detected
+junction. The sparseness is the point and is not evidence of rarity — detection needs a read-through
+molecule to have been captured for that specific cell, so most members of a real clone carry no
+label. Read the colours as a *sample* of each clone, not its extent.
+
+## The same map, weighted by how well each cell is supported
+
+Every coloured dot above is drawn identically, which overstates the weaker ones. Each assignment
+rests on a different amount of evidence, and there are two measures of it that mean different things:
+
+| measure | range here | what it means |
+|---|---|---|
+| **UMIs** | 1 (96%), 2 (11 cells), 3 (2 cells) | *independent molecules* — the honest measure |
+| **reads** | 1–9 | sequencing depth on those molecules, mostly PCR duplicates |
+
+The principled choice is UMIs, and it is nearly useless here: 310 of 323 assignments rest on a single
+captured molecule. So size encodes **reads**, which at least varies, and a black ring marks the 13
+cells with more than one UMI — the only ones whose evidence is genuinely independent.
+
+```{r umap-confidence, fig.height=6, fig.width=11}
+confidence_umap <- function(panel_name) {
+  bg <- dplyr::filter(embedding, panel == panel_name, pass_cell)
+  fg <- dplyr::filter(labelled,  panel == panel_name, pass_cell) |>
+    dplyr::arrange(dplyr::desc(reads))      # large drawn first, so small stay visible on top
+  ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(colour = "grey88", size = 0.25, stroke = 0) +
+    # Two layers, and the no-border one uses stroke = 0 rather than a colour. Every other way of
+    # saying "no border" fails: colour = NA, whether mapped or fixed, makes ggplot treat the row as
+    # missing and drop the point at draw time, and "transparent" (= white at alpha 0) collides with
+    # alpha=, which overwrites the alpha channel and leaves an opaque white ring. stroke = 0 gives
+    # the border no width, so its colour never matters.
+    geom_point(data = dplyr::filter(fg, umis < 2),
+               aes(fill = site_id, size = reads),
+               shape = 21, stroke = 0, alpha = 0.85) +
+    geom_point(data = dplyr::filter(fg, umis >= 2),
+               aes(fill = site_id, size = reads),
+               shape = 21, colour = "black", stroke = 0.7, alpha = 0.85) +
+    scale_fill_manual(values = site_palette, drop = FALSE) +
+    # limits from the whole table, not the panel: otherwise each panel scales to its own maximum
+    # (6 in HSC, 9 in MNC) and a dot of a given size would mean different things in the two
+    scale_size_continuous(range = c(1.2, 5), breaks = c(1, 2, 4, 6, 9),
+                          limits = range(labelled$reads)) +
+    guides(fill = guide_legend(override.aes = list(size = 3))) +
+    labs(title = panel_name, fill = "clone", size = "reads") +
+    theme(axis.text = element_blank(), panel.grid = element_blank())
+}
+
+confidence_umap("HSC") | confidence_umap("MNC")
+```
+
+```{r confidence-table}
+labelled |>
+  dplyr::filter(pass_cell) |>
+  dplyr::mutate(support = dplyr::case_when(
+    umis >= 2   ~ "2+ UMIs (independent molecules)",
+    reads >= 3  ~ "1 UMI, 3+ reads",
+    reads == 2  ~ "1 UMI, 2 reads",
+    TRUE        ~ "1 UMI, 1 read (weakest)")) |>
+  dplyr::count(panel, support, name = "cells") |>
+  tidyr::pivot_wider(names_from = panel, values_from = cells, values_fill = 0L) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+The conclusion to draw from this figure is not that some dots are trustworthy and others are not. It
+is that **per-cell confidence is uniformly low**, because a cell is labelled only when one of its rare
+read-through molecules happened to be sequenced. The evidence for a clone is not in any single dot; it
+is in the 109 independent cells that carry IS01. Confidence lives at the site level, which is what the
+`≥3 cells and ≥3 UMIs` floor in the pipeline tests, and this plot is best read as a reminder that no
+individual dot should be leaned on.
+
+## Detected clones by replicate
+
+Each tube pools several hashtagged mice, and `dm2_class` records which one a cell was called to. That
+makes this the figure that decides whether the clones are what they appear to be. A lentiviral
+integration site is created once, in one transduced cell, in one animal. **A genuine clone must
+therefore sit inside a single replicate.** A site spread evenly across replicates is not a clone — it
+is cross-contamination, ambient vector, or a demultiplexing failure.
+
+Shown before and after QC filtering, for each compartment. The grey in each panel is that replicate's
+own cells.
+
+```{r replicate-umap-fn}
+replicate_umap <- function(emb, lab, panel_name, subtitle) {
+  bg <- dplyr::filter(emb, panel == panel_name, !is.na(replicate))
+  fg <- dplyr::filter(lab, panel == panel_name, !is.na(replicate))
+  ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(colour = "grey85", size = 0.18, stroke = 0) +
+    geom_point(data = fg, aes(colour = site_id), size = 1.3, alpha = 0.9) +
+    scale_colour_manual(values = site_palette, drop = FALSE) +
+    facet_wrap(~ replicate, nrow = 1, drop = FALSE) +
+    guides(colour = guide_legend(override.aes = list(size = 3))) +
+    labs(title = panel_name, subtitle = subtitle, colour = "clone", x = NULL, y = NULL) +
+    theme(axis.text = element_blank(), panel.grid = element_blank(),
+          strip.text = element_text(size = 8))
+}
+```
+
+```{r replicate-hsc, fig.height=3.2, fig.width=13}
+replicate_umap(embedding_raw, labelled_raw, "HSC", "before QC filtering")
+replicate_umap(dplyr::filter(embedding, pass_cell), dplyr::filter(labelled, pass_cell),
+               "HSC", "after QC filtering")
+```
+
+```{r replicate-mnc, fig.height=3.2, fig.width=13}
+replicate_umap(embedding_raw, labelled_raw, "MNC", "before QC filtering")
+replicate_umap(dplyr::filter(embedding, pass_cell), dplyr::filter(labelled, pass_cell),
+               "MNC", "after QC filtering")
+```
+
+```{r replicate-table}
+dplyr::bind_rows(
+  dplyr::mutate(labelled_raw, stage = "before QC"),
+  dplyr::mutate(dplyr::filter(labelled, pass_cell), stage = "after QC")
+) |>
+  dplyr::filter(!is.na(replicate)) |>
+  dplyr::count(stage, panel, site_id, replicate, name = "cells") |>
+  tidyr::pivot_wider(names_from = replicate, values_from = cells,
+                     values_fill = 0L, names_prefix = "") |>
+  dplyr::arrange(stage, panel, site_id) |>
+  DT::datatable(rownames = FALSE, filter = "top",
+                options = list(pageLength = 20, scrollX = TRUE))
+```
+
+Read the table rather than the figure for this one: the question is whether each row has its mass in a
+single column. Where a site is confined to one replicate, it behaves like a clone. Where it is spread,
+it does not, whatever its total cell count — and that is a check the site-level thresholds in the
+pipeline cannot make, because they only count cells and UMIs.
+
+## The same map, split by sample
+
+Each compartment pools three samples, and they are not equivalent: one sorted mCherry⁺, one sorted
+mCherry⁻, one wild-type. Pooling them hides the single most informative comparison, because the
+wild-type samples are the assay's negative control and should be empty.
+
+`sample.name` is one-to-one with the tube, so the six samples are exactly the six cells of this grid.
+Faceting on the sort fraction rather than the name itself keeps each compartment in its own row — the
+two UMAPs are separate embeddings and must not be drawn in each other's panels.
+
+Each panel shows **that sample's own cells** in grey, with its detected clones highlighted on top. So
+the grey is a result too, not just scenery: it is where that sample sits in the shared embedding, and
+the three samples do not occupy it identically.
+
+```{r umap-by-sample, fig.height=7, fig.width=12}
+sample_key <- embedding %>%
+  dplyr::distinct(panel, sorted, sample_name, tube) %>%
+  dplyr::arrange(panel, sorted)
+
+ggplot(dplyr::filter(labelled, pass_cell), aes(UMAP_1, UMAP_2)) +
+  # The grey keeps `sorted`, so each panel is that sample's own cells and nothing else.
+  geom_point(data = dplyr::filter(embedding, pass_cell),
+             colour = "grey80", size = 0.2, stroke = 0) +
+  geom_point(aes(colour = site_id), size = 1.6, alpha = 0.9) +
+  scale_colour_manual(values = site_palette, drop = FALSE) +
+  # drop = FALSE keeps the wild-type column, which has no labelled cells and is the point
+  facet_grid(panel ~ sorted, switch = "y", drop = FALSE) +
+  labs(title = "Detected clones by sample", colour = "clone", x = NULL, y = NULL) +
+  theme(axis.text = element_blank(), panel.grid = element_blank(),
+        strip.text.y.left = element_text(angle = 0))
+```
+
+```{r sample-key}
+labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::count(panel, sorted, name = "labelled cells") %>%
+  dplyr::right_join(sample_key, by = c("panel", "sorted")) %>%
+  dplyr::mutate(`labelled cells` = tidyr::replace_na(`labelled cells`, 0L)) %>%
+  dplyr::select(sample = sample_name, tube, compartment = panel, sorted, `labelled cells`) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+The wild-type columns are the result to check first. Those animals never received the vector, so a
+clone label there would be an outright false positive — ambient contamination or index hopping — and
+would put a number on the floor beneath every other panel. The mCherry⁻ columns are a different
+matter: those cells failed a gate on *protein*, which is not the same as lacking the provirus, so a
+label there is informative rather than wrong.
+
+```{r umap-facet, fig.height=7, fig.width=11}
+# One panel per clone, so sites with few cells are not hidden under the larger ones. The grey layer
+# carries `panel` but not `site_id`, so ggplot repeats it across every column of the grid while
+# keeping each compartment on its own row - no cross join needed.
+ggplot(dplyr::filter(labelled, pass_cell), aes(UMAP_1, UMAP_2)) +
+  geom_point(data = dplyr::select(dplyr::filter(embedding, pass_cell),
+                                  panel, UMAP_1, UMAP_2),
+             colour = "grey90", size = 0.15, stroke = 0) +
+  geom_point(colour = "firebrick", size = 1.1) +
+  facet_grid(panel ~ site_id, switch = "y") +
+  labs(title = "Each clone on its own panel",
+       x = NULL, y = NULL) +
+  theme(axis.text = element_blank(), panel.grid = element_blank(),
+        strip.text.y.left = element_text(angle = 0))
+```
+
+A clone confined to one region of the embedding would suggest its cells share a state; one scattered
+across the map suggests the opposite. With these numbers, treat any apparent clustering cautiously —
+a handful of cells will look clustered by chance on a map of tens of thousands.
+
+## Clone sizes by compartment
+
+```{r clone-sizes}
+labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::count(site_id, sorted, panel, name = "cells") %>%
+  tidyr::pivot_wider(names_from = panel, values_from = cells, values_fill = 0) %>%
+  dplyr::mutate(total = rowSums(dplyr::pick(dplyr::where(is.numeric)))) %>%
+  dplyr::arrange(dplyr::desc(total)) %>%
+  DT::datatable(rownames = FALSE, options = list(pageLength = 20, scrollX = TRUE))
+```
+
+Reading a clone present in both HSC and MNC as evidence of ongoing output from a labelled stem cell is
+tempting, and it is the interesting hypothesis — but note the asymmetry in what the two fractions
+sample, and that both are drawn from the same ambient pool, before leaning on it.
+
+## Cells carrying more than one site
+
+```{r ambiguous}
+amb <- labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::distinct(tube, barcode, n_sites_in_cell)
+
+dplyr::count(amb, n_sites_in_cell, name = "cells") %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+These are flagged rather than resolved, deliberately. A cell showing two strong junctions is either a
+genuine multi-copy integrant or a doublet, and this assay cannot tell the difference. Treating them as
+multi-copy clones would inflate clone counts; dropping them would deflate them. They are marked
+`ambiguous` so downstream analyses can make that choice explicitly.
+
+
+# Limitations
+
+**Only intact proviruses are visible.** The junction filter requires a clean processed `CA`. Integrants
+with deleted or rearranged LTR ends present no such junction and are invisible here. For clonality
+that is arguably a feature, but it means site counts are a floor, not a census.
+
+**The junction position is tied to the contig boundary.** 3236 is the last base of *this* contig. If
+the cassette is ever re-cut with a different 3′ boundary, the filter position must move with it; the
+constant lives in `scripts/slurm/analysis/integration-sites.sh`.
+
+**Detection is read-through-limited, so absence is weak evidence.** A cell is labelled only if one of
+its few read-through molecules happened to be captured and sequenced. Most cells in a real clone carry
+no label. Clone *sizes* here are therefore samples, not counts, and comparing them across tubes
+assumes comparable depth.
+
+**Small sites sit near the background.** Whatever the wild-type tubes show is the floor for index
+hopping and ambient contamination; a site supported by three cells in one tube is not obviously above
+it. The `≥3 cells and ≥3 UMIs` threshold is the one genuinely arbitrary parameter in the chain, and
+the waterfall above is printed so it can be revisited.
+
+**Clip length biases which loci are findable.** A junction whose flanking host sequence is repetitive
+yields clips that align with MAPQ 0 and is silently lost. Sites are therefore enriched for integrations
+into unique sequence — which is also where genes are, partly confounding the intragenic enrichment
+used above as a sanity check.
