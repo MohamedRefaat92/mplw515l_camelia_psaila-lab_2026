@@ -1,0 +1,509 @@
+---
+title: "Alternative Dimensionality Reductions: PHATE, ForceAtlas2, NMF & Diffusion Map"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+PHATE and FA2 coordinates are pre-computed in the targets pipeline
+(`phate_coords_*`, `fa2_coords_*`) and slotted into the Seurat object via
+`CreateDimReducObject()`. The object is kept in memory across all tabs per
+compartment so standard `DimPlot()` / `FeaturePlot()` calls apply throughout.
+
+NMF (RcppML) and Diffusion Map (destiny) are computed inline in this notebook
+on the HSC compartment using SCT-normalised expression.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(RcppML)
+library(Matrix)
+library(destiny)
+library(targets)
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r params}
+targets::tar_load(proc_params)
+INSPECT_RES <- 0.5
+```
+
+```{r helpers}
+cluster_col_res <- function(md, res) {
+  pat <- paste0("_res\\.", gsub("\\.", "\\\\.", res), "$")
+  grep(pat, colnames(md), value = TRUE)[1]
+}
+
+add_dimreduc <- function(srt, coords, name, key) {
+  srt[[name]] <- Seurat::CreateDimReducObject(
+    embeddings = coords, key = key, assay = DefaultAssay(srt)
+  )
+  srt
+}
+```
+
+---
+
+# 1 · HSC {.tabset}
+
+```{r hsc-load}
+targets::tar_load(c(mpn_processed_data_hsc, phate_coords_hsc, fa2_coords_hsc))
+srt <- add_dimreduc(mpn_processed_data_hsc, phate_coords_hsc, "phate", "PHATE_")
+srt <- add_dimreduc(srt,                    fa2_coords_hsc,   "fa2",   "FA2_")
+rm(mpn_processed_data_hsc, phate_coords_hsc, fa2_coords_hsc); gc()
+clust_col <- cluster_col_res(srt@meta.data, INSPECT_RES)
+```
+
+::: {.panel-tabset}
+
+### UMAP — clusters
+
+```{r hsc-umap-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "umap.nn", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("HSC — UMAP (clusters)")
+```
+
+### UMAP — by sample
+
+```{r hsc-umap-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "umap.nn", group.by = clust_col,
+        split.by = "sample.name",label = TRUE, pt.size = 0.3) +
+  NoLegend() + ggtitle("HSC — UMAP by sample")
+```
+
+### PHATE — clusters
+
+```{r hsc-phate-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "phate", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("HSC — PHATE (clusters)")
+```
+
+### PHATE — by sample
+
+```{r hsc-phate-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "phate", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("HSC — PHATE by sample")
+```
+
+### FA2 — clusters
+
+```{r hsc-fa2-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "fa2", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("HSC — ForceAtlas2 (clusters)")
+```
+
+### FA2 — by sample
+
+```{r hsc-fa2-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "fa2", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("HSC — ForceAtlas2 by sample")
+```
+
+:::
+
+```{r hsc-cleanup}
+rm(srt); gc()
+```
+
+---
+
+# 2 · MNC {.tabset}
+
+```{r mnc-load}
+targets::tar_load(c(mpn_processed_data_mnc, phate_coords_mnc, fa2_coords_mnc))
+srt <- add_dimreduc(mpn_processed_data_mnc, phate_coords_mnc, "phate", "PHATE_")
+srt <- add_dimreduc(srt,                    fa2_coords_mnc,   "fa2",   "FA2_")
+rm(mpn_processed_data_mnc, phate_coords_mnc, fa2_coords_mnc); gc()
+clust_col <- cluster_col_res(srt@meta.data, INSPECT_RES)
+```
+
+::: {.panel-tabset}
+
+### UMAP — clusters
+
+```{r mnc-umap-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "umap.nn", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("MNC — UMAP (clusters)")
+```
+
+### UMAP — by sample
+
+```{r mnc-umap-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "umap.nn", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("MNC — UMAP by sample")
+```
+
+### PHATE — clusters
+
+```{r mnc-phate-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "phate", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("MNC — PHATE (clusters)")
+```
+
+### PHATE — by sample
+
+```{r mnc-phate-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "phate", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("MNC — PHATE by sample")
+```
+
+### FA2 — clusters
+
+```{r mnc-fa2-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "fa2", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("MNC — ForceAtlas2 (clusters)")
+```
+
+### FA2 — by sample
+
+```{r mnc-fa2-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "fa2", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("MNC — ForceAtlas2 by sample")
+```
+
+:::
+
+```{r mnc-cleanup}
+rm(srt); gc()
+```
+
+---
+
+# 3 · Stroma {.tabset}
+
+```{r stroma-load}
+targets::tar_load(c(mpn_processed_data_stroma, phate_coords_stroma, fa2_coords_stroma))
+srt <- add_dimreduc(mpn_processed_data_stroma, phate_coords_stroma, "phate", "PHATE_")
+srt <- add_dimreduc(srt,                       fa2_coords_stroma,   "fa2",   "FA2_")
+rm(mpn_processed_data_stroma, phate_coords_stroma, fa2_coords_stroma); gc()
+clust_col <- cluster_col_res(srt@meta.data, INSPECT_RES)
+```
+
+::: {.panel-tabset}
+
+### UMAP — clusters
+
+```{r stroma-umap-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "umap.nn", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("Stroma — UMAP (clusters)")
+```
+
+### UMAP — by sample
+
+```{r stroma-umap-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "umap.nn", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("Stroma — UMAP by sample")
+```
+
+### PHATE — clusters
+
+```{r stroma-phate-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "phate", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("Stroma — PHATE (clusters)")
+```
+
+### PHATE — by sample
+
+```{r stroma-phate-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "phate", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("Stroma — PHATE by sample")
+```
+
+### FA2 — clusters
+
+```{r stroma-fa2-clust}
+#| fig-width: 8
+#| fig-height: 6
+DimPlot(srt, reduction = "fa2", group.by = clust_col, label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("Stroma — ForceAtlas2 (clusters)")
+```
+
+### FA2 — by sample
+
+```{r stroma-fa2-sample}
+#| fig-width: 14
+#| fig-height: 8
+DimPlot(srt, reduction = "fa2", group.by = clust_col,
+        split.by = "sample.name", ncol = 4, pt.size = 0.3) +
+  NoLegend() + ggtitle("Stroma — ForceAtlas2 by sample")
+```
+
+:::
+
+```{r stroma-cleanup}
+rm(srt); gc()
+```
+
+---
+
+# 4 · NMF — HSC
+
+Non-negative Matrix Factorisation decomposes the SCT expression matrix into
+`k` gene programs (**W**, genes × k) and per-cell program activities (**H**, k × cells).
+Run on non-HVG genes so the programs capture stable transcriptional structure
+not dominated by the features already driving the PCA/UMAP.
+
+```{r nmf-load}
+targets::tar_load(mpn_processed_hsc)
+clust_col_nmf <- cluster_col_res(mpn_processed_hsc@meta.data, INSPECT_RES)
+```
+
+```{r nmf-run}
+NMF_K   <- 10L   # number of components — adjust after inspecting MSE elbow below
+NMF_SEED <- 42L
+
+mat_nmf <- Seurat::GetAssayData(mpn_processed_hsc, assay = "SCT", layer = "data")
+
+# Exclude HVGs so programs capture stable (non-highly-variable) structure.
+# To run on HVGs instead, remove the next line.
+mat_nmf <- mat_nmf[!rownames(mat_nmf) %in% Seurat::VariableFeatures(mpn_processed_hsc), ]
+
+cat("Matrix dimensions (genes × cells):", nrow(mat_nmf), "×", ncol(mat_nmf), "\n")
+
+nmf_res <- RcppML::nmf(mat_nmf, k = NMF_K, seed = NMF_SEED, tol = 1e-4, verbose = FALSE)
+
+# Attach per-cell activities as metadata
+h_df           <- as.data.frame(t(nmf_res$h))     # cells × k
+colnames(h_df) <- paste0("NMF_", seq_len(ncol(h_df)))
+rownames(h_df) <- colnames(mpn_processed_hsc)
+mpn_processed_hsc <- Seurat::AddMetaData(mpn_processed_hsc, h_df)
+
+cat("NMF complete — k =", NMF_K, "\n")
+```
+
+## MSE by component
+
+```{r nmf-mse, fig.width=5, fig.height=4}
+# Per-component reconstruction MSE as a rough elbow diagnostic
+mse_vals <- sapply(seq_len(NMF_K), function(i) {
+  recon <- nmf_res$w[, i, drop = FALSE] %*% nmf_res$h[i, , drop = FALSE]
+  mean((mat_nmf - recon)^2)
+})
+
+ggplot(data.frame(k = seq_len(NMF_K), mse = mse_vals),
+       aes(k, mse)) +
+  geom_line(colour = "steelblue4") +
+  geom_point(colour = "steelblue4", size = 2) +
+  scale_x_continuous(breaks = seq_len(NMF_K)) +
+  labs(x = "NMF component", y = "MSE",
+       title = "Per-component reconstruction MSE") +
+  theme_cowplot(font_size = 11)
+```
+
+## Program activity — UMAP {.tabset}
+
+```{r nmf-umap, fig.width=14, fig.height=10}
+Seurat::FeaturePlot(
+  mpn_processed_hsc,
+  features  = paste0("NMF_", seq_len(NMF_K)),
+  reduction = "umap.nn",
+  ncol      = 4,
+  pt.size   = 0.2,
+  order     = TRUE
+) & scale_colour_viridis_c(option = "plasma") &
+  theme(plot.title = element_text(size = 9))
+```
+
+## Program activity — by sample
+
+```{r nmf-umap-sample, fig.width=14, fig.height=10}
+Seurat::DimPlot(
+  mpn_processed_hsc,
+  reduction = "umap.nn",
+  group.by  = clust_col_nmf,
+  split.by  = "sample.name",
+  label     = TRUE,
+  ncol      = 4,
+  pt.size   = 0.3
+) + Seurat::NoLegend() + ggtitle("HSC — clusters by sample")
+```
+
+## Top genes per component
+
+```{r nmf-top-genes}
+w_mat           <- nmf_res$w
+rownames(w_mat) <- rownames(mat_nmf)
+
+top_genes_nmf <- dplyr::bind_rows(lapply(seq_len(ncol(w_mat)), function(k) {
+  scores <- sort(w_mat[, k], decreasing = TRUE)
+  data.frame(
+    component = paste0("NMF_", k),
+    gene      = names(scores)[1:20],
+    score     = round(scores[1:20], 4)
+  )
+}))
+
+DT::datatable(
+  top_genes_nmf,
+  rownames = FALSE,
+  filter   = "top",
+  caption  = "Top 20 genes per NMF component (W matrix loading score)",
+  options  = list(pageLength = 20, scrollX = TRUE)
+)
+```
+
+```{r nmf-cleanup}
+rm(mat_nmf, nmf_res, h_df, w_mat, top_genes_nmf, mse_vals)
+gc()
+```
+
+---
+
+# 5 · Diffusion Map — HSC
+
+Diffusion Map (Coifman & Lafon 2006; `destiny` implementation) captures
+continuous manifold structure by computing eigenvectors of the diffusion operator
+on the cell–cell similarity graph. The resulting diffusion components are used
+to build a UMAP, which is then compared to the SNN-based UMAP.
+
+```{r dm-run}
+# Dense cells × HVGs matrix required by destiny
+hvg_dm  <- Seurat::VariableFeatures(mpn_processed_hsc)
+mat_dm  <- Seurat::GetAssayData(mpn_processed_hsc, assay = "SCT", layer = "data")
+mat_dm  <- t(as.matrix(mat_dm[hvg_dm, ]))   # cells × HVGs
+
+cat("DiffusionMap input:", nrow(mat_dm), "cells ×", ncol(mat_dm), "HVGs\n")
+
+set.seed(42)
+dm <- destiny::DiffusionMap(mat_dm)
+
+dc_emb           <- destiny::eigenvectors(dm)
+rownames(dc_emb) <- colnames(mpn_processed_hsc)
+colnames(dc_emb) <- paste0("DC_", seq_len(ncol(dc_emb)))
+
+mpn_processed_hsc[["diffmap"]] <- Seurat::CreateDimReducObject(
+  embeddings = dc_emb,
+  key        = "DC_",
+  assay      = "SCT"
+)
+
+# UMAP from diffusion components
+mpn_processed_hsc <- Seurat::RunUMAP(
+  mpn_processed_hsc,
+  reduction      = "diffmap",
+  dims           = 1:20,
+  reduction.name = "umap_dm",
+  reduction.key  = "UMAPdm_",
+  verbose        = FALSE
+)
+
+cat("Diffusion UMAP ready.\n")
+```
+
+## Diffusion components — eigenvalue spectrum
+
+```{r dm-eigenvalues, fig.width=6, fig.height=4}
+evals <- destiny::eigenvalues(dm)
+ggplot(data.frame(DC = seq_along(evals), eigenvalue = evals),
+       aes(DC, eigenvalue)) +
+  geom_line(colour = "steelblue4") +
+  geom_point(colour = "steelblue4", size = 2) +
+  labs(x = "Diffusion component", y = "Eigenvalue",
+       title = "Diffusion Map eigenvalue spectrum") +
+  theme_cowplot(font_size = 11)
+```
+
+## UMAP comparison: SNN-PCA vs Diffusion
+
+```{r dm-umap-compare, fig.width=14, fig.height=6}
+p1 <- Seurat::DimPlot(mpn_processed_hsc, reduction = "umap.nn",
+                      group.by = clust_col_nmf, label = TRUE, repel = TRUE) +
+  Seurat::NoLegend() + ggtitle("SNN-PCA UMAP")
+
+p2 <- Seurat::DimPlot(mpn_processed_hsc, reduction = "umap_dm",
+                      group.by = clust_col_nmf, label = TRUE, repel = TRUE) +
+  Seurat::NoLegend() + ggtitle("Diffusion Map UMAP")
+
+p1 | p2
+```
+
+## Diffusion UMAP — by sample
+
+```{r dm-umap-sample, fig.width=14, fig.height=8}
+Seurat::DimPlot(
+  mpn_processed_hsc,
+  reduction = "umap_dm",
+  group.by  = clust_col_nmf,
+  split.by  = "sample.name",
+  label     = TRUE,
+  ncol      = 4,
+  pt.size   = 0.3
+) + Seurat::NoLegend() + ggtitle("HSC — Diffusion UMAP by sample")
+```
+
+## Top diffusion components on SNN-UMAP
+
+```{r dm-dc-umap, fig.width=14, fig.height=8}
+# Attach DC coordinates as metadata for FeaturePlot
+dc_meta <- as.data.frame(dc_emb[, 1:6])
+mpn_processed_hsc <- Seurat::AddMetaData(mpn_processed_hsc, dc_meta)
+
+Seurat::FeaturePlot(
+  mpn_processed_hsc,
+  features  = paste0("DC_", 1:6),
+  reduction = "umap.nn",
+  ncol      = 3,
+  pt.size   = 0.2,
+  order     = TRUE
+) & scale_colour_viridis_c(option = "mako") &
+  theme(plot.title = element_text(size = 9))
+```
+
+```{r dm-cleanup}
+rm(mat_dm, dm, dc_emb, dc_meta)
+rm(mpn_processed_hsc)
+gc()
+```
+
+{{< include ../_session-info.qmd >}}

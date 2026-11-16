@@ -1,0 +1,409 @@
+---
+title: "Dimensionality Reduction & Clustering (RNA / lognorm)"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+> **Exploratory / archival notebook.** This notebook is self-contained and performs
+> its own computation. It is **not** part of the standard render pipeline and does
+> **not** connect to the targets store for its results.
+>
+> It exists as a one-off comparison of lognorm RNA clustering vs the SCTransform
+> path used in the pipeline. The parameter choice (SCT) has been made and frozen
+> in `metadata/project_config.yaml`. Run this notebook manually if needed; do not include
+> it in automated renders.
+
+Per-compartment exploration using **lognorm RNA** as the reference assay.
+Each subset: NormalizeData → FindVariableFeatures → ScaleData → PCA → cluster → UMAP.
+
+> **Note:** The targets pipeline uses SCTransform (`REF_ASSAY = "SCT"`), not lognorm RNA.
+> UMAPs here will differ from the analysis report — use the SCT notebook for pipeline-identical results.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(targets)
+library(harmony)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r params}
+targets::tar_load(proc_params)
+targets::tar_load(excluded_genes)
+
+REF_ASSAY    <- "RNA"
+N_FEATURES   <- proc_params$n_features
+N_DIMS       <- proc_params$n_pca_dims
+K            <- proc_params$k_neighbors
+pca_name     <- paste0("pca.", REF_ASSAY)
+clust_prefix <- paste0("^sNN_pca\\.", REF_ASSAY, "_")
+
+# ── Edit the grid ──────────────────────────────────────────────────
+DIMS_GRID   <- c(15, 30, 50)
+K_GRID      <- c(20, 30)
+RES_SCAN    <- c(0.1, 0.2, 0.3, 0.5, 0.6, 0.7)
+INSPECT_RES <- proc_params$marker_resolution
+K_UMAP      <- proc_params$n_umap_neighbors
+# ──────────────────────────────────────────────────────────────────
+
+SUBSET_NAMES <- c("hsc", "mnc", "stroma")
+```
+
+```{r helpers}
+cluster_col_res <- function(md, res) {
+  pat <- paste0("_res\\.", gsub("\\.", "\\\\.", res), "$")
+  grep(pat, colnames(md), value = TRUE)[1]
+}
+
+# Extract lightweight plot data from one processed+run Seurat object
+extract_run_data <- function(srt_i) {
+  umap <- as.data.frame(Seurat::Embeddings(srt_i, "umap.nn")[, 1:2])
+  colnames(umap) <- c("UMAP1", "UMAP2")
+  md   <- srt_i@meta.data[, grep(paste0(clust_prefix, "|^sample\\.name$"),
+                                   colnames(srt_i@meta.data)), drop = FALSE]
+  cbind(umap, md)
+}
+
+# Extract elbow + PCA data frames (before neighbour/UMAP)
+extract_preprocess_data <- function(srt) {
+  elbow <- Seurat::ElbowPlot(srt, ndims = 50,
+                              reduction = paste0("pca.", REF_ASSAY))$data
+
+  pca_emb <- as.data.frame(Seurat::Embeddings(srt, paste0("pca.", REF_ASSAY))[, 1:2])
+  colnames(pca_emb) <- c("PC1", "PC2")
+  pca_emb$sample    <- srt$sample.name
+
+  # PCA UMAP (for visual comparison with Harmony)
+  suppressMessages(invisible(capture.output({
+    srt <- Seurat::RunUMAP(srt,
+                            dims           = seq(N_DIMS),
+                            reduction      = paste0("pca.", REF_ASSAY),
+                            n.neighbors    = K_UMAP,
+                            reduction.name = "umap.pca",
+                            return.model   = FALSE,
+                            verbose        = FALSE)
+  })))
+  umap_pca <- as.data.frame(Seurat::Embeddings(srt, "umap.pca")[, 1:2])
+  colnames(umap_pca) <- c("UMAP1", "UMAP2")
+  umap_pca$sample    <- srt$sample.name
+
+  # Harmony integration on sample.name — for visual comparison only
+  suppressMessages(invisible(capture.output({
+    srt <- harmony::RunHarmony(srt,
+                                group.by.vars  = "sample.name",
+                                reduction      = paste0("pca.", REF_ASSAY),
+                                reduction.save = "harmony",
+                                verbose        = FALSE)
+    srt <- Seurat::RunUMAP(srt,
+                            dims           = seq(N_DIMS),
+                            reduction      = "harmony",
+                            n.neighbors    = K_UMAP,
+                            reduction.name = "umap.harmony",
+                            return.model   = FALSE,
+                            verbose        = FALSE)
+  })))
+  umap_harmony <- as.data.frame(Seurat::Embeddings(srt, "umap.harmony")[, 1:2])
+  colnames(umap_harmony) <- c("UMAP1", "UMAP2")
+  umap_harmony$sample    <- srt$sample.name
+
+  list(elbow = elbow, pca = pca_emb, umap_pca = umap_pca, umap_harmony = umap_harmony)
+}
+
+scatter_emb <- function(df, x, y, colour_col, title, guide_title) {
+  ggplot(df, aes(x = .data[[x]], y = .data[[y]], colour = .data[[colour_col]])) +
+    geom_point(size = 0.7, alpha = 0.5) +
+    labs(title = title, colour = guide_title) +
+    guides(colour = guide_legend(override.aes = list(size = 4))) +
+    theme_bw() +
+    theme(legend.position = "bottom", legend.text = element_text(size = 7))
+}
+```
+
+```{r run-all, message=FALSE, warning=FALSE, results='hide'}
+#| cache: true
+# Lognorm RNA preprocessing helper — mirrors preprocess_seurat() structure
+# but uses NormalizeData → FindVariableFeatures → ScaleData → RunPCA.
+preprocess_rna <- function(srt) {
+  out <- NULL
+  suppressMessages(invisible(capture.output({
+    out <- Seurat::NormalizeData(srt, verbose = FALSE) |>
+      Seurat::FindVariableFeatures(selection.method = "vst",
+                                   nfeatures        = N_FEATURES,
+                                   verbose          = FALSE)
+    Seurat::VariableFeatures(out) <- setdiff(Seurat::VariableFeatures(out), excluded_genes)
+    out <- out |>
+      Seurat::ScaleData(verbose = FALSE) |>
+      Seurat::RunPCA(assay          = REF_ASSAY,
+                     reduction.name = pca_name,
+                     verbose        = FALSE)
+  })))
+  out
+}
+
+subset_data <- list()
+for (nm in SUBSET_NAMES) {
+  target_nm <- paste0("mpn_clean_", nm)
+  targets::tar_load_raw(target_nm)
+  raw_srt <- get(target_nm)
+  rm(list = target_nm)
+
+  # Preprocess once for elbow/PCA plots
+  srt_pre <- preprocess_rna(raw_srt)
+  pre     <- extract_preprocess_data(srt_pre)
+  rm(srt_pre); gc()
+
+  runs <- list()
+  for (n_dims in DIMS_GRID) {
+    for (k in K_GRID) {
+      label <- paste0("dims", n_dims, "_k", k)
+      suppressMessages(invisible(capture.output({
+        # Preprocess fresh each run so dims/k differences start from the same input
+        srt_i <- preprocess_rna(raw_srt)
+        srt_i <- find_neighbors_clusters(srt_i,
+                                         dims_i    = seq(n_dims),
+                                         ref_assay = REF_ASSAY,
+                                         k         = k,
+                                         res       = RES_SCAN)
+        srt_i <- Seurat::RunUMAP(srt_i,
+                                  n.neighbors    = K_UMAP,
+                                  nn.name        = Seurat::Neighbors(srt_i),
+                                  reduction.name = "umap.nn",
+                                  return.model   = FALSE,
+                                  verbose        = FALSE)
+      })))
+      runs[[label]] <- extract_run_data(srt_i)
+      rm(srt_i); gc()
+    }
+  }
+
+  rm(raw_srt); gc()
+  subset_data[[nm]] <- list(pre = pre, runs = runs)
+}
+message("Done: ", paste(SUBSET_NAMES, collapse = ", "))
+```
+
+---
+
+## 1. Normalise → PCA {.tabset}
+
+::: {.panel-tabset}
+
+```{r pca-tabs}
+#| results: asis
+#| fig-width: 7
+#| fig-height: 6
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+  pre <- subset_data[[nm]]$pre
+
+  p_elbow <- ggplot(pre$elbow, aes(x = dims, y = stdev)) +
+    geom_point() +
+    geom_vline(xintercept = N_DIMS, linetype = "dashed", colour = "firebrick") +
+    labs(title    = paste0("PCA elbow — ", nm),
+         subtitle = paste0("Dashed = n_pca_dims = ", N_DIMS),
+         x = "PC", y = "Std Dev") +
+    theme_bw()
+
+  p_pca  <- scatter_emb(pre$pca, "PC1", "PC2", "sample",
+                        paste0("PCA — ", nm), "Sample")
+
+  print(p_elbow / p_pca)
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 2. PCA vs Harmony UMAP — coloured by sample {.tabset}
+
+Visual comparison of UMAP computed from PCA vs Harmony-corrected embeddings.
+Harmony is run on `sample.name` for batch correction assessment only — it is
+not used in any downstream analysis.
+
+::: {.panel-tabset}
+
+```{r harmony-comparison-tabs}
+#| results: asis
+#| fig-width: 12
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+  pre <- subset_data[[nm]]$pre
+
+  p_pca <- scatter_emb(pre$umap_pca, "UMAP1", "UMAP2", "sample",
+                       paste0(nm, " — PCA UMAP"), "Sample")
+  p_har <- scatter_emb(pre$umap_harmony, "UMAP1", "UMAP2", "sample",
+                       paste0(nm, " — Harmony UMAP"), "Sample")
+  print(p_pca | p_har)
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 3. UMAP — coloured by sample {.tabset}
+
+::: {.panel-tabset}
+
+```{r umap-sample-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  runs <- subset_data[[nm]]$runs
+  cat("\n\n### ", nm, "\n\n")
+
+  plots <- list()
+  for (lbl in names(runs)) {
+    df          <- runs[[lbl]]
+    plots[[lbl]] <- scatter_emb(df, "UMAP1", "UMAP2", "sample.name", lbl, "Sample") +
+      theme(legend.position = "bottom", legend.text = element_text(size = 7))
+  }
+  print(wrap_plots(plots, ncol = length(K_GRID)))
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 4. UMAP — coloured by cluster (res `r INSPECT_RES`) {.tabset}
+
+::: {.panel-tabset}
+
+```{r umap-cluster-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  runs <- subset_data[[nm]]$runs
+  cat("\n\n### ", nm, "\n\n")
+
+  plots <- list()
+  for (lbl in names(runs)) {
+    df        <- runs[[lbl]]
+    col       <- cluster_col_res(df, INSPECT_RES)
+    df[[col]] <- factor(df[[col]])
+    centroids <- df |> group_by(.data[[col]]) |>
+      summarise(UMAP1 = median(UMAP1), UMAP2 = median(UMAP2), .groups = "drop")
+    plots[[lbl]] <- ggplot(df, aes(x = UMAP1, y = UMAP2, colour = .data[[col]])) +
+      geom_point(size = 0.5, alpha = 0.5, show.legend = FALSE) +
+      ggrepel::geom_label_repel(data = centroids,
+                                aes(label = .data[[col]]),
+                                size = 3, show.legend = FALSE,
+                                label.padding = unit(0.15, "lines"),
+                                max.overlaps = Inf) +
+      labs(title = lbl) +
+      theme_void(base_size = 9) +
+      theme(plot.title = element_text(hjust = 0.5))
+  }
+  print(wrap_plots(plots, ncol = length(K_GRID)))
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 5. Resolution scan {.tabset}
+
+Pick one run per subset and inspect how cluster count varies with resolution.
+
+::: {.panel-tabset}
+
+```{r res-scan-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 8
+
+for (nm in SUBSET_NAMES) {
+  runs <- subset_data[[nm]]$runs
+  cat("\n\n### ", nm, "\n\n")
+
+  inspect_run <- paste0("dims", N_DIMS, "_k", K)
+  if (!inspect_run %in% names(runs)) inspect_run <- names(runs)[1]
+  df <- runs[[inspect_run]]
+
+  clust_cols <- grep(paste0(clust_prefix, ".*_res\\."),
+                     colnames(df), value = TRUE)
+
+  res_rows <- list()
+  for (col in clust_cols) {
+    res_rows[[col]] <- data.frame(
+      resolution = sub(paste0(clust_prefix, "\\d+_"), "", col),
+      n_clusters = nlevels(factor(df[[col]]))
+    )
+  }
+  res_summary <- do.call(rbind, res_rows)
+  rm(res_rows)
+  p_bar <- ggplot(res_summary, aes(x = resolution, y = n_clusters)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    labs(title = paste0("Cluster count vs resolution — ", nm, " (", inspect_run, ")"),
+         x = "Resolution", y = "# clusters") +
+    theme_bw()
+
+  strip_plots <- list()
+  for (col in clust_cols) {
+    res_label    <- sub(paste0(clust_prefix, "\\d+_"), "", col)
+    n_cl         <- nlevels(factor(df[[col]]))
+    df[[col]]    <- factor(df[[col]])
+    centroids    <- df |> group_by(.data[[col]]) |>
+      summarise(UMAP1 = median(UMAP1), UMAP2 = median(UMAP2), .groups = "drop")
+    strip_plots[[col]] <- ggplot(df, aes(x = UMAP1, y = UMAP2, colour = .data[[col]])) +
+      geom_point(size = 0.4, alpha = 0.5, show.legend = FALSE) +
+      ggrepel::geom_label_repel(data = centroids, aes(label = .data[[col]]),
+                                size = 2.5, show.legend = FALSE,
+                                label.padding = unit(0.12, "lines"),
+                                max.overlaps = Inf) +
+      labs(title = paste0(res_label, "  (", n_cl, " cl)")) +
+      theme_void(base_size = 8) +
+      theme(plot.title = element_text(size = 8, hjust = 0.5))
+  }
+
+  col_inspect <- cluster_col_res(df, INSPECT_RES)
+  cluster_tbl <- df |>
+    count(.data[[col_inspect]], name = "n_cells") |>
+    rename(cluster = 1) |>
+    mutate(pct = round(100 * n_cells / sum(n_cells), 1)) |>
+    arrange(desc(n_cells))
+  p_sizes <- ggplot(cluster_tbl, aes(x = reorder(cluster, -n_cells), y = n_cells)) +
+    geom_col(fill = "mediumpurple", alpha = 0.8) +
+    geom_text(aes(label = paste0(pct, "%")), vjust = -0.4, size = 3) +
+    labs(title = paste0("Cluster sizes — ", nm, "  res ", INSPECT_RES),
+         x = "Cluster", y = "# cells") +
+    theme_bw()
+
+  print(p_bar)
+  print(wrap_plots(strip_plots, ncol = 3))
+  print(p_sizes)
+  cat("\n\n")
+}
+```
+
+:::
+
+{{< include ../_session-info.qmd >}}

@@ -1,0 +1,1747 @@
+---
+title: "miloR — DA patterns explained by gene expression & GSEA"
+author:
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+# Introduction
+
+Differential abundance (DA) identifies *where* in state-space the mutant mouse cells are enriched or depleted relative to wildtype. However, it does not explain *what* is driving the cells into these cell states. This notebook bridges the two views by finding genes and gene-sets whose activity is associated with the abundance shift. To this end, I used two approaches:
+
+-   Rank co-enriched and co-depleted genes by regressing per-neighbourhood average gene expression on the neighbourhood log fold-change.
+
+-   Identify shift-associated by running GSEA on the ranked genes identifies pathways whose activity is associated with the pattern of DA.
+
+```{r setup}
+library(tidyverse)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(Seurat)
+library(DT)
+library(htmltools)
+library(targets)
+library(miloR)
+library(limma)
+library(fgsea)
+library(matrixStats)
+library(base64enc)
+source(file.path("src/R/scrna-seq_utilities.R"))
+ggplot2::theme_set(cowplot::theme_cowplot())
+
+```
+
+```{r load-objects}
+tar_load(milo_hsc_obj)
+tar_load(milo_hsc_da)
+tar_load(sex_degs)
+tar_load(proc_params)
+tar_load(mpn_processed_hsc_fullcc)
+
+da_res_pos_all <- milo_hsc_da$mChPos_vs_WT$da_results
+da_res_neg_all <- milo_hsc_da$mChNeg_vs_WT$da_results
+EXCL_CLUSTERS  <- c("16", "20", "19", "18", "14", "17")
+da_res_pos <- da_res_pos_all %>% filter(!sNN_pca.SCT_30_res.0.9 %in% EXCL_CLUSTERS)
+da_res_neg <- da_res_neg_all %>% filter(!sNN_pca.SCT_30_res.0.9 %in% EXCL_CLUSTERS)
+exclude_genes <- c(sex_degs, "ENSMUSG00000121395")   # transgenes are in their own assay, not in RNA
+gene_subset <- setdiff(rownames(mpn_processed_hsc_fullcc), exclude_genes)
+SIG_FDR     <- 0.05
+PADJ_GSEA   <- 0.05
+dir_cols    <- c("Co-enriched" = "#B2182B", "Co-depleted" = "#2166AC", "NS" = "grey75")
+class_cols  <- c("Shared" = "#5E3C99", "Discordant" = "#E66101",
+                 "mCh+ only" = "#B2182B", "mCh- only" = "#2166AC", "NS" = "grey80")
+```
+
+# Helper functions
+
+```{r helpers}
+nhood_sizes <- function(milo) colSums(nhoods(milo))
+
+lfc_precision_weights <- function(da.res, milo,
+                                  use = c("size", "fdr", "both")) {
+  use  <- match.arg(use)
+  sz   <- nhood_sizes(milo)[da.res$Nhood]
+  w_size <- sz / stats::median(sz)
+  if (use == "size") return(w_size)
+  w_fdr <- pmin(-log10(pmax(da.res$SpatialFDR, 1e-12)), 8)
+  w_fdr <- w_fdr / stats::median(w_fdr[is.finite(w_fdr)])
+  if (use == "fdr") return(w_fdr)
+  sqrt(w_size * w_fdr)
+}
+
+build_substrate <- function(milo, da.res,
+                            assay      = "logcounts",
+                            subset.row = NULL,
+                            weight_by  = c("both", "size", "fdr")) {
+  weight_by <- match.arg(weight_by)
+  milo <- calcNhoodExpression(milo, assay = assay, subset.row = subset.row)
+  X    <- as.matrix(nhoodExpression(milo))          # genes × nhoods
+  X    <- X[, da.res$Nhood, drop = FALSE]           # align to da.res row order
+  colnames(X) <- da.res$Nhood #?
+  y    <- da.res$logFC
+  w    <- lfc_precision_weights(da.res, milo, use = weight_by)
+  keep <- matrixStats::rowVars(X) > 0               # drop all-zero genes
+  list(milo = milo, X = X[keep, , drop = FALSE], y = y, w = w,
+       genes = rownames(X)[keep], da.res = da.res)
+}
+
+pergene_lfc_regression <- function(sub) {
+  design <- stats::model.matrix(~ sub$y)
+  colnames(design) <- c("(Intercept)", "LFC")
+  fit <- limma::lmFit(sub$X, design, weights = sub$w)
+  fit <- limma::eBayes(fit, trend = TRUE, robust = TRUE)
+  tt  <- limma::topTable(fit, coef = "LFC", number = Inf, sort.by = "none")
+  data.frame(
+    gene  = rownames(tt),
+    slope = tt$logFC,     # slope of nhood expression on nhood logFC
+    t     = tt$t,
+    P     = tt$P.Value,
+    FDR   = tt$adj.P.Val,
+    stringsAsFactors = FALSE
+  )
+}
+
+build_detection_substrate <- function(milo, da.res, subset.row = NULL) {
+  # binary detection matrix without coercion headaches: keep nonzeros, set to 1
+  Dbin <- Matrix::drop0(SingleCellExperiment::counts(milo))
+  Dbin@x <- rep(1, length(Dbin@x))                 # genes x cells, 1 = detected
+  if (!is.null(subset.row)) Dbin <- Dbin[intersect(subset.row, rownames(Dbin)), , drop = FALSE]
+  nh   <- nhoods(milo)                             # cells x nhoods (binary)
+  k    <- as.matrix(Dbin %*% nh)                   # genes x nhoods: cells expressing
+  storage.mode(k) <- "double"
+  nvec <- as.numeric(Matrix::colSums(nh))          # cells per nhood
+ 
+  # depth covariate: per-nhood mean log library size. Detection is monotone in
+  # library size, so a depth gradient aligned with LFC would fake a positive
+  # slope on every gene -> regress it out.
+  libsize  <- Matrix::colSums(SingleCellExperiment::counts(milo))
+  nh_depth <- as.vector(Matrix::crossprod(nh, log1p(libsize)) / nvec)
+ 
+  ord <- da.res$Nhood
+  structure(
+    list(k     = k[, ord, drop = FALSE],
+         n     = nvec[ord],
+         depth = as.numeric(scale(nh_depth[ord])), # centred+scaled for conditioning
+         lfc   = da.res$logFC,
+         genes = rownames(k)),
+    nhood_order = ord)                             # for permutation-null alignment
+}
+
+.fit_detection_glm <- function(kg, n, covdf) {
+  Y <- cbind(kg, n - kg)                           # two-column binomial response
+  fit <- tryCatch(
+    suppressWarnings(stats::glm(Y ~ ., data = covdf, family = stats::quasibinomial())),
+    error = function(e) NULL)
+  na <- c(log_or = NA, odds_ratio = NA, se = NA, t = NA, P = NA,
+          dispersion = NA, converged = 0, separation = NA)
+  if (is.null(fit)) return(na)
+  sm <- summary(fit)                               # <- SE, t, p, dispersion all from base R
+  co <- sm$coefficients
+  if (!"LFC" %in% rownames(co)) return(na)
+  sep <- any(fit$fitted.values < 1e-8 | fit$fitted.values > 1 - 1e-8)  # perfect separation
+  c(log_or     = unname(co["LFC", "Estimate"]),
+    odds_ratio = unname(exp(co["LFC", "Estimate"])),
+    se         = unname(co["LFC", "Std. Error"]),
+    t          = unname(co["LFC", "t value"]),
+    P          = unname(co["LFC", "Pr(>|t|)"]),
+    dispersion = unname(sm$dispersion),
+    converged  = as.numeric(isTRUE(fit$converged)),
+    separation = as.numeric(sep))
+}
+
+detection_lfc_model <- function(sub,
+                                adjust_depth      = TRUE,
+                                min_detect_nhoods = 5L,
+                                max_mean_frac     = 0.95,
+                                min_mean_frac     = 0.005,
+                                genes             = NULL,
+                                BPPARAM           = NULL,
+                                batch_size        = 500L) {
+  k <- sub$k; n <- sub$n
+  if (!is.null(genes)) k <- k[intersect(genes, rownames(k)), , drop = FALSE]
+
+  tot_n     <- sum(n)
+  mean_frac <- Matrix::rowSums(k) / tot_n
+  n_detect  <- Matrix::rowSums(k > 0)
+
+  ceiling_g <- rownames(k)[mean_frac > max_mean_frac]
+  eligible  <- rownames(k)[n_detect >= min_detect_nhoods &
+                           mean_frac <= max_mean_frac &
+                           mean_frac >= min_mean_frac]
+
+  covdf   <- if (adjust_depth) data.frame(LFC = sub$lfc, depth = sub$depth)
+             else              data.frame(LFC = sub$lfc)
+  n_cores <- if (!is.null(BPPARAM)) BPPARAM else 1L
+
+  # Batch genes so each mclapply fork only inherits a small k slice.
+  # batch_size = Inf disables batching (one mclapply over all genes) — safe on high-RAM machines.
+  # batch_size = 500 reduces per-fork memory at the cost of serial overhead between batches.
+  bs <- if (is.infinite(batch_size)) length(eligible) else as.integer(batch_size)
+  batches <- split(eligible, ceiling(seq_along(eligible) / bs))
+  rows <- unlist(lapply(batches, function(batch) {
+    k_b <- k[batch, , drop = FALSE]
+    fit_b <- function(g) .fit_detection_glm(k_b[g, ], n, covdf)
+    if (n_cores > 1L)
+      parallel::mclapply(batch, fit_b, mc.cores = n_cores)
+    else
+      lapply(batch, fit_b)
+  }), recursive = FALSE)
+
+  M <- do.call(rbind, rows)
+  res <- data.frame(gene = eligible, M,
+                    mean_frac   = mean_frac[eligible],
+                    n_detect_nh = n_detect[eligible],
+                    stringsAsFactors = FALSE)
+  res <- res[stats::complete.cases(res[, c("t", "P")]), ]
+  res$FDR <- stats::p.adjust(res$P, "BH")
+  res <- res[order(-res$t), ]
+  rownames(res) <- NULL
+
+  list(result  = res,
+       ceiling = data.frame(gene = ceiling_g,
+                            mean_frac = mean_frac[ceiling_g],
+                            stringsAsFactors = FALSE))
+}
+
+make_detection_stat_fun <- function(sub, candidate_genes, adjust_depth = TRUE) {
+  k     <- sub$k[candidate_genes, , drop = FALSE]   # cols follow nhood_order
+  n     <- sub$n
+  depth <- sub$depth
+  ord   <- attr(sub, "nhood_order")
+  function(da_perm) {
+    lfc   <- da_perm$logFC[match(ord, da_perm$Nhood)]   # align permuted LFC to substrate
+    covdf <- if (adjust_depth) data.frame(LFC = lfc, depth = depth)
+             else              data.frame(LFC = lfc)
+    vapply(rownames(k),
+           function(g) .fit_detection_glm(k[g, ], n, covdf)[["t"]],
+           numeric(1))
+  }
+}
+enrichment_fgsea <- function(gene_stat_df, gene_sets, stat = "t",
+                             minSize = 15, maxSize = 500, eps = 0) {
+  ranks <- gene_stat_df[[stat]]
+  names(ranks) <- gene_stat_df$gene
+  ranks <- sort(ranks[is.finite(ranks)], decreasing = TRUE)
+  res   <- fgsea::fgseaMultilevel(pathways = gene_sets, stats = ranks,
+                                  minSize = minSize, maxSize = maxSize, eps = eps)
+  res[order(res$padj), ]
+}
+
+load_msig_mouse <- function(collection, subcollection = NULL) {
+  if (!requireNamespace("msigdbr", quietly = TRUE)) stop("install msigdbr")
+  h <- msigdbr::msigdbr(species = "Mus musculus",
+                        collection = collection,
+                        subcollection = subcollection)
+  split(h$gene_symbol, h$gs_name)
+}
+
+msig_collections <- list(
+  Hallmark   = list(collection = "H",  subcollection = NULL),
+  GOBP       = list(collection = "C5", subcollection = "GO:BP"),
+  KEGG       = list(collection = "C2", subcollection = "CP:KEGG_LEGACY"),
+  Reactome   = list(collection = "C2", subcollection = "CP:REACTOME"),
+  WikiPaths  = list(collection = "C2", subcollection = "CP:WIKIPATHWAYS"),
+  C2_all    = list(collection = "C2", subcollection = NULL),
+  C3_all    = list(collection = "C3", subcollection = NULL),
+  C6_all    = list(collection = "C6", subcollection = NULL),
+  C7_all    = list(collection = "C7", subcollection = NULL),
+  C9_all    = list(collection = "C9", subcollection = NULL)
+)
+
+COLLECTION_ABBREV <- c(
+  "^HALLMARK_" = "HM_", "^KEGG_" = "KG_", "^REACTOME_" = "RE_",
+  "^WP_" = "WP_", "^GOBP_" = "BP_"
+)
+abbreviate_pathway <- function(x) {
+  for (pat in names(COLLECTION_ABBREV)) x <- sub(pat, COLLECTION_ABBREV[[pat]], x)
+  x
+}
+
+dl_btn <- function(df, filename = "data.csv", label = "⬇ Source data") {
+  invisible(NULL)
+}
+```
+
+# DA landscape
+
+The output of MiloR DA is visualized below on a neighbourhood graph coloured by DA logFC comparing condition (mCh+ or mCh- ) to WT control (blue = depleted, red = enriched). The neighbourhood is an aggregated view of the cell nearest neighbour graph. The embedding of node is the median UMAP coordinates of the memeber cells. Each node is a neighbourhood; size reflects neighbourhood size.
+
+::: panel-tabset
+## Het mCh+ vs WT
+
+```{r da-landscape-pos, fig.height=6, fig.width=10}
+da_fdr_alpha <- 0.05
+plot_nhood_graph_da(milo_hsc_obj, milo_hsc_da$mChPos_vs_WT$da_results,
+                    alpha = da_fdr_alpha, layout = "umap.nn") +
+  labs(title = milo_hsc_da$mChPos_vs_WT$model_contrast, fill = "log2FC",
+       caption = paste0("Coloured by logFC (SpatialFDR < ", da_fdr_alpha, "); non-significant = white (logFC set to 0)")) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-10, 10))
+```
+
+## Het mCh- vs WT
+
+```{r da-landscape-neg, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_hsc_obj, milo_hsc_da$mChNeg_vs_WT$da_results,
+                    alpha = da_fdr_alpha, layout = "umap.nn") +
+  labs(title = milo_hsc_da$mChNeg_vs_WT$model_contrast, fill = "log2FC",
+       caption = paste0("Coloured by logFC (SpatialFDR < ", da_fdr_alpha, "); non-significant = white (logFC set to 0)")) +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-10, 10))
+```
+
+## Excluded neighbourhoods
+
+```{r da-landscape-excl, fig.height=6, fig.width=10}
+da_excl_viz <- da_res_pos_all %>%
+  mutate(
+    logFC      = if_else(sNN_pca.SCT_30_res.0.9 %in% EXCL_CLUSTERS, 10, 0),
+    SpatialFDR = if_else(sNN_pca.SCT_30_res.0.9 %in% EXCL_CLUSTERS, 0, 1)
+  )
+plot_nhood_graph_da(milo_hsc_obj, da_excl_viz, alpha = 0.05, layout = "umap.nn") +
+  ggplot2::scale_fill_gradient2(
+    low = "grey88", mid = "grey88", high = "#E6550D",
+    midpoint = 5, limits = c(0, 10),
+    breaks = c(0, 10), labels = c("Retained", "Excluded"), name = "Status") +
+  labs(title = paste0("Excluded neighbourhoods — clusters ", paste(EXCL_CLUSTERS, collapse = ", ")),
+       caption = paste0(
+         sum(da_res_pos_all$sNN_pca.SCT_30_res.0.9 %in% EXCL_CLUSTERS),
+         " nhoods excluded (orange); ",
+         sum(!da_res_pos_all$sNN_pca.SCT_30_res.0.9 %in% EXCL_CLUSTERS),
+         " retained (grey)"))
+```
+:::
+
+# Continuous per-gene expression on LFC regression using limma
+
+Regress neighbourhood-averaged expression on neighbourhood LFC using limma (weighted by miloR FDR). Both contrasts share the same neighbourhood expression matrix, computed once.
+
+```{r build-substrate}
+milo_hsc_obj <- calcNhoodExpression(milo_hsc_obj, assay = "logcounts", subset.row = gene_subset)
+nhexpr       <- as.matrix(nhoodExpression(milo_hsc_obj))   # genes × nhoods
+
+build_sub_expr <- function(nhexpr, da.res, milo, weight_by = "fdr") {
+  X    <- nhexpr[, da.res$Nhood, drop = FALSE]
+  y    <- da.res$logFC
+  w    <- lfc_precision_weights(da.res, milo, use = weight_by)
+  keep <- matrixStats::rowVars(X) > 0
+  list(X = X[keep, , drop = FALSE], y = y, w = w, genes = rownames(X)[keep])
+}
+
+sub_pos <- build_sub_expr(nhexpr, da_res_pos, milo_hsc_obj)
+sub_neg <- build_sub_expr(nhexpr, da_res_neg, milo_hsc_obj)
+```
+
+```{r pergene-lfc-reg}
+gstats_pos <- pergene_lfc_regression(sub_pos)
+gstats_neg <- pergene_lfc_regression(sub_neg)
+```
+
+```{r limma-rank-helper}
+# ── labelling helper ─────────────────────────────────────────────────────────
+label_limma_rank <- function(gstats, n = 10) {
+  gstats %>%
+    mutate(sig       = FDR < SIG_FDR,
+           direction = case_when(sig & slope > 0 ~ "Co-enriched",
+                                 sig & slope < 0 ~ "Co-depleted",
+                                 TRUE            ~ "NS")) %>%
+    filter(sig) %>% group_by(direction) %>%
+    slice_max(abs(t), n = n) %>% ungroup()
+}
+
+# ── pure plotting function ────────────────────────────────────────────────────
+plot_limma_rank <- function(gstats, labels = NULL, title = "") {
+  df <- gstats %>%
+    mutate(sig       = FDR < SIG_FDR,
+           direction = case_when(sig & slope > 0 ~ "Co-enriched",
+                                 sig & slope < 0 ~ "Co-depleted",
+                                 TRUE            ~ "NS"),
+           rank = rank(-t))
+  n_genes <- nrow(df)
+  p <- ggplot(df, aes(x = rank, y = t)) +
+    geom_point(aes(colour = direction), size = 0.8, alpha = 0.5) +
+    geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    scale_colour_manual(values = dir_cols, name = NULL) +
+    labs(x = "Gene rank", y = "t-statistic (limma slope ~ nhood logFC)", title = title) +
+    theme_bw(base_size = 13)
+  if (!is.null(labels) && nrow(labels) > 0) {
+    label_df <- df %>% filter(gene %in% labels$gene)
+    nudge    <- ifelse(label_df$direction == "Co-enriched", n_genes * 0.12, -n_genes * 0.12)
+    p <- p + ggrepel::geom_text_repel(
+      data = label_df, aes(label = gene, colour = direction),
+      size = 3.5, max.overlaps = Inf, show.legend = FALSE,
+      nudge_x = nudge, segment.size = 0.25, segment.colour = "grey55")
+  }
+  p
+}
+
+scatter_gene <- function(sub, gene, contrast_label) {
+  data.frame(t(sub$X), y = sub$y) %>%
+    ggplot(aes(!!sym(gene), y)) +
+    geom_point(aes(fill = y), shape = 21, size = 2, stroke = 0.3, colour = "black", alpha = 0.8) +
+    geom_smooth(method = "lm", colour = "grey30", linewidth = 0.7) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", name = "DA log2FC") +
+    xlab(paste(gene, "neighbourhood-averaged expression")) +
+    ylab(paste("MiloR DA log2FC", contrast_label)) +
+    theme_bw(base_size = 11)
+}
+```
+
+### Het mCh+ vs WT {.unnumbered}
+
+The expression of the top ranked -based on the order of the model's t-test statistic- gene tracks the abundance shift quite well.
+
+However, it penalizes interesting candidates like Meis2 (ranked 215), which we observed that its expression pattern is co-enriched in mutant-mouse enriched states. Interestingly, although the expression of Meis2 is clearly co-enriched with mCh+ cells, it displays a switch-like expression pattern instead of a continuous one like Bhlhe40.
+
+Despite the ability to capture genes that track the abundance shift, this result shows the limitation of modeling LogFC by regressing over the continuous neighbourhood expression using limma. Namely, it rewards genes that are expressed in larger number of neighborhoods because they're more likely to continuously track with the differential abundance pattern. Thus, it could bias against genes that are exclusively expressed in the differentially abundant state. This will be addressed using a "detection" model in the next section.
+
+```{r limma-scatter-pos, fig.width=12, fig.height=4}
+top_gene_pos <- gstats_pos$gene[which.max(gstats_pos$t)]
+scatter_gene(sub_pos, top_gene_pos, "(mCh+)") + scatter_gene(sub_pos, "Meis2", "(mCh+)")
+```
+
+<details>
+
+<summary>Rank plot & tables — mCh+ vs WT (click to expand)</summary>
+
+Genes ranked by t-statistic from the weighted limma regression, with searchable tables of significant co-enriched and co-depleted genes.
+
+```{r limma-rank-pos, fig.height=6, fig.width=10}
+lbl_lim_pos <- label_limma_rank(gstats_pos, n = 10)
+plot_limma_rank(gstats_pos, labels = lbl_lim_pos,
+                title = "Limma — genes co-varying with DA (mCh+ vs WT)")
+```
+
+```{r limma-dl-pos}
+dl_btn(gstats_pos, "limma_mchpos_vs_wt.csv", "⬇ Limma results (mCh+ vs WT, all genes)")
+```
+
+::: panel-tabset
+#### Co-enriched with mCh+ {.unnumbered}
+
+```{r limma-coenr-pos}
+gstats_coenr_pos <- gstats_pos %>% filter(FDR < SIG_FDR) %>% arrange(desc(t))
+DT::datatable(gstats_coenr_pos, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(gstats_coenr_pos)[sapply(gstats_coenr_pos, is.numeric)], digits = 3)
+```
+
+```{r limma-coenr-pos-dl, echo=FALSE}
+dl_btn(gstats_coenr_pos, "limma_coenr_mchpos.csv", "⬇ Download co-enriched with mCh+ (limma)")
+```
+
+#### Co-depleted with mCh+ {.unnumbered}
+
+```{r limma-codepl-pos}
+gstats_codepl_pos <- gstats_pos %>% filter(FDR < SIG_FDR) %>% arrange(t)
+DT::datatable(gstats_codepl_pos, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(gstats_codepl_pos)[sapply(gstats_codepl_pos, is.numeric)], digits = 3)
+```
+
+```{r limma-codepl-pos-dl, echo=FALSE}
+dl_btn(gstats_codepl_pos, "limma_codepl_mchpos.csv", "⬇ Download co-depleted with mCh+ (limma)")
+```
+:::
+
+</details>
+
+### Het mCh- vs WT {.unnumbered}
+
+<details>
+
+<summary>Scatter, rank plot & tables — mCh- vs WT (click to expand)</summary>
+
+Same limma regression for the mCh- vs WT contrast.
+
+```{r limma-scatter-neg, fig.width=12, fig.height=4}
+top_gene_neg <- gstats_neg$gene[which.max(gstats_neg$t)]
+scatter_gene(sub_neg, top_gene_neg, "(mCh-)") + scatter_gene(sub_neg, "Meis2", "(mCh-)")
+```
+
+```{r limma-rank-neg, fig.height=6, fig.width=10}
+lbl_lim_neg <- label_limma_rank(gstats_neg, n = 10)
+plot_limma_rank(gstats_neg, labels = lbl_lim_neg,
+                title = "Limma — genes co-varying with DA (mCh- vs WT)")
+```
+
+```{r limma-dl-neg}
+dl_btn(gstats_neg, "limma_mchneg_vs_wt.csv", "⬇ Limma results (mCh- vs WT, all genes)")
+```
+
+::: panel-tabset
+#### Co-enriched with mCh- {.unnumbered}
+
+```{r limma-coenr-neg}
+gstats_coenr_neg <- gstats_neg %>% filter(FDR < SIG_FDR) %>% arrange(desc(t))
+DT::datatable(gstats_coenr_neg, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(gstats_coenr_neg)[sapply(gstats_coenr_neg, is.numeric)], digits = 3)
+```
+
+```{r limma-coenr-neg-dl, echo=FALSE}
+dl_btn(gstats_coenr_neg, "limma_coenr_mchneg.csv", "⬇ Download co-enriched with mCh- (limma)")
+```
+
+#### Co-depleted with mCh- {.unnumbered}
+
+```{r limma-codepl-neg}
+gstats_codepl_neg <- gstats_neg %>% filter(FDR < SIG_FDR) %>% arrange(t)
+DT::datatable(gstats_codepl_neg, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(gstats_codepl_neg)[sapply(gstats_codepl_neg, is.numeric)], digits = 3)
+```
+
+```{r limma-codepl-neg-dl, echo=FALSE}
+dl_btn(gstats_codepl_neg, "limma_codepl_mchneg.csv", "⬇ Download co-depleted with mCh- (limma)")
+```
+:::
+
+</details>
+
+### Comparison: mCh+ vs mCh- {.unnumbered}
+
+<details>
+
+<summary>t-statistic scatter & condition-differential rank — mCh+ vs mCh- (click to expand)</summary>
+
+Genes significant in both contrasts at the same direction are **Shared**; opposite directions are **Discordant**; unique to one contrast are labelled by condition.
+
+```{r limma-compare, fig.height=6, fig.width=14}
+cmp_lim <- inner_join(
+  gstats_pos %>% select(gene, t_pos = t, FDR_pos = FDR),
+  gstats_neg %>% select(gene, t_neg = t, FDR_neg = FDR),
+  by = "gene"
+) %>%
+  mutate(
+    delta = t_pos - t_neg,          # positive = stronger mCh+ effect, negative = stronger mCh-
+    sig   = FDR_pos < SIG_FDR | FDR_neg < SIG_FDR
+  )
+
+# Label: top 10 per condition extremes + top 10 shared in each direction
+lim_lab <- bind_rows(
+  cmp_lim %>% filter(sig) %>% slice_max(delta, n = 10),            # most mCh+ dominant
+  cmp_lim %>% filter(sig) %>% slice_min(delta, n = 10),            # most mCh- dominant
+  cmp_lim %>% filter(sig, t_pos > 0, t_neg > 0) %>% slice_max(t_pos + t_neg, n = 10),  # shared enriched
+  cmp_lim %>% filter(sig, t_pos < 0, t_neg < 0) %>% slice_max(-(t_pos + t_neg), n = 10) # shared depleted
+) %>% distinct(gene, .keep_all = TRUE)
+
+p_lim_scatter <- ggplot(cmp_lim, aes(t_pos, t_neg)) +
+  geom_point(aes(fill = delta), shape = 21, colour = "grey30", size = 1.5, stroke = 0.3, alpha = 0.7) +
+  ggrepel::geom_text_repel(data = lim_lab, aes(label = gene),
+                           size = 2.8, colour = "grey20", max.overlaps = Inf,
+                           segment.size = 0.2, segment.colour = "grey55") +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50", linetype = "dashed", linewidth = 0.4) +
+  geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       name = "Δt (mCh+ − mCh-)") +
+  labs(x = "t-statistic (mCh+ vs WT)", y = "t-statistic (mCh- vs WT)",
+       title = "Limma — mCh+ vs mCh- (scatter)") +
+  theme_bw(base_size = 11)
+
+# Rank plot by delta among significant genes
+lim_rank <- cmp_lim %>% filter(sig) %>% arrange(desc(delta)) %>% mutate(rank = row_number())
+n_sig_lim <- nrow(lim_rank)
+lim_rank_lab <- bind_rows(slice_max(lim_rank, delta, n = 15), slice_min(lim_rank, delta, n = 15)) %>%
+  distinct(gene, .keep_all = TRUE)
+nudge_lim <- ifelse(lim_rank_lab$delta > 0, n_sig_lim * 0.08, -n_sig_lim * 0.08)
+
+p_lim_rank <- ggplot(lim_rank, aes(rank, delta)) +
+  geom_point(aes(fill = delta), shape = 21, colour = "grey30", size = 1.5, stroke = 0.3, alpha = 0.7) +
+  ggrepel::geom_text_repel(data = lim_rank_lab, aes(label = gene),
+                           size = 2.8, colour = "grey20", max.overlaps = Inf,
+                           nudge_x = nudge_lim,
+                           segment.size = 0.2, segment.colour = "grey55") +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.3, linetype = "dashed") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       name = "Δt (mCh+ − mCh-)") +
+  labs(x = "Gene rank", y = "Δt (mCh+ − mCh-)",
+       title = "Limma — condition-differential rank",
+       caption = "Ranked by mCh+ − mCh- t-stat; labelled: top 15 at each extreme") +
+  theme_bw(base_size = 11)
+
+p_lim_scatter | p_lim_rank
+```
+
+
+</details>
+
+# Per-gene detection regression
+
+To address the limitation of limma continuous model from the previous section, we use a model that uses the per-neighborhood "detection" of a gene instead of its average expression.
+
+```{r fit-quasibinomial}
+sub_det_pos <- build_detection_substrate(milo_hsc_obj, da_res_pos, subset.row = gene_subset)
+
+# Reuse k/n/depth from pos; swap lfc for neg aligned to the same nhood order
+ord_pos       <- attr(sub_det_pos, "nhood_order")
+sub_det_neg   <- sub_det_pos
+sub_det_neg$lfc <- da_res_neg$logFC[match(ord_pos, da_res_neg$Nhood)]
+
+n_cores <- max(1L, parallel::detectCores() - 2L)
+det_pos <- detection_lfc_model(sub_det_pos, adjust_depth = TRUE, BPPARAM = n_cores)
+det_neg <- detection_lfc_model(sub_det_neg, adjust_depth = TRUE, BPPARAM = n_cores)
+```
+
+```{r det-rank-helper}
+# ── labelling helpers — called explicitly in each chunk ──────────────────────
+
+label_det_rank <- function(det_res, n = 10) {
+  det_res %>%
+    mutate(sig       = FDR < SIG_FDR,
+           direction = case_when(sig & log_or > 0 ~ "Co-enriched",
+                                 sig & log_or < 0 ~ "Co-depleted",
+                                 TRUE             ~ "NS")) %>%
+    filter(sig) %>% group_by(direction) %>%
+    slice_max(abs(log_or), n = n) %>% ungroup()
+}
+
+label_det_volcano <- function(det_res, n = 20) {
+  det_res %>%
+    filter(FDR < SIG_FDR) %>%
+    mutate(direction = if_else(log_or > 0, "Co-enriched", "Co-depleted")) %>%
+    group_by(direction) %>%
+    slice_max(abs(log_or), n = n) %>%
+    ungroup()
+}
+
+label_det_frac_lor <- function(det_res, n_bins = 20, n_per_bin = 2) {
+  # Bin mean_frac; within each bin × direction take top n_per_bin by abs(log_or)
+  det_res %>%
+    filter(FDR < SIG_FDR) %>%
+    mutate(
+      direction = if_else(log_or > 0, "Co-enriched", "Co-depleted"),
+      frac_bin  = cut(mean_frac, breaks = n_bins, labels = FALSE)
+    ) %>%
+    group_by(direction, frac_bin) %>%
+    slice_max(abs(log_or), n = n_per_bin) %>%
+    ungroup()
+}
+
+# ── pure plotting functions ──────────────────────────────────────────────────
+
+plot_det_rank <- function(det_res, labels = NULL, title = "") {
+  df <- det_res %>%
+    mutate(rank      = rank(-log_or),
+           sig       = FDR < SIG_FDR,
+           direction = case_when(sig & log_or > 0 ~ "Co-enriched",
+                                 sig & log_or < 0 ~ "Co-depleted",
+                                 TRUE             ~ "NS"))
+  n_genes <- nrow(df)
+  p <- ggplot(df, aes(x = rank, y = log_or)) +
+    geom_point(aes(colour = mean_frac), size = 0.8, alpha = 0.7) +
+    geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.3) +
+    scale_colour_viridis_c(option = "turbo", direction = -1,
+                           name = "mean frac\n(↓ = localized)") +
+    labs(x = "Gene rank", y = "log Odds Ratio", title = title) +
+    theme_bw(base_size = 13)
+  if (!is.null(labels) && nrow(labels) > 0) {
+    label_df <- df %>% filter(gene %in% labels$gene)
+    nudge    <- ifelse(label_df$direction == "Co-enriched", n_genes * 0.12, -n_genes * 0.12)
+    p <- p + ggrepel::geom_text_repel(
+      data = label_df, aes(label = gene), colour = "grey20",
+      size = 3.5, max.overlaps = Inf, show.legend = FALSE,
+      nudge_x = nudge, segment.size = 0.25, segment.colour = "grey55")
+  }
+  p
+}
+
+plot_det_volcano <- function(det_res, labels = NULL, title = "") {
+  # FDR=0 genes: place at -log10(double.xmin) ~308 so they sit at the natural top
+  df <- det_res %>%
+    mutate(sig = FDR < SIG_FDR,
+           nlp = -log10(pmax(FDR, .Machine$double.xmin)))
+  n_fdr0 <- sum(det_res$FDR == 0)
+  p <- ggplot(df, aes(log_or, nlp)) +
+    geom_point(aes(colour = mean_frac), size = 0.9, alpha = 0.7) +
+    geom_hline(yintercept = -log10(SIG_FDR), colour = "grey50",
+               linetype = "dashed", linewidth = 0.4) +
+    geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+    scale_colour_viridis_c(option = "turbo", direction = -1,
+                           name = "mean frac\n(↓ = localized)") +
+    labs(x = "log Odds Ratio", y = expression(-log[10](FDR)), title = title,
+         caption = paste0(n_fdr0, " FDR = 0 genes at top — also shown in lollipop below")) +
+    theme_bw(base_size = 13) +
+    theme(panel.grid.minor = element_blank())
+  if (!is.null(labels) && nrow(labels) > 0) {
+    label_df <- df %>% filter(gene %in% labels$gene)
+    p <- p + ggrepel::geom_text_repel(
+      data = label_df, aes(label = gene),
+      colour = "grey20", size = 2.8, max.overlaps = Inf,
+      segment.size = 0.2, segment.colour = "grey55")
+  }
+  p
+}
+
+plot_det_zero_fdr <- function(df, title = "") {
+  # df: pre-filtered data frame (caller applies FDR == 0 and any |log_or| threshold)
+  df <- df %>% arrange(log_or) %>% mutate(gene = factor(gene, levels = gene))
+  ggplot(df, aes(log_or, gene)) +
+    geom_segment(aes(x = 0, xend = log_or, y = gene, yend = gene),
+                 colour = "grey75", linewidth = 0.5) +
+    geom_point(aes(colour = mean_frac), size = 1.5) +
+    scale_colour_viridis_c(option = "turbo", direction = -1,
+                           name = "mean frac\n(↓ = localized)") +
+    geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    labs(x = "log Odds Ratio", y = NULL, title = title,
+         subtitle = paste0(nrow(df), " genes with FDR = 0 & |log OR| ≥ 0.15  —  ordered by log OR")) +
+    theme_bw(base_size = 11) +
+    theme(axis.text.y      = element_text(size = 5),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor   = element_blank())
+}
+
+plot_det_frac_lor <- function(det_res, labels = NULL, title = "") {
+  df <- det_res %>%
+    mutate(sig = FDR < SIG_FDR,
+           nlp = pmin(-log10(FDR + .Machine$double.eps), 10))
+  p <- ggplot(df, aes(mean_frac, log_or)) +
+    geom_point(aes(fill = nlp), shape = 21, colour = "grey60", size = 0.8, alpha = 0.6) +
+    geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.3) +
+    scale_fill_viridis_c(option = "mako", direction = 1,
+                         name = expression(-log[10](FDR)),
+                         limits = c(0, 10), oob = scales::squish) +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Mean detection fraction", y = "log Odds Ratio", title = title,
+         caption = "Labelled: low frac + high |OR| — localized, co-varying genes") +
+    theme_bw(base_size = 13)
+  if (!is.null(labels) && nrow(labels) > 0) {
+    label_df <- df %>% filter(gene %in% labels$gene)
+    p <- p + ggrepel::geom_text_repel(
+      data = label_df, aes(label = gene), colour = "grey20",
+      size = 2.8, max.overlaps = Inf, min.segment.length = 0,
+      segment.size = 0.2, segment.colour = "grey55")
+  }
+  p
+}
+
+plot_det_frac_lor_zoomed <- function(df, title = "") {
+  # Scatter limited to lollipop genes: label all with direct geom_text (no repel)
+  df <- df %>% mutate(nlp = pmin(-log10(FDR + .Machine$double.eps), 10))
+  ggplot(df, aes(mean_frac, log_or)) +
+    geom_point(aes(fill = nlp), shape = 21, colour = "grey60", size = 3) +
+    ggrepel::geom_text_repel(aes(label = gene), size = 2.0, colour = "grey20",
+                             max.overlaps = Inf, force = 0.2, force_pull = 0.9,
+                             box.padding = 0.12, segment.size = 0.15, segment.colour = "grey55",
+                             min.segment.length = 0) +
+    geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.3) +
+    scale_fill_viridis_c(option = "mako", direction = 1,
+                         name = expression(-log[10](FDR)),
+                         limits = c(0, 10), oob = scales::squish) +
+    scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Mean detection fraction", y = "log Odds Ratio", title = title,
+         subtitle = paste0(nrow(df), " genes — FDR = 0 & |log OR| ≥ 0.15 — zoom to inspect")) +
+    theme_bw(base_size = 13)
+}
+```
+
+### Het mCh+ vs WT {.unnumbered}
+
+::: panel-tabset
+#### Co-enriched with mCh+ {.unnumbered}
+
+```{r det-coenr-pos}
+det_coenr_pos <- det_pos$result %>% filter(FDR < SIG_FDR, log_or >= 0.1) %>% arrange(desc(log_or))
+DT::datatable(det_coenr_pos, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(det_coenr_pos)[sapply(det_coenr_pos, is.numeric)], digits = 3)
+```
+
+```{r det-coenr-pos-dl, echo=FALSE}
+dl_btn(det_coenr_pos, "det_coenr_mchpos.csv", "⬇ Download co-enriched with mCh+ (detection model)")
+```
+
+#### Co-depleted with mCh+ {.unnumbered}
+
+```{r det-codepl-pos}
+det_codepl_pos <- det_pos$result %>% filter(FDR < SIG_FDR, log_or <= -0.1) %>% arrange(log_or)
+DT::datatable(det_codepl_pos, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(det_codepl_pos)[sapply(det_codepl_pos, is.numeric)], digits = 3)
+```
+
+```{r det-codepl-pos-dl, echo=FALSE}
+dl_btn(det_codepl_pos, "det_codepl_mchpos.csv", "⬇ Download co-depleted with mCh+ (detection model)")
+```
+:::
+
+<details>
+
+<summary>Top 10 co-enriched & co-depleted genes — expression UMAPs (click to expand)</summary>
+
+UMAP plots of normalized SCT expression for the top 10 co-enriched and co-depleted genes identified by the detection model. Each gene is shown split by sample to reveal how expression tracks the DA pattern across conditions. Two rendering orders are provided: shuffled (reduces overplotting bias from cluster order) and expression-ordered (brings high-expressing cells to the foreground to highlight low-abundance signal).
+
+Top 10 co-enriched genes — normalized expression (cells in random order):
+
+```{r det-feat-enr-pos-shuffle, fig.width=20, fig.height=26}
+top_enr_pos <- det_pos$result %>%
+  filter(FDR < SIG_FDR, log_or > 0) %>%
+  arrange(desc(log_or)) %>% head(10) %>% pull(gene)
+if (length(top_enr_pos) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_enr_pos,
+                        cell_order = "shuffle", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+Top 10 co-enriched genes — normalized expression (cells ordered by expression):
+
+```{r det-feat-enr-pos, fig.width=20, fig.height=26}
+if (length(top_enr_pos) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_enr_pos,
+                        cell_order = "expression", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+Top 10 co-depleted genes — normalized expression (cells in random order):
+
+```{r det-feat-dep-pos-shuffle, fig.width=20, fig.height=26}
+top_dep_pos <- det_pos$result %>%
+  filter(FDR < SIG_FDR, log_or < 0) %>%
+  arrange(log_or) %>% head(10) %>% pull(gene)
+if (length(top_dep_pos) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_dep_pos,
+                        cell_order = "shuffle", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+Top 10 co-depleted genes — normalized expression (cells ordered by expression):
+
+```{r det-feat-dep-pos, fig.width=20, fig.height=26}
+if (length(top_dep_pos) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_dep_pos,
+                        cell_order = "expression", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+</details>
+
+```{r det-rank-pos, fig.height=6, fig.width=10}
+lbl_rank_pos <- label_det_rank(det_pos$result, n = 10)
+plot_det_rank(det_pos$result, labels = lbl_rank_pos,
+              title = "Detection model — genes co-varying with DA (mCh+ vs WT)")
+```
+
+```{r det-volcano-pos, fig.height=9, fig.width=9}
+lbl_vol_pos <- label_det_volcano(det_pos$result, n = 20)
+plot_det_volcano(det_pos$result, labels = lbl_vol_pos,
+                 title = "Volcano (mCh+ vs WT)")
+```
+
+<details>
+
+A focused looked on the FDR = 0 genes that suffer from overplotting in the volcano plot.
+
+<summary>FDR = 0 genes — lollipop (click to expand)</summary>
+
+Genes reaching FDR = 0 (numerical machine precision — strongest possible signal) ranked by their log Odds Ratio. Positive OR indicates co-enrichment with DA-enriched neighbourhoods; negative OR indicates co-depletion. Point colour shows mean detection fraction across all neighbourhoods — lower values (dark) mark genes detected only in a small proportion of cells, highlighting localized, state-specific candidates.
+
+```{r det-zero-fdr-pos}
+#| fig-width: 8
+#| fig-height: !expr max(4, sum(det_pos$result$FDR == 0 & abs(det_pos$result$log_or) >= 0.15) * 0.07)
+fdr0_pos <- det_pos$result %>% filter(FDR == 0, abs(log_or) >= 0.15)
+plot_det_zero_fdr(fdr0_pos, "Genes with FDR = 0 & |log OR| ≥ 0.15 — mCh+ vs WT")
+```
+
+</details>
+
+```{r det-frac-pos, fig.height=9, fig.width=9}
+lbl_frac_pos <- label_det_frac_lor(det_pos$result, n_bins = 20, n_per_bin = 2)
+plot_det_frac_lor(det_pos$result, labels = lbl_frac_pos,
+                  title = "Mean detection fraction vs log OR (mCh+ vs WT)")
+```
+
+```{r det-dl-pos}
+dl_btn(det_pos$result, "det_mchpos_vs_wt.csv", "⬇ Detection model results (mCh+ vs WT, all genes)")
+```
+
+<details>
+
+<summary>FDR = 0 genes — mean detection fraction scatter (click to expand)</summary>
+
+The same FDR = 0 genes plotted as mean detection fraction (x) versus log Odds Ratio (y). Restricting to these extreme-significance genes reduces overplotting enough to label all points. Low fraction + high absolute OR marks genes detected in only a narrow slice of the cell state space yet strongly co-varying with the DA pattern — these are the strongest candidates for state-specific regulators.
+
+```{r det-zero-fdr-frac-pos, fig.height=10, fig.width=10}
+plot_det_frac_lor_zoomed(fdr0_pos, "FDR = 0 genes — mean frac vs log OR (mCh+ vs WT)")
+```
+
+</details>
+
+### Het mCh- vs WT {.unnumbered}
+
+::: panel-tabset
+#### Co-enriched with mCh- {.unnumbered}
+
+```{r det-coenr-neg}
+det_coenr_neg <- det_neg$result %>% filter(FDR < SIG_FDR, log_or >= 0.1) %>% arrange(desc(log_or))
+DT::datatable(det_coenr_neg, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(det_coenr_neg)[sapply(det_coenr_neg, is.numeric)], digits = 3)
+```
+
+```{r det-coenr-neg-dl, echo=FALSE}
+dl_btn(det_coenr_neg, "det_coenr_mchneg.csv", "⬇ Download co-enriched with mCh- (detection model)")
+```
+
+#### Co-depleted with mCh- {.unnumbered}
+
+```{r det-codepl-neg}
+det_codepl_neg <- det_neg$result %>% filter(FDR < SIG_FDR, log_or <= -0.1) %>% arrange(log_or)
+DT::datatable(det_codepl_neg, rownames = FALSE, filter = "top",
+              options = list(pageLength = 10, scrollX = TRUE)) %>%
+  DT::formatSignif(columns = names(det_codepl_neg)[sapply(det_codepl_neg, is.numeric)], digits = 3)
+```
+
+```{r det-codepl-neg-dl, echo=FALSE}
+dl_btn(det_codepl_neg, "det_codepl_mchneg.csv", "⬇ Download co-depleted with mCh- (detection model)")
+```
+:::
+
+<details>
+
+<summary>Top 10 co-enriched & co-depleted genes — expression UMAPs (click to expand)</summary>
+
+UMAP plots of normalized SCT expression for the top 10 co-enriched and co-depleted genes identified by the detection model. Each gene is shown split by sample to reveal how expression tracks the DA pattern across conditions. Two rendering orders are provided: shuffled (reduces overplotting bias from cluster order) and expression-ordered (brings high-expressing cells to the foreground to highlight low-abundance signal).
+
+Top 10 co-enriched genes — normalized expression (cells in random order):
+
+```{r det-feat-enr-neg-shuffle, fig.width=20, fig.height=26}
+top_enr_neg <- det_neg$result %>%
+  filter(FDR < SIG_FDR, log_or > 0) %>%
+  arrange(desc(log_or)) %>% head(10) %>% pull(gene)
+if (length(top_enr_neg) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_enr_neg,
+                        cell_order = "shuffle", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+Top 10 co-enriched genes — normalized expression (cells ordered by expression):
+
+```{r det-feat-enr-neg, fig.width=20, fig.height=26}
+if (length(top_enr_neg) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_enr_neg,
+                        cell_order = "expression", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+Top 10 co-depleted genes — normalized expression (cells in random order):
+
+```{r det-feat-dep-neg-shuffle, fig.width=20, fig.height=26}
+top_dep_neg <- det_neg$result %>%
+  filter(FDR < SIG_FDR, log_or < 0) %>%
+  arrange(log_or) %>% head(10) %>% pull(gene)
+if (length(top_dep_neg) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_dep_neg,
+                        cell_order = "shuffle", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+Top 10 co-depleted genes — normalized expression (cells ordered by expression):
+
+```{r det-feat-dep-neg, fig.width=20, fig.height=26}
+if (length(top_dep_neg) > 0)
+  plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = top_dep_neg,
+                        cell_order = "expression", outline = FALSE,
+                        split.by = "sample.name") & scale_color_viridis_c(option = "turbo")
+```
+
+</details>
+
+```{r det-rank-neg, fig.height=6, fig.width=10}
+lbl_rank_neg <- label_det_rank(det_neg$result, n = 10)
+plot_det_rank(det_neg$result, labels = lbl_rank_neg,
+              title = "Detection model — genes co-varying with DA (mCh- vs WT)")
+```
+
+```{r det-volcano-neg, fig.height=9, fig.width=9}
+lbl_vol_neg <- label_det_volcano(det_neg$result, n = 20)
+plot_det_volcano(det_neg$result, labels = lbl_vol_neg,
+                 title = "Volcano (mCh- vs WT)")
+```
+
+<details>
+
+A focused looked on the FDR = 0 genes that suffer from overplotting in the volcano plot.
+
+<summary>FDR = 0 genes — lollipop (click to expand)</summary>
+
+Genes reaching FDR = 0 (numerical machine precision — strongest possible signal) ranked by their log Odds Ratio. Positive OR indicates co-enrichment with DA-enriched neighbourhoods; negative OR indicates co-depletion. Point colour shows mean detection fraction across all neighbourhoods — lower values (dark) mark genes detected only in a small proportion of cells, highlighting localized, state-specific candidates.
+
+```{r det-zero-fdr-neg}
+#| fig-width: 8
+#| fig-height: !expr max(4, sum(det_neg$result$FDR == 0 & abs(det_neg$result$log_or) >= 0.15) * 0.07)
+fdr0_neg <- det_neg$result %>% filter(FDR == 0, abs(log_or) >= 0.15)
+plot_det_zero_fdr(fdr0_neg, "Genes with FDR = 0 & |log OR| ≥ 0.15 — mCh- vs WT")
+```
+
+</details>
+
+```{r det-frac-neg, fig.height=9, fig.width=9}
+lbl_frac_neg <- label_det_frac_lor(det_neg$result, n_bins = 20, n_per_bin = 2)
+plot_det_frac_lor(det_neg$result, labels = lbl_frac_neg,
+                  title = "Mean detection fraction vs log OR (mCh- vs WT)")
+```
+
+```{r det-dl-neg}
+dl_btn(det_neg$result, "det_mchneg_vs_wt.csv", "⬇ Detection model results (mCh- vs WT, all genes)")
+```
+
+<details>
+
+<summary>FDR = 0 genes — mean detection fraction scatter (click to expand)</summary>
+
+The same FDR = 0 genes plotted as mean detection fraction (x) versus log Odds Ratio (y). Restricting to these extreme-significance genes reduces overplotting enough to label all points. Low fraction + high absolute OR marks genes detected in only a narrow slice of the cell state space yet strongly co-varying with the DA pattern — these are the strongest candidates for state-specific regulators.
+
+```{r det-zero-fdr-frac-neg, fig.height=10, fig.width=10}
+plot_det_frac_lor_zoomed(fdr0_neg, "FDR = 0 genes — mean frac vs log OR (mCh- vs WT)")
+```
+
+</details>
+
+### Comparison: mCh+ vs mCh- {.unnumbered}
+
+```{r det-compare, fig.height=6, fig.width=14}
+cmp_det <- inner_join(
+  det_pos$result %>% select(gene, lor_pos = log_or, FDR_pos = FDR),
+  det_neg$result %>% select(gene, lor_neg = log_or, FDR_neg = FDR),
+  by = "gene"
+) %>%
+  mutate(
+    delta = lor_pos - lor_neg,
+    sig   = FDR_pos < SIG_FDR | FDR_neg < SIG_FDR
+  )
+
+det_lab <- bind_rows(
+  cmp_det %>% filter(sig) %>% slice_max(delta, n = 10),
+  cmp_det %>% filter(sig) %>% slice_min(delta, n = 10),
+  cmp_det %>% filter(sig, lor_pos > 0, lor_neg > 0) %>% slice_max(lor_pos + lor_neg, n = 10),
+  cmp_det %>% filter(sig, lor_pos < 0, lor_neg < 0) %>% slice_max(-(lor_pos + lor_neg), n = 10)
+) %>% distinct(gene, .keep_all = TRUE)
+
+p_det_scatter <- ggplot(cmp_det, aes(lor_pos, lor_neg)) +
+  geom_point(aes(fill = delta), shape = 21, colour = "grey30", size = 1.5, stroke = 0.3, alpha = 0.7) +
+  ggrepel::geom_text_repel(data = det_lab, aes(label = gene),
+                           size = 2.8, colour = "grey20", max.overlaps = Inf,
+                           segment.size = 0.2, segment.colour = "grey55") +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50", linetype = "dashed", linewidth = 0.4) +
+  geom_hline(yintercept = 0, colour = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       name = "Δ log OR\n(mCh+ − mCh-)") +
+  labs(x = "log OR (mCh+ vs WT)", y = "log OR (mCh- vs WT)",
+       title = "Detection model — mCh+ vs mCh- (scatter)") +
+  theme_bw(base_size = 11)
+
+det_rank <- cmp_det %>% filter(sig) %>% arrange(desc(delta)) %>% mutate(rank = row_number())
+n_sig_det <- nrow(det_rank)
+det_rank_lab <- bind_rows(slice_max(det_rank, delta, n = 15), slice_min(det_rank, delta, n = 15)) %>%
+  distinct(gene, .keep_all = TRUE)
+nudge_det <- ifelse(det_rank_lab$delta > 0, n_sig_det * 0.08, -n_sig_det * 0.08)
+
+p_det_rank <- ggplot(det_rank, aes(rank, delta)) +
+  geom_point(aes(fill = delta), shape = 21, colour = "grey30", size = 1.5, stroke = 0.3, alpha = 0.7) +
+  ggrepel::geom_text_repel(data = det_rank_lab, aes(label = gene),
+                           size = 2.8, colour = "grey20", max.overlaps = Inf,
+                           nudge_x = nudge_det,
+                           segment.size = 0.2, segment.colour = "grey55") +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.3, linetype = "dashed") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       name = "Δ log OR\n(mCh+ − mCh-)") +
+  labs(x = "Gene rank", y = "Δ log OR (mCh+ − mCh-)",
+       title = "Detection model — condition-differential rank",
+       caption = "Ranked by mCh+ − mCh- log OR; labelled: top 15 at each extreme") +
+  theme_bw(base_size = 11)
+
+p_det_scatter | p_det_rank
+```
+
+```{r det-compare-dl, echo=FALSE}
+dl_btn(cmp_det, "det_mchpos_vs_mchneg_comparison.csv",
+       "⬇ Download detection model comparison (mCh+ vs mCh-)")
+```
+
+# Limma vs detection — method concordance (mCh+)
+
+Both models rank genes by their association with DA, but via slightly different approaches: limma uses continuous neighbourhood-averaged expression; the detection model uses binary detection rates. Genes with switch-like expression pattern score poorly in limma (slope diluted by zero-expression nhoods) but rank highly in the detection model.
+
+```{r limma-vs-det, fig.height=6, fig.width=14}
+cmp_methods <- inner_join(
+  gstats_pos %>% select(gene, limma_t = t, limma_FDR = FDR),
+  det_pos$result %>% select(gene, det_lor = log_or, det_FDR = FDR),
+  by = "gene"
+) %>%
+  mutate(
+    sig      = limma_FDR < SIG_FDR | det_FDR < SIG_FDR,
+    rank_lim = rank(-limma_t),
+    rank_det = rank(-det_lor),
+    delta    = rank_det - rank_lim  # positive = detection ranks this gene higher than limma
+  )
+
+n_genes <- nrow(cmp_methods)
+
+meth_lab <- bind_rows(
+  cmp_methods %>% filter(sig) %>% slice_max(delta,  n = 10),               # detection-biased
+  cmp_methods %>% filter(sig) %>% slice_min(delta,  n = 10),               # limma-biased
+  cmp_methods %>% filter(sig) %>% slice_min(rank_lim + rank_det, n = 10)   # top concordant
+) %>% distinct(gene, .keep_all = TRUE)
+
+p_meth_scatter <- ggplot(cmp_methods, aes(rank_lim, rank_det)) +
+  geom_point(aes(fill = delta), shape = 21, colour = "grey30", size = 1.5, stroke = 0.3, alpha = 0.7) +
+  ggrepel::geom_text_repel(data = meth_lab, aes(label = gene), size = 2.5, colour = "grey20",
+                           max.overlaps = Inf, segment.size = 0.2, segment.colour = "grey55") +
+  geom_abline(slope = 1, intercept = 0, colour = "grey50", linetype = "dashed", linewidth = 0.4) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       name = "Δrank\n(det − lim)") +
+  labs(x = "Limma rank  (1 = highest t)", y = "Detection rank  (1 = highest log OR)",
+       title = "Limma vs detection — rank concordance (mCh+ vs WT)",
+       caption = "Labelled: top 10 detection-biased, top 10 limma-biased, top 10 concordant  |  dashed = perfect concordance") +
+  theme_bw(base_size = 11)
+
+meth_rank <- cmp_methods %>% filter(sig) %>%
+  arrange(desc(delta)) %>% mutate(rank_d = row_number())
+n_sig_meth   <- nrow(meth_rank)
+meth_rank_lab <- bind_rows(
+  slice_max(meth_rank, delta, n = 15),
+  slice_min(meth_rank, delta, n = 15)
+) %>% distinct(gene, .keep_all = TRUE)
+nudge_meth <- ifelse(meth_rank_lab$delta > 0, n_sig_meth * 0.08, -n_sig_meth * 0.08)
+
+p_meth_rank <- ggplot(meth_rank, aes(rank_d, delta)) +
+  geom_point(aes(fill = delta), shape = 21, colour = "grey30", size = 1.5, stroke = 0.3, alpha = 0.7) +
+  ggrepel::geom_text_repel(data = meth_rank_lab, aes(label = gene), size = 2.8, colour = "grey20",
+                           max.overlaps = Inf, nudge_x = nudge_meth,
+                           segment.size = 0.25, segment.colour = "grey55") +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       name = "Δrank\n(det − lim)") +
+  labs(x = "Gene rank", y = "Δrank  (det − lim)",
+       title = "Method-differential rank (mCh+ vs WT)",
+       caption = "Significant genes ranked by Δrank; labelled: top 15 at each extreme") +
+  theme_bw(base_size = 11)
+
+p_meth_scatter | p_meth_rank
+```
+
+```{r limma-vs-det-stats}
+cor_sp <- cor(cmp_methods$rank_lim, cmp_methods$rank_det,
+              method = "spearman", use = "complete.obs")
+cat(sprintf("Spearman ρ (limma rank vs detection rank, mCh+): %.3f\n\n", cor_sp))
+```
+
+This comparisons highlights some genes that have a much higher rank (i.e. less associated with differential abundance) in limma model compared to the detection model because they either have localized expression in a small part of the cell embedding (e.g  *Fcnb*, and *Clec4a2*) or have as switch-like expression pattern (e.g *Prom1*).
+
+```{r limma-vs-det-feature, fig.width=20, fig.height=9}
+highlight_genes <- c("Fcnb", "Clec4a2", "Prom1")
+plot_umap_feature_ext(mpn_processed_hsc_fullcc, features = highlight_genes,
+                      cell_order = "expression", outline = FALSE,
+                      split.by = "sample.name") &
+  scale_color_viridis_c(option = "turbo")
+```
+
+# GSEA on DA-co-detected genes
+
+GSEA on `log_or` ranks from the detection model. Both contrasts are run independently against each MSigDB collection.
+
+```{r load-genesets, message=FALSE}
+msig_gs <- lapply(msig_collections, function(coll) {
+  load_msig_mouse(coll$collection, coll$subcollection)
+})
+```
+
+```{r run-gsea}
+gse_pos <- lapply(msig_gs, function(gs) enrichment_fgsea(det_pos$result, gs, stat = "log_or"))
+gse_neg <- lapply(msig_gs, function(gs) enrichment_fgsea(det_neg$result, gs, stat = "log_or"))
+# cmp_det (lor_pos - lor_neg delta) already defined in det-compare chunk above
+gse_cmp <- lapply(msig_gs, function(gs) enrichment_fgsea(cmp_det, gs, stat = "delta"))
+```
+
+```{r gsea-dl-pos}
+gse_pos_all <- bind_rows(lapply(names(gse_pos), function(cn)
+  gse_pos[[cn]] %>% mutate(collection = cn))) %>% arrange(padj)
+dl_btn(gse_pos_all, "gsea_mchpos_vs_wt_all.csv", "⬇ All GSEA results (mCh+ vs WT, all collections)")
+```
+
+```{r gsea-dl-neg}
+gse_neg_all <- bind_rows(lapply(names(gse_neg), function(cn)
+  gse_neg[[cn]] %>% mutate(collection = cn))) %>% arrange(padj)
+dl_btn(gse_neg_all, "gsea_mchneg_vs_wt_all.csv", "⬇ All GSEA results (mCh- vs WT, all collections)")
+```
+
+```{r gsea-dl-cmp}
+gse_cmp_all <- bind_rows(lapply(names(gse_cmp), function(cn)
+  gse_cmp[[cn]] %>% mutate(collection = cn))) %>% arrange(padj)
+dl_btn(gse_cmp_all, "gsea_mchpos_vs_mchneg_all.csv", "⬇ All GSEA results (mCh+ vs mCh-, all collections)")
+```
+
+```{r gsea-helpers}
+N_TOP_GSEA <- 15
+N_TOP_HITS <- 5
+
+render_gsea_tables <- function(gse_results, contrast_tag = "") {
+  for (coll_name in names(gse_results)) {
+    cat("##", coll_name, "\n\n")
+    all_sig <- gse_results[[coll_name]] %>% filter(padj < PADJ_GSEA) %>% arrange(desc(NES))
+    if (nrow(all_sig) == 0) { cat("No significant pathways.\n\n"); next }
+    # download button for this collection
+    fn <- paste0("gsea_", tolower(gsub("[^a-z0-9]", "_", coll_name)), contrast_tag, ".csv")
+    print(htmltools::tagList(dl_btn(all_sig, fn,
+          paste0("⬇ ", coll_name, " GSEA results (", nrow(all_sig), " sig. pathways)"))))
+    cat("\n\n")
+    sig <- all_sig %>%
+      mutate(pathway     = stringr::str_trunc(abbreviate_pathway(pathway), 60),
+             NES         = round(NES, 3),
+             padj        = signif(padj, 3),
+             leadingEdge = sapply(leadingEdge, \(x) paste(head(x, 8), collapse = ", "))) %>%
+      select(pathway, NES, padj, size, leadingEdge)
+    print(htmltools::tagList(DT::datatable(sig, rownames = FALSE, filter = "top",
+                                          options = list(pageLength = 10, scrollX = TRUE))))
+    cat("\n\n")
+  }
+}
+
+render_gsea_bars <- function(gse_results) {
+  for (coll_name in names(gse_results)) {
+    cat("##", coll_name, "\n\n")
+    res <- gse_results[[coll_name]] %>%
+      filter(padj < PADJ_GSEA) %>%
+      mutate(direction     = if_else(NES > 0, "Co-enriched", "Co-depleted"),
+             pathway_short = stringr::str_trunc(abbreviate_pathway(pathway), 55))
+    if (nrow(res) == 0) { cat("No significant pathways.\n\n"); next }
+    df_dep <- res %>% filter(direction == "Co-depleted") %>%
+      slice_max(abs(NES), n = N_TOP_GSEA, with_ties = FALSE) %>% arrange(abs(NES))
+    df_enr <- res %>% filter(direction == "Co-enriched") %>%
+      slice_max(abs(NES), n = N_TOP_GSEA, with_ties = FALSE) %>% arrange(abs(NES))
+    df <- bind_rows(df_dep, df_enr) %>%
+      mutate(pathway_short = factor(pathway_short, levels = unique(pathway_short)),
+             direction     = factor(direction, levels = c("Co-enriched", "Co-depleted")),
+             label_x       = if_else(NES > 0, 0.05, -0.05),
+             label_hjust   = if_else(NES > 0, 0, 1))
+    p <- ggplot(df, aes(x = NES, y = pathway_short)) +
+      geom_col(aes(fill = direction), width = 0.7, alpha = 0.85) +
+      geom_vline(xintercept = 0, colour = "grey40", linewidth = 0.3) +
+      geom_text(aes(label = paste0("p=", signif(padj, 2)), x = label_x, hjust = label_hjust),
+                size = 2.5, colour = "grey20") +
+      scale_fill_manual(values = c("Co-enriched" = "#B2182B", "Co-depleted" = "#2166AC"),
+                        name = NULL) +
+      facet_grid(direction ~ ., scales = "free_y", space = "free_y") +
+      labs(x = "NES", y = NULL, title = coll_name,
+           caption = paste0("Top ", N_TOP_GSEA, " per direction — padj < ", PADJ_GSEA)) +
+      theme_bw(base_size = 10) +
+      theme(legend.position = "none", strip.background = element_rect(fill = "grey92"),
+            strip.text = element_text(face = "bold", size = 9),
+            axis.text.y = element_text(size = 7), panel.grid.major.y = element_blank())
+    print(p)
+    cat("\n\n")
+  }
+}
+
+make_enrich_plots <- function(paths_df, gs_list, ranks_stat) {
+  lapply(seq_len(nrow(paths_df)), function(i) {
+    pw <- paths_df$pathway[i]
+    fgsea::plotEnrichment(gs_list[[pw]], stats = ranks_stat) +
+      labs(title    = stringr::str_trunc(abbreviate_pathway(pw), 50),
+           subtitle = paste0("NES=", round(paths_df$NES[i], 2),
+                             "  padj=", signif(paths_df$padj[i], 2))) +
+      theme_bw(base_size = 9) +
+      theme(plot.title = element_text(size = 8, face = "bold"),
+            plot.subtitle = element_text(size = 7))
+  })
+}
+
+render_gsea_curves <- function(gse_results, gs_list, ranks_stat) {
+  for (coll_name in names(gse_results)) {
+    cat("##", coll_name, "\n\n")
+    enr <- gse_results[[coll_name]] %>% filter(padj < PADJ_GSEA, NES > 0) %>%
+      arrange(padj) %>% head(N_TOP_HITS)
+    dep <- gse_results[[coll_name]] %>% filter(padj < PADJ_GSEA, NES < 0) %>%
+      arrange(padj) %>% head(N_TOP_HITS)
+    if (nrow(enr) == 0 && nrow(dep) == 0) { cat("No significant pathways.\n\n"); next }
+    if (nrow(enr) > 0) {
+      cat("**Co-enriched — top", nrow(enr), "pathways**\n\n")
+      print(patchwork::wrap_plots(make_enrich_plots(enr, gs_list[[coll_name]], ranks_stat),
+                                  ncol = min(nrow(enr), 3)))
+      cat("\n\n")
+    }
+    if (nrow(dep) > 0) {
+      cat("**Co-depleted — top", nrow(dep), "pathways**\n\n")
+      print(patchwork::wrap_plots(make_enrich_plots(dep, gs_list[[coll_name]], ranks_stat),
+                                  ncol = min(nrow(dep), 3)))
+      cat("\n\n")
+    }
+  }
+}
+
+ranks_pos <- { r <- det_pos$result$log_or; names(r) <- det_pos$result$gene
+               sort(r[is.finite(r)], decreasing = TRUE) }
+ranks_neg <- { r <- det_neg$result$log_or; names(r) <- det_neg$result$gene
+               sort(r[is.finite(r)], decreasing = TRUE) }
+ranks_cmp <- { r <- cmp_det$delta; names(r) <- cmp_det$gene
+               sort(r[is.finite(r)], decreasing = TRUE) }
+```
+
+## Het mCh+ vs WT {.unnumbered}
+
+### Enrichment tables {.unnumbered}
+
+::: panel-tabset
+```{r gsea-tables-pos, results="asis"}
+render_gsea_tables(gse_pos, contrast_tag = "_mchpos_vs_wt")
+```
+:::
+
+### GSEA bar plots {.unnumbered}
+
+::: panel-tabset
+```{r gsea-bars-pos, results="asis", fig.width=10, fig.height=9}
+render_gsea_bars(gse_pos)
+```
+:::
+
+### Enrichment curves — top hits {.unnumbered}
+
+::: panel-tabset
+```{r gsea-curves-pos, results="asis", fig.width=12, fig.height=6}
+render_gsea_curves(gse_pos, msig_gs, ranks_pos)
+```
+:::
+
+## Het mCh- vs WT {.unnumbered}
+
+### Enrichment tables {.unnumbered}
+
+::: panel-tabset
+```{r gsea-tables-neg, results="asis"}
+render_gsea_tables(gse_neg, contrast_tag = "_mchneg_vs_wt")
+```
+:::
+
+### GSEA bar plots {.unnumbered}
+
+::: panel-tabset
+```{r gsea-bars-neg, results="asis", fig.width=10, fig.height=9}
+render_gsea_bars(gse_neg)
+```
+:::
+
+### Enrichment curves — top hits {.unnumbered}
+
+::: panel-tabset
+```{r gsea-curves-neg, results="asis", fig.width=12, fig.height=6}
+render_gsea_curves(gse_neg, msig_gs, ranks_neg)
+```
+:::
+
+## mCh+ vs mCh- (condition-differential rank) {.unnumbered}
+
+GSEA ranked by the detection-model delta (log OR mCh+ minus log OR mCh-). Positive NES = pathways more strongly co-enriched with mCh+ neighbourhoods than mCh-; negative NES = more strongly co-enriched with mCh- neighbourhoods. The ranking statistic is the same `delta` column from the comparison scatter in the Per-gene detection section above.
+
+### Enrichment tables {.unnumbered}
+
+::: panel-tabset
+```{r gsea-tables-cmp, results="asis"}
+render_gsea_tables(gse_cmp, contrast_tag = "_mchpos_vs_mchneg")
+```
+:::
+
+### GSEA bar plots {.unnumbered}
+
+::: panel-tabset
+```{r gsea-bars-cmp, results="asis", fig.width=10, fig.height=9}
+render_gsea_bars(gse_cmp)
+```
+:::
+
+### Enrichment curves — top hits {.unnumbered}
+
+::: panel-tabset
+```{r gsea-curves-cmp, results="asis", fig.width=12, fig.height=6}
+render_gsea_curves(gse_cmp, msig_gs, ranks_cmp)
+```
+:::
+
+# Limitations
+
+-   Very small, disconnected clusters were excluded from the analysis.
+
+-   I modeled the differential abundance pattern globally.
+
+-   I used the logFC from all neighborhoods of the included clusters, regardless of the their p-adj value. Nevertheless, the model uses the corresponding p-adj values as weight.
+
+-   I tested all genes for co-enrichment or co-depletion to avoid neglecting interesting genes that are expressed at low level. However, this means that genes that are not variable enough in the first place are included in the modeling. Nevertheless, these gene are not expected to come up as top hits anyway.
+
+-   The expression values that were used are neighborhood averages, not single-cells.
+
+# Conclusion
+
+We used differential abundance to define enriched and depleted cell states in the mutant mouse with respect to the wild-type control. To identify candidate genes involved in the enrichment or depletion of specific cell states, we modeled the differential abundance score as a function of gene expression using linear models. This allowed us to rank genes based on their positive or negative association with the cell states of interest from the mutant mouse, and highlight the set of active biological processes in them. Importantly, it allowed us to have a deeper look on what sets mCh+ and mCh- apart at the earliest stage. While both share expression of stemness markers like *Mmrn1* (https://pubmed.ncbi.nlm.nih.gov/41568470/), each displays a specific set of gene expression pattern. *Meis2*, *Csf3*, and *Nkx2-3* are more enriched in the mCh+ cells, while mCh- uniquely turns on matricellular-associated genes like *Ccn1* and *Matn4*. These are genes are non-structural component of the ECM that mediates signals between the cell and its environment, and fibroblast regulators. Interestingly, *Ccn1* was shown to promote cell survival in AML by indirectly activating Bcl-xL (https://pmc.ncbi.nlm.nih.gov/articles/PMC4153307/), which is also up-regulated in the mutant mouse clusters (6 and 8), especially in the mCh- cells.*Matn4* is an ECM component whose expression is specific to LT-HSC and anticorrelates with proliferation towards progenitors (https://pmc.ncbi.nlm.nih.gov/articles/PMC5030798/). 
+
+# Extra:
+
+## UCell module scores — co-enriched genesets {.unnumbered}
+
+Top co-enriched genesets per contrast and per MSigDB collection (up to 10 per collection, ranked by padj) scored per cell with UCell and overlaid on the combined HSC UMAP.
+
+```{r gsea-ucell-helpers}
+plot_ucell_umap <- function(ucell_df, score_col) {
+  df  <- ucell_df[order(ucell_df[[score_col]]), ]
+  q99 <- quantile(df[[score_col]], 0.99, na.rm = TRUE)
+  ggplot(df, aes(UMAP1, UMAP2, colour = .data[[score_col]])) +
+    geom_point(size = 0.3, alpha = 0.7) +
+    scale_colour_viridis_c(option = "turbo", name = "UCell",
+                           limits = c(0, q99), oob = scales::squish) +
+    facet_wrap(~ sample.name, nrow = 1) +
+    labs(title = score_col) +
+    theme_void(base_size = 9) +
+    theme(plot.title        = element_text(size = 12, face = "bold"),
+          legend.key.height = unit(0.4, "cm"),
+          strip.text        = element_text(size = 9))
+}
+
+render_ucell_maps <- function(gse_lst, n = 10) {
+  for (coll_name in names(gse_lst)) {
+    cat("##", coll_name, "\n\n")
+    top_df <- gse_lst[[coll_name]] %>%
+      filter(padj < PADJ_GSEA, NES > 0) %>%
+      arrange(padj) %>%
+      slice_head(n = n)
+    if (nrow(top_df) == 0) { cat("No significant co-enriched genesets.\n\n"); next }
+    gs <- setNames(
+      lapply(top_df$pathway, function(pw) msig_gs[[coll_name]][[pw]]),
+      stringr::str_trunc(abbreviate_pathway(top_df$pathway), 45)
+    )
+    uc <- extract_ucell_scores(mpn_processed_hsc_fullcc, gs, umap_name = "umap.nn")
+    for (g in names(gs)) {
+      print(plot_ucell_umap(uc, g))
+      cat("\n\n")
+    }
+  }
+}
+```
+
+### mCh+ vs WT {.unnumbered}
+
+::: panel-tabset
+```{r gsea-ucell-pos, results="asis", fig.width=14, fig.height=3.5, dpi=72}
+render_ucell_maps(gse_pos)
+```
+:::
+
+### mCh- vs WT {.unnumbered}
+
+::: panel-tabset
+```{r gsea-ucell-neg, results="asis", fig.width=14, fig.height=3.5, dpi=72}
+render_ucell_maps(gse_neg)
+```
+:::
+
+### mCh+ vs mCh- {.unnumbered}
+
+::: panel-tabset
+```{r gsea-ucell-cmp, results="asis", fig.width=14, fig.height=3.5, dpi=72}
+render_ucell_maps(gse_cmp)
+```
+:::
+
+## Explore the enriched mCh+ erythroid neighbourhood
+
+In general, the clusters representing the erythroid lineage show a pattern of depletion of both mCh+ and mCh- cells. However, a small neighbourhood displaying the opposite pattern stands out at early erythroid stage. Cluster 3 is isolated and analysed here using the same limma and detection-model pipelines as the main analysis.
+
+```{r ery-setup}
+ERY_CLUSTERS   <- c("3")   # candidate early erythroid; see also "9", "7"
+da_res_ery_pos <- da_res_pos_all %>% filter(sNN_pca.SCT_30_res.0.9 %in% ERY_CLUSTERS)
+```
+
+```{r ery-limma}
+sub_ery_pos    <- build_sub_expr(nhexpr, da_res_ery_pos, milo_hsc_obj)
+gstats_ery_pos <- pergene_lfc_regression(sub_ery_pos)
+```
+
+```{r ery-detection}
+ery_det_pos <- build_detection_substrate(milo_hsc_obj, da_res_ery_pos, subset.row = gene_subset)
+det_ery_pos <- detection_lfc_model(ery_det_pos, adjust_depth = TRUE)
+```
+
+### Limma — neighbourhood expression regression {.unnumbered}
+
+Genes ranked by their t-statistic from the weighted limma regression of neighbourhood-averaged expression on neighbourhood logFC within cluster 3.
+
+```{r ery-limma-table}
+DT::datatable(
+  gstats_ery_pos %>% arrange(desc(t)),
+  rownames = FALSE, filter = "top",
+  options  = list(pageLength = 10, scrollX = TRUE)
+) %>%
+  DT::formatSignif(columns = names(gstats_ery_pos)[sapply(gstats_ery_pos, is.numeric)], digits = 3)
+```
+
+```{r ery-limma-dl, echo=FALSE}
+dl_btn(gstats_ery_pos %>% arrange(desc(t)), "limma_ery_mchpos.csv",
+       "⬇ Download limma results (erythroid mCh+)")
+```
+
+### Detection model {.unnumbered}
+
+Per-gene quasibinomial detection model within the erythroid-enriched neighbourhood.
+
+```{r ery-det-table}
+DT::datatable(
+  det_ery_pos$result %>% arrange(desc(log_or)),
+  rownames = FALSE, filter = "top",
+  options  = list(pageLength = 10, scrollX = TRUE)
+) %>%
+  DT::formatSignif(
+    columns = names(det_ery_pos$result)[sapply(det_ery_pos$result, is.numeric)], digits = 3)
+```
+
+```{r ery-det-dl, echo=FALSE}
+dl_btn(det_ery_pos$result %>% arrange(desc(log_or)), "det_ery_mchpos.csv",
+       "⬇ Download detection model results (erythroid mCh+)")
+```
+
+```{r ery-det-volcano, fig.height=9, fig.width=9}
+lbl_vol_ery <- label_det_volcano(det_ery_pos$result, n = 20)
+plot_det_volcano(det_ery_pos$result, labels = lbl_vol_ery,
+                 title = "Volcano — erythroid mCh+ neighbourhood (cluster 3)")
+```
+
+## miloDE — neighbourhood-level DE {#sec-milode}
+
+Neighbourhood-level differential expression tested with `miloDE::de_test_neighbourhoods()` across three contrasts: mCh+ vs WT, mCh- vs WT, and mCh+ vs mCh-. Each neighbourhood is a cell × KNN graph community; DE is run within each neighbourhood to localise expression changes to specific UMAP regions.
+
+```{r milode-load, eval=FALSE}
+tar_load(milo_within_ngb_pos_de)
+tar_load(milo_within_ngb_neg_de)
+tar_load(milo_within_ngb_pos_neg_de)
+#use the p-value corrected across genes since I didn't run cross-hoods p-value correction
+milo_within_ngb_pos_de$pval_corrected_across_nhoods <- milo_within_ngb_pos_de$pval_corrected_across_genes
+
+hood_annot <- miloR::annotateNhoods(
+  milo_hsc_obj,
+  da.res      = milo_hsc_da$mChPos_vs_WT$da_results,
+  coldata_col = "sNN_pca.SCT_30_res.0.9"
+)
+
+milode_lst <- list(
+  "mCh+ vs WT"   = milo_within_ngb_pos_de,
+  "mCh- vs WT"   = milo_within_ngb_neg_de,
+  "mCh+ vs mCh-" = milo_within_ngb_pos_neg_de
+)
+```
+
+### miloDE gene logFC on neighbourhood graph
+
+```{r, eval=FALSE}
+miloDE::plot_DE_single_gene(milo_hsc_obj,
+                            milo_within_ngb_pos_de,
+                            gene = "Klf1",
+                            layout = "umap.nn",
+                            alpha =1) &
+    ggplot2::scale_fill_gradient2(low = "blue", mid = "white", high = "red")
+```
+
+### DE magnitude per neighbourhood {.unnumbered}
+
+Number of DE genes (`n_DE_genes`) and neighbourhood-specific DE genes (`n_specific_DE_genes`) plotted on the Milo UMAP. Each dot is a neighbourhood; size reflects neighbourhood size.
+
+::: panel-tabset
+```{r milode-magnitude, eval=FALSE, results="asis", fig.height=5, fig.width=10}
+for (comp in names(milode_lst)) {
+  cat("##", comp, "\n\n")
+  de_stat     <- miloDE::convert_de_stat(milode_lst[[comp]])
+  stat_de_mag <- miloDE::rank_neighbourhoods_by_DE_magnitude(de_stat)
+
+  p1 <- miloDE::plot_milo_by_single_metric(
+    milo_hsc_obj, stat_de_mag,
+    colour_by  = "n_DE_genes",
+    layout     = "umap.nn",
+    size_range = c(1.5, 3),
+    edge_width = c(0.2, 0.5)
+  ) + scale_fill_viridis_c(name = "# DE genes", option = "turbo")
+
+  p2 <- miloDE::plot_milo_by_single_metric(
+    milo_hsc_obj, stat_de_mag,
+    colour_by  = "n_specific_DE_genes",
+    layout     = "umap.nn",
+    size_range = c(1.5, 3),
+    edge_width = c(0.2, 0.5)
+  ) + scale_fill_viridis_c(name = "# specific\nDE genes", option = "turbo")
+
+  print(patchwork::wrap_plots(p1, p2, nrow = 1))
+  cat("\n\n")
+}
+```
+:::
+
+### Genes up/down across neighbourhoods {.unnumbered}
+
+::: panel-tabset
+```{r milode-updown, eval=FALSE, results="asis", fig.height=5, fig.width=6}
+for (comp in names(milode_lst)) {
+  cat("##", comp, "\n\n")
+  p <- milode_lst[[comp]] %>%
+    filter(!gene %in% sex_degs) %>%
+    group_by(gene) %>%
+    summarise(up_nbh   = sum(logFC > 0, na.rm = TRUE),
+              down_nbh = sum(logFC < 0, na.rm = TRUE)) %>%
+    ungroup() %>%
+    ggplot(aes(down_nbh, up_nbh, label = gene)) +
+    geom_abline(slope = 1, color = "grey") +
+    geom_point(size = 0.5) +
+    ggrepel::geom_text_repel(
+      data = . %>% filter(down_nbh > 1000 | up_nbh > 1000),
+      size = 3
+    ) +
+    labs(title = comp,
+         x = "# neighbourhoods down-regulated",
+         y = "# neighbourhoods up-regulated") +
+    theme_bw(base_size = 11)
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+### Top DE genes per neighbourhood {.unnumbered}
+
+For each contrast, the top genes by frequency of significant DE across neighbourhoods (padj \< 0.05, \|logFC\| \> 1).
+
+::: panel-tabset
+```{r milode-top-genes, eval=FALSE, results="asis"}
+for (comp in names(milode_lst)) {
+  cat("##", comp, "\n\n")
+  top_genes <- milode_lst[[comp]] %>%
+    dplyr::filter(pval_corrected_across_nhoods < 0.05,
+                  abs(logFC) > 1) %>%
+    dplyr::count(gene, name = "n_sig_nhoods") %>%
+    dplyr::arrange(desc(n_sig_nhoods)) %>%
+    dplyr::slice_head(n = 50)
+
+  if (nrow(top_genes) == 0) { cat("No significant genes.\n\n"); next }
+  print(htmltools::tagList(
+    DT::datatable(top_genes, rownames = FALSE, filter = "top",
+                  caption = paste("Top DE genes —", comp),
+                  options = list(pageLength = 15, scrollX = TRUE))
+  ))
+  cat("\n\n")
+}
+```
+:::
+
+```{r milode-cleanup, eval=FALSE}
+rm(milo_within_ngb_pos_de, milo_within_ngb_neg_de,
+   milo_within_ngb_pos_neg_de, milode_lst, hood_annot); invisible(gc(verbose = FALSE))
+```
+
+------------------------------------------------------------------------
+
+## Enrichment analysis based on gene expression
+
+```{r, eval=FALSE}
+ranks    <- setNames(da_res$logFC, as.character(da_res$Nhood))   # order nhoods by LFC
+det_nh   <- sub$X>0               # genes x nhoods (detected?)
+pathways <- apply(det_nh, 1, function(r) names(ranks)[r])# one nhood-set per gene
+spec <- fgsea::fgseaMultilevel(pathways, ranks, minSize = 5)     # NES per gene = specificity
+```
+
+```{r, eval=FALSE}
+ranks    <- setNames(da_res$logFC, as.character(da_res$Nhood))   # order nhoods by LFC
+pathways <- apply(sub$X, 1, function(r) r %>% sort %>% tail(300) %>% names, simplify = FALSE)# one nhood-set per gene
+spec <- fgsea::fgseaMultilevel(pathways, ranks, minSize = 5)     # NES per gene = specificity
+```
+
+```{r, eval=FALSE}
+cap <- 100
+ranks    <- setNames(da_res$logFC, as.character(da_res$Nhood))   # order nhoods by LFC
+pathways <- apply(sub$X, 1, function(r){
+  nz <- r[r>0]
+  if(length(nz) > cap) nz <- nz %>% sort %>% tail(cap)
+  names(nz)
+  },
+simplify = FALSE)# one nhood-set per gene
+spec <- fgsea::fgseaMultilevel(pathways, ranks, minSize = 5)     # NES per gene = specificity
+```
+
+```{r, eval=FALSE}
+da_res <- milo_hsc_da$mChPos_vs_WT$da_results
+
+cap <- 100
+ranks    <- setNames(da_res$logFC, as.character(da_res$Nhood))   # order nhoods by LFC
+pathways <- apply(sub$X, 1, function(r){
+  nz <- r[r>0]
+  if(length(nz) > cap) nz <- nz %>% sort %>% tail(cap)
+  names(nz)
+  },
+simplify = FALSE)# one nhood-set per gene
+spec <- fgsea::fgseaMultilevel(pathways, ranks, minSize = 5)     # NES per gene = specificity
+```
+
+```{r, eval=FALSE}
+da_res <- milo_hsc_da$mChPos_vs_WT$da_results
+
+q_cutoff <- 0.9
+ranks    <- setNames(da_res$logFC, as.character(da_res$Nhood))   # order nhoods by LFC
+pathways <- apply(sub$X, 1, function(r){
+  q_r <- r[r>=quantile(r, q_cutoff)]
+  names(q_r)
+  },
+simplify = FALSE)# one nhood-set per gene
+
+lengths(pathways) %>% table
+spec <- fgsea::fgseaMultilevel(pathways, ranks, minSize = 5)     # NES per gene = specificity
+```
+
+Center of mass prioritization of genes
+
+```{r, eval=FALSE}
+E   <- sub$X[, da_res$Nhood]
+tot <- Matrix::rowSums(E)
+com <- ifelse(tot > 0, as.vector(E %*% da_res$logFC) / tot, NA)   # all genes, O(genes x nhoods)
+
+```
+
+```{r cleanup, eval=FALSE}
+rm(milo_hsc_obj, milo_hsc_da, gstats, sub, gse_results, msig_gs); gc()
+```
+
+{{< include ../_session-info.qmd >}}

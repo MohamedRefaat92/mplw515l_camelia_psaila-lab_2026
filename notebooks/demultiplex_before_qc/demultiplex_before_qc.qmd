@@ -1,0 +1,419 @@
+---
+title: "Demultiplexing (pre-QC)"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+Comparison of two demultiplexing tools — **deMULTIplex2** (pipeline default) and
+**HTODemux** (Seurat built-in) — on the raw merged object before any QC filtering.
+Use this notebook to assess HTO signal quality, compare assignment rates,
+and decide which tool to use in the pipeline.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(targets)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r load}
+# mpn_raw_stroma has the HTO assay + dm2_class added by flag_qc_metadata().
+# mpn_raw_all is pre-QC and lacks dm2_class — do not use it here.
+targets::tar_load(mpn_raw_stroma)
+targets::tar_load(qc_params)
+
+srt           <- mpn_raw_stroma
+hto_features  <- rownames(srt[["HTO"]])
+DM2_AVAILABLE <- "dm2_class" %in% colnames(srt@meta.data)
+```
+
+```{r normalise-hto}
+# CLR normalisation required for ridge plots and pair plots (creates data layer).
+# The pipeline uses deMULTIplex2 for assignment (dm2_class column); normalisation
+# here is only for visualisation purposes — it does not re-run demultiplexing.
+srt <- Seurat::NormalizeData(srt, assay = "HTO",
+                              normalization.method = "CLR",
+                              margin = 2, verbose = FALSE)
+```
+
+---
+
+## 1. HTO count distribution
+
+Raw HTO counts per barcode — check that all HTOs are captured.
+
+```{r hto-totals}
+hto_counts         <- as.data.frame(t(as.matrix(
+  SeuratObject::LayerData(srt, assay = "HTO", layer = "counts"))))
+hto_counts$total   <- rowSums(hto_counts)
+
+ggplot(hto_counts, aes(x = total)) +
+  geom_histogram(bins = 80, fill = "steelblue", alpha = 0.8) +
+  scale_x_log10() +
+  labs(title = "Total HTO counts per cell (log10 scale)",
+       x = "Total HTO counts", y = "# cells") +
+  theme_bw()
+```
+
+---
+
+## 2. HTO CLR-normalised signal per assignment class
+
+Ridge plots of CLR-normalised HTO signal grouped by deMULTIplex2 class.
+Good separation between positive and negative peaks indicates clean demultiplexing.
+
+```{r hto-ridge}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-height: 10
+#| fig-width: 6
+Seurat::Idents(srt) <- "dm2_class"
+Seurat::RidgePlot(srt,
+                  assay    = "HTO",
+                  features = hto_features,
+                  ncol     = 1)
+```
+
+---
+
+## 3. HTO signal pair plots
+
+```{r hto-data}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+hto_df             <- as.data.frame(t(as.matrix(
+  SeuratObject::LayerData(srt, assay = "HTO", layer = "data"))))
+hto_df$dm2_class   <- srt$dm2_class
+hto_df$sample.name <- srt$sample.name
+pairs              <- combn(hto_features, 2, simplify = FALSE)
+```
+
+### Coloured by assignment
+
+```{r hto-pairs-class}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-width: 10
+plots <- list()
+for (pr in pairs) {
+  pr_key      <- paste(pr, collapse = "_vs_")
+  plots[[pr_key]] <- ggplot(hto_df[sample(nrow(hto_df)), ],
+         aes(x = .data[[pr[1]]], y = .data[[pr[2]]], colour = dm2_class)) +
+    geom_point(size = 0.2, alpha = 0.4) +
+    labs(title = paste(pr[1], "vs", pr[2])) +
+    guides(colour = guide_legend(override.aes = list(size = 4))) +
+    theme_bw() +
+    theme(legend.text = element_text(size = 7))
+}
+(wrap_plots(plots, ncol = 3) + plot_layout(guides = "collect")) &
+  theme(legend.position = "bottom")
+```
+
+### Coloured by sample
+
+```{r hto-pairs-sample}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-width: 10
+plots_sample <- list()
+for (pr in pairs) {
+  pr_key               <- paste(pr, collapse = "_vs_")
+  plots_sample[[pr_key]] <- ggplot(hto_df[sample(nrow(hto_df)), ],
+         aes(x = .data[[pr[1]]], y = .data[[pr[2]]], colour = sample.name)) +
+    geom_point(size = 0.2, alpha = 0.4) +
+    labs(title = paste(pr[1], "vs", pr[2])) +
+    guides(colour = guide_legend(override.aes = list(size = 4))) +
+    theme_bw() +
+    theme(legend.text = element_text(size = 7))
+}
+(wrap_plots(plots_sample, ncol = 3) + plot_layout(guides = "collect")) &
+  theme(legend.position = "bottom")
+```
+
+### Coloured by density
+
+```{r hto-pairs-density}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-width: 10
+plots_dens <- list()
+for (pr in pairs) {
+  pr_key           <- paste(pr, collapse = "_vs_")
+  plots_dens[[pr_key]] <- ggplot(hto_df, aes(x = .data[[pr[1]]], y = .data[[pr[2]]])) +
+    ggpointdensity::geom_pointdensity(size = 0.2, show.legend = FALSE) +
+    viridis::scale_color_viridis() +
+    labs(title = paste(pr[1], "vs", pr[2])) +
+    theme_bw()
+}
+wrap_plots(plots_dens, ncol = 3)
+```
+
+---
+
+## 4. deMULTIplex2 assignment summary
+
+```{r dm2-summary}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+dm2_tbl <- srt@meta.data |>
+  dplyr::count(dm2_class, name = "n_cells") |>
+  dplyr::mutate(pct = round(100 * n_cells / sum(n_cells), 1)) |>
+  dplyr::arrange(desc(n_cells))
+
+knitr::kable(dm2_tbl, col.names = c("Class", "# cells", "% cells"))
+
+ggplot(dm2_tbl, aes(x = reorder(dm2_class, -n_cells), y = n_cells,
+                    fill = dm2_class)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.4, size = 3) +
+  labs(title = "deMULTIplex2 class distribution (pre-QC)",
+       x = NULL, y = "# cells") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+## 5. HTODemux — Seurat built-in demultiplexing
+
+Run HTODemux on the same object for comparison with deMULTIplex2.
+
+```{r htodemux}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+# ── Edit positive quantile ─────────────────────────────────────────
+POSITIVE_QUANTILE <- qc_params$hto_demux_positive_quantile  # e.g. 0.99
+# ──────────────────────────────────────────────────────────────────
+srt <- Seurat::HTODemux(srt,
+                         assay             = "HTO",
+                         positive.quantile = POSITIVE_QUANTILE,
+                         verbose           = FALSE)
+```
+
+### HTODemux assignment summary
+
+```{r htodemux-summary}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+hto_tbl <- srt@meta.data |>
+  dplyr::count(HTO_classification.global, name = "n_cells") |>
+  dplyr::mutate(pct = round(100 * n_cells / sum(n_cells), 1)) |>
+  dplyr::arrange(desc(n_cells))
+
+knitr::kable(hto_tbl,
+             col.names = c("HTODemux class", "# cells", "% cells"))
+
+ggplot(hto_tbl,
+       aes(x = reorder(HTO_classification.global, -n_cells), y = n_cells,
+           fill = HTO_classification.global)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = paste0(pct, "%")), vjust = -0.4, size = 3) +
+  labs(title = paste0("HTODemux class distribution (quantile = ",
+                      POSITIVE_QUANTILE, ")"),
+       x = NULL, y = "# cells") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### HTODemux ridge plots
+
+```{r htodemux-ridge}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-height: 10
+#| fig-width: 6
+Seurat::Idents(srt) <- "HTO_maxID"
+Seurat::RidgePlot(srt,
+                  assay    = "HTO",
+                  features = hto_features,
+                  ncol     = 1)
+```
+
+---
+
+## 6. HTODemux vs deMULTIplex2 — assignment comparison
+
+The core comparison: how do the two tools assign individual HTOs?
+`dm2_class` (deMULTIplex2) vs `HTO_classification` (HTODemux per-HTO label).
+Diagonal = agreement; off-diagonal = discordant assignments.
+
+```{r tool-comparison}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+# Full cross-table: dm2_class rows × HTODemux per-HTO assignment columns
+comp_tbl <- srt@meta.data |>
+  dplyr::count(dm2_class, HTO_classification, name = "n_cells") |>
+  tidyr::pivot_wider(names_from  = HTO_classification,
+                     values_from = n_cells,
+                     values_fill = 0L) |>
+  dplyr::arrange(dm2_class)
+
+knitr::kable(comp_tbl, caption = "Rows = deMULTIplex2, Cols = HTODemux (per-HTO label)")
+```
+
+```{r tool-comparison-tile}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-width: 10
+#| fig-height: 8
+comp_long <- srt@meta.data |>
+  dplyr::count(dm2_class, HTO_classification, name = "n_cells")
+
+# order axes: singlet HTOs first, then multiplet/negative
+hto_order_dm2 <- c(sort(hto_features), setdiff(sort(unique(srt$dm2_class)), hto_features))
+hto_order_htd <- c(sort(hto_features),
+                   setdiff(sort(unique(srt$HTO_classification)), hto_features))
+
+comp_long <- comp_long |>
+  dplyr::mutate(
+    dm2_class          = factor(dm2_class,          levels = rev(hto_order_dm2)),
+    HTO_classification = factor(HTO_classification, levels = hto_order_htd)
+  )
+
+ggplot(comp_long,
+       aes(x = HTO_classification, y = dm2_class, fill = n_cells)) +
+  geom_tile(colour = "grey80") +
+  geom_text(aes(label = ifelse(n_cells > 0, n_cells, "")), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue", name = "# cells",
+                      trans = "sqrt") +
+  labs(title    = "Assignment agreement: deMULTIplex2 (rows) vs HTODemux (cols)",
+       subtitle = "Diagonal = concordant assignments",
+       x        = "HTODemux",
+       y        = "deMULTIplex2") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1),
+        panel.grid  = element_blank())
+```
+
+### Global class agreement
+
+Collapsed to Singlet / Doublet / Negative for a quick overall rate.
+
+```{r tool-comparison-global}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+global_tbl <- srt@meta.data |>
+  dplyr::count(dm2_class_global = dplyr::case_when(
+                 dm2_class %in% hto_features ~ "Singlet",
+                 dm2_class == "multiplet"    ~ "Doublet",
+                 TRUE                         ~ "Negative"),
+               HTO_classification.global,
+               name = "n_cells") |>
+  tidyr::pivot_wider(names_from  = HTO_classification.global,
+                     values_from = n_cells,
+                     values_fill = 0L)
+
+knitr::kable(global_tbl,
+             caption = "Global class agreement — Rows: deMULTIplex2, Cols: HTODemux")
+```
+
+---
+
+## 7. HTO signal heatmap by assignment class
+
+Average CLR-normalised HTO signal per assignment class for both tools.
+
+```{r hto-heatmap}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-width: 12
+#| fig-height: 5
+make_heatmap <- function(srt, group_by, title) {
+  avg    <- Seurat::AverageExpression(srt, assay = "HTO",
+                                       layer    = "data",
+                                       group.by = group_by)$HTO
+  avg_df <- as.data.frame(avg) |>
+    tibble::rownames_to_column("HTO") |>
+    tidyr::pivot_longer(-HTO, names_to = "class", values_to = "avg_clr")
+  ggplot(avg_df, aes(x = class, y = HTO, fill = avg_clr)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = round(avg_clr, 2)), size = 3) +
+    scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                         midpoint = 0, name = "Avg CLR") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+}
+
+make_heatmap(srt, "dm2_class",          "deMULTIplex2") |
+make_heatmap(srt, "HTO_classification", "HTODemux")
+```
+
+---
+
+## 8. HTO UMAP — coloured by both tools
+
+UMAP run directly on CLR-normalised HTO features (no PCA intermediate).
+Labels placed at cluster centroids; legends removed to save space.
+
+```{r hto-umap-params}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+# ── Tune these if separation is poor ──────────────────────────
+N_NEIGHBORS <- 20L
+MIN_DIST    <- 0.3
+# ──────────────────────────────────────────────────────────────
+```
+
+```{r hto-umap-compute}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+srt_sub <- Seurat::ScaleData(srt, assay = "HTO",
+                              features = hto_features, verbose = FALSE)
+srt_sub <- Seurat::RunUMAP(srt_sub,
+                            features       = hto_features,
+                            assay          = "HTO",
+                            reduction.name = "umap.HTO",
+                            n.neighbors    = N_NEIGHBORS,
+                            min.dist       = MIN_DIST,
+                            verbose        = FALSE)
+
+# helper: scatter with centroid labels, no legend
+labeled_dimplot <- function(srt, group_by, title) {
+  emb <- as.data.frame(Seurat::Embeddings(srt, "umap.HTO"))
+  colnames(emb) <- c("UMAP_1", "UMAP_2")
+  emb[[group_by]] <- srt@meta.data[[group_by]]
+  centroids <- emb |>
+    dplyr::group_by(.data[[group_by]]) |>
+    dplyr::summarise(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2),
+                     .groups = "drop")
+  ggplot(emb[sample(nrow(emb)), ],
+         aes(x = UMAP_1, y = UMAP_2, colour = .data[[group_by]])) +
+    geom_point(size = 0.4, alpha = 0.5) +
+    ggrepel::geom_label_repel(
+      data          = centroids,
+      aes(label     = .data[[group_by]]),
+      size          = 3.5,
+      label.padding = unit(0.15, "lines"),
+      show.legend   = FALSE,
+      seed          = 42
+    ) +
+    labs(title = title, x = "UMAP 1", y = "UMAP 2") +
+    theme_bw() +
+    theme(legend.position = "none")
+}
+```
+
+### deMULTIplex2
+
+```{r hto-umap-dm2}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+labeled_dimplot(srt_sub, "dm2_class", "deMULTIplex2")
+```
+
+### HTODemux
+
+```{r hto-umap-htodemux}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+labeled_dimplot(srt_sub, "HTO_classification", "HTODemux")
+```
+
+### Sample
+
+```{r hto-umap-sample}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+labeled_dimplot(srt_sub, "sample.name", "Sample")
+```
+
+{{< include ../_session-info.qmd >}}

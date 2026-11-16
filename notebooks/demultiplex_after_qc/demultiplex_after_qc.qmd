@@ -1,0 +1,203 @@
+---
+title: "Demultiplexing (post-QC)"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+deMULTIplex2 class distribution after QC flags have been applied.
+Shows how multiplets and negatives overlap with low-quality cells,
+and which cells are retained after filtering.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(targets)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r load}
+# metadata_flagged_all contains dm2_class and pass_cell added by flag_qc_metadata().
+# mpn_raw_all is pre-QC and lacks both columns — do not use it here.
+targets::tar_load(metadata_flagged_all)
+targets::tar_load(mpn_raw_stroma)   # needed for HTO assay in sections 5 & 6
+targets::tar_load(qc_params)
+
+md                 <- metadata_flagged_all
+srt                <- mpn_raw_stroma
+DM2_AVAILABLE      <- "dm2_class" %in% colnames(md)
+PASSCELL_AVAILABLE <- "pass_cell" %in% colnames(md)
+```
+
+---
+
+## 1. QC flags × HTO class cross-table
+
+How many cells in each deMULTIplex2 class pass or fail QC?
+
+```{r flags-crosstab}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+cross_tbl <- md |>
+  dplyr::count(dm2_class, pass_qc, pass_hto, pass_cell, name = "n_cells") |>
+  dplyr::mutate(pct = round(100 * n_cells / sum(n_cells), 1)) |>
+  dplyr::arrange(dm2_class, pass_qc)
+
+knitr::kable(cross_tbl)
+```
+
+---
+
+## 2. deMULTIplex2 class distribution — before vs after filtering
+
+```{r dm2-before-after}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+before <- md |>
+  dplyr::count(dm2_class, name = "n_cells") |>
+  dplyr::mutate(stage = "pre-filter",
+                pct   = round(100 * n_cells / sum(n_cells), 1))
+
+after <- md |>
+  dplyr::filter(pass_cell) |>
+  dplyr::count(dm2_class, name = "n_cells") |>
+  dplyr::mutate(stage = "post-filter",
+                pct   = round(100 * n_cells / sum(n_cells), 1))
+
+both <- dplyr::bind_rows(before, after) |>
+  dplyr::mutate(stage = factor(stage, c("pre-filter", "post-filter")))
+
+ggplot(both, aes(x = reorder(dm2_class, -n_cells), y = n_cells, fill = stage)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  geom_text(aes(label = paste0(pct, "%")),
+            position = position_dodge(width = 0.9),
+            vjust = -0.4, size = 2.8) +
+  scale_fill_manual(values = c("pre-filter" = "#4393c3",
+                                "post-filter" = "#2166ac")) +
+  labs(title = "deMULTIplex2 class distribution before and after QC filtering",
+       x = NULL, y = "# cells", fill = NULL) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+## 3. QC metrics by HTO class
+
+Do multiplets or negatives show distinct QC metric distributions?
+
+```{r qc-by-class}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-height: 8
+qc_vars <- c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rp")
+
+plots <- list()
+for (v in qc_vars) {
+  plots[[v]] <- ggplot(md, aes(x = dm2_class, y = .data[[v]], fill = dm2_class)) +
+    geom_violin(alpha = 0.7, show.legend = FALSE) +
+    geom_boxplot(width = 0.12, outlier.size = 0.2, show.legend = FALSE) +
+    labs(x = NULL, y = v) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+}
+wrap_plots(plots, ncol = 2)
+```
+
+---
+
+## 4. pass_cell distribution per sample
+
+How many cells per sample survive all filters?
+
+```{r pass-cell-per-sample}
+#| eval: !expr isTRUE(get0("PASSCELL_AVAILABLE"))
+sample_tbl <- md |>
+  dplyr::group_by(sample.name) |>
+  dplyr::summarise(
+    n_total    = dplyr::n(),
+    n_pass     = sum(pass_cell),
+    pct_pass   = round(100 * n_pass / n_total, 1),
+    n_fail_qc  = sum(!pass_qc),
+    n_fail_hto = sum(pass_qc & !pass_hto),
+    .groups = "drop"
+  )
+
+knitr::kable(sample_tbl,
+             col.names = c("Sample", "Total", "Pass", "% pass",
+                           "Fail QC", "Fail HTO (pass QC)"))
+
+ggplot(sample_tbl, aes(x = sample.name, y = n_pass)) +
+  geom_col(fill = "steelblue", alpha = 0.85) +
+  geom_text(aes(label = paste0(pct_pass, "%")), vjust = -0.4, size = 3) +
+  labs(title = "Cells passing all filters per sample",
+       x = NULL, y = "# cells") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+## 5. HTO signal in pass vs fail cells
+
+Do failed cells show lower HTO signal overall?
+
+```{r hto-signal-pass-fail}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+hto_df        <- as.data.frame(t(as.matrix(
+  SeuratObject::LayerData(srt, assay = "HTO", layer = "data"))))
+hto_df$total     <- rowSums(hto_df)
+hto_df$pass_cell <- md[rownames(hto_df), "pass_cell"]
+
+ggplot(hto_df, aes(x = pass_cell, y = total, fill = pass_cell)) +
+  geom_violin(alpha = 0.7, show.legend = FALSE) +
+  geom_boxplot(width = 0.1, outlier.size = 0.2, show.legend = FALSE) +
+  scale_x_discrete(labels = c("FALSE" = "Fail", "TRUE" = "Pass")) +
+  labs(title = "Total CLR-normalised HTO signal: pass vs fail cells",
+       x = NULL, y = "Sum of CLR HTO signal") +
+  theme_bw()
+```
+
+---
+
+## 6. HTO signal heatmap — pass_cell only
+
+```{r hto-heatmap-filtered}
+#| eval: !expr isTRUE(get0("DM2_AVAILABLE"))
+#| fig-height: 5
+pass_cells <- rownames(md)[md$pass_cell]
+srt_pass <- subset(srt, cells = intersect(colnames(srt), pass_cells))
+srt_pass  <- Seurat::NormalizeData(srt_pass, assay = "HTO",
+                                    normalization.method = "CLR",
+                                    margin = 2, verbose = FALSE)
+avg <- Seurat::AverageExpression(srt_pass, assay = "HTO",
+                                  layer    = "data",
+                                  group.by = "dm2_class")$HTO
+avg_df <- as.data.frame(avg) |>
+  tibble::rownames_to_column("HTO") |>
+  tidyr::pivot_longer(-HTO, names_to = "class", values_to = "avg_clr")
+
+ggplot(avg_df, aes(x = class, y = HTO, fill = avg_clr)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = round(avg_clr, 2)), size = 3) +
+  scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                       midpoint = 0, name = "Avg CLR") +
+  labs(title = "Mean HTO signal per class (post-filter cells only)",
+       x = "Assigned class", y = NULL) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+{{< include ../_session-info.qmd >}}
