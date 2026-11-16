@@ -1,0 +1,9 @@
+Tube,Label,sample_name_long,sample_name_short
+Rx_1,Stroma WT,Stroma_wildtype,Stroma_WT
+Rx_2,Stroma Het,Stroma_heterozygous,Stroma_Het
+Rx_3,HSC Het mCh-,HSC_heterozygous_mcherry_negative,HSC_Het_mCh_neg
+Rx_4,HSC Het mCh+,HSC_heterozygous_mcherry_positive,HSC_Het_mCh_pos
+Rx_5,HSC WT,HSC_wildtype,HSC_WT
+Rx_6,MNC mCh+,MNC_mcherry_positive,MNC_mCh_pos
+Rx_7,MNC mCh-,MNC_mcherry_negative,MNC_mCh_neg
+Rx_8,MNC WT,MNC_wildtype,MNC_WT

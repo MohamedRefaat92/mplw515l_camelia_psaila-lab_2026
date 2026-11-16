@@ -21,3 +21,12 @@ The generated file starts from your reviewed copy: your descriptions (kind, samp
 and any columns you added are kept; file facts (path, format, size, owner, md5, ...) are refreshed; new
 files are added; files no longer in `data/` are kept and marked `missing`. Describe new rows in
 `catalogue_data.tsv`, then commit it.
+
+## In this project
+
+| File | What |
+| --- | --- |
+| `project_config.yaml` | the analysis parameters: QC thresholds per compartment, processing, sub-clusters, cell-type markers and colours; read by `_targets.R` (one target per section) |
+| `samples.csv` | the sample sheet: `Tube`, `sample_name_short`, `sample_name_long` (copied from the data hub by `scripts/sh/link-references.sh`) |
+| `cellranger/libraries.csv` | per tube: its feature reference, and the GEX and CITE libraries (FASTQ id, and the library's folder below `$FASTQ_ROOT`) |
+| `cellranger/featureref_GFP.csv`, `featureref_MPL.csv` | the TotalSeq-B hashtags (0301–0304) for the WT (GFP) and Het (MPL) tubes |
