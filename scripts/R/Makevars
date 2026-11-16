@@ -1,0 +1,4 @@
+# Used by scripts/R/install-r-packages.R (R_MAKEVARS_USER) while it compiles the project's R packages.
+# Packages that still ask for C++11 (presto) get C++14, which current RcppArmadillo needs.
+CXX11STD = -std=gnu++14
+CXX14STD = -std=gnu++14

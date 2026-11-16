@@ -1,13 +1,35 @@
 [project]
-name = "hyprid-proj"
+name = "mplw515l-camelia-psaila-lab-2026"
 version = "0.1.0"
-description = "Add your description here"
+description = "scRNA-seq of MPLW515L mouse bone marrow (Stroma, HSC, MNC): QC, clustering, DE, annotation, trajectories"
 readme = "README.md"
 authors = [
     { name = "mohamedrefaat92", email = "mohamedrefaat.1.1992@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    # single-cell analysis (src/python/analysis/, notebooks/exploration/)
+    "anndata",
+    "scanpy",
+    "scvelo",
+    "cellrank",
+    "loompy",
+    "igraph",
+    "leidenalg",
+    "pynndescent",
+    "metacells",
+    "seacells",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "joblib",
+    "matplotlib",
+    "seaborn",
+    # called from R through reticulate (phateR, Rmagic)
+    "phate",
+    "magic-impute",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.18,<0.13.0"]
@@ -16,6 +38,23 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
+]
+# Not installed by default (uv sync --group <name>): large, and used by one analysis each
+perturbgen = [   # src/python/analysis/perturbgen_run.py
+    "torch",
+    "lightning>=2.4",
+    "datasets>=3.0",
+    "huggingface-hub>=0.20",
+    "transformers>=4.30",
+    "evaluate",
+    "einops",
+    "wandb",
+    "pybiomart",
+    "pyyaml",
+]
+alphagenome = [  # notebooks/exploration/alphagenome_calr_klf1.ipynb
+    "alphagenome",
+    "pyfaidx",
 ]
 
 [tool.uv.build-backend]

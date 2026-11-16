@@ -46,6 +46,7 @@ options(
 )
 
 # RENV_PROJECT lets kernels started in subfolders find the project
+options(renv.config.synchronized.check = FALSE)   # skip renv's library-vs-lockfile check at startup (slow scan on this project)
 local({
   root <- Sys.getenv("RENV_PROJECT", unset = getwd())
   source(file.path(root, "renv", "activate.R"))

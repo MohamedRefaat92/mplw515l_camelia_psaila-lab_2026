@@ -15,3 +15,11 @@ library(targets)
 library(tarchetypes)
 library(quarto)
 library(visNetwork)
+
+# Used behind the scenes by packages the analysis calls (no code loads them by name)
+library(qs2)        # targets' format = "qs"
+library(presto)     # fast Wilcoxon tests for Seurat::FindAllMarkers
+library(glmGamPoi)  # Seurat::SCTransform (v2)
+library(Rfast2)     # Seurat::RunMoransI
+library(metap)      # Seurat::FindConservedMarkers
+library(multtest)   # metap
