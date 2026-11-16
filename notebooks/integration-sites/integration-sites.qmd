@@ -328,6 +328,82 @@ sites %>%
   DT::formatStyle("cells", fontWeight = "bold")
 ```
 
+### A site reported with zero cells
+
+One row will have `cells = 0`. That is not a failure to detect it — it is a site discovery found and
+the assignment step was then forbidden to use, and it is shown rather than quietly dropped.
+
+Cell assignment works by matching clips against the flanks of the called sites (see the tier table
+above), so a flank has to be distinctive enough to match *against*. A flank containing a long
+homopolymer is not: it attracts clips that belong nowhere in particular.
+
+```{r low-complexity}
+# longest run of one base in each site's flank, the quantity the pipeline gates on
+flank_fa <- file.path(sites_dir, "work", "site_flanks.fa")
+kept     <- if (file.exists(flank_fa)) {
+  sub("\\|.*", "", grep("^>", readLines(flank_fa), value = TRUE)) |> sub(pattern = "^>", replacement = "")
+} else character(0)
+
+sites |>
+  dplyr::transmute(site_id, chrom, pos, cells,
+                   `in the mini-reference` = ifelse(site_id %in% kept, "yes", "NO - gated")) |>
+  dplyr::arrange(`in the mini-reference`, dplyr::desc(cells)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12)) |>
+  DT::formatStyle("in the mini-reference", target = "row",
+                  backgroundColor = DT::styleEqual("NO - gated", "#fde8e8"))
+```
+
+The gated site is `JH584304.1:35,417`, on an unplaced scaffold, whose flank carries a **23-base
+homopolymer** against 5–6 for every other site. Three independent things said it was not real before
+the gate existed:
+
+- it had **zero** cells in both high-signal tubes while carrying 14 in the mCherry⁻ fractions — a
+  real site appearing only where there is least vector is backwards
+- it has no 5′ junction, so the target-site duplication check cannot support it
+- when the assignment threshold was lowered it gained **4.7×** more cells, against 1.6× for genuine
+  sites: it was absorbing the extra sensitivity rather than benefiting from it
+
+It therefore appears in the legend of every figure below with no points against it.
+
+#### Why it is shown rather than dropped
+
+The two stages ask different questions, and a site can pass one and fail the other without either
+being a mistake.
+
+| | asks | about | verdict on IS07 |
+|---|---|---|---|
+| discovery | does this ≥25 bp clip place uniquely in 2.7 Gb? | the **clip** | yes — 3 clips at MAPQ ≥ 30 |
+| assignment | can this flank tell apart clips that belong to it from clips that do not? | the **locus** | no — the homopolymer |
+
+The evidence is also partly independent: discovery's verdict comes from the read, assignment's from
+the reference sequence around the site. So the gate never disputes that those three clips aligned
+where they did. Its claim is narrower, and worth stating precisely: **this flank cannot support
+quantification**. Not *no provirus is there* — unmeasurable, not false. The 4.7× inflation is that
+claim measured directly.
+
+That distinction decides what happens next. If a bulk integration-site assay on the same genomic DNA
+ever gives an independently derived site list, `JH584304.1:35,417` is precisely the call it would
+adjudicate.
+
+Three reasons to leave the disagreement visible:
+
+- **It localises the problem.** Agreement between the stages gives two kinds of support;
+  disagreement says *where* the trouble is. Here it was the locus's sequence rather than the reads,
+  which is what pointed at the homopolymer in the first place.
+- **It measures a limit of the method.** The pipeline can call sites it cannot then quantify. A
+  reader shown eight clean sites has no way to know that failure mode exists, or how one is handled.
+- **It is a standing check on the gate.** `max_homopolymer` is a threshold chosen from a single
+  example. Keeping the gated case in view means a future run producing a similar site that is *not*
+  caught would be noticeable.
+
+One detail sharpens all of this. Discovery's call was marginal to begin with: **3 clips, 3 cells,
+against a floor of exactly 3** — and all three came from Rx_3 and Rx_7, the mCherry⁻ fractions, with
+none from the two high-signal tubes. So this is not two confident stages contradicting each other.
+It is a borderline call, admitted by a threshold with zero margin, that a second and independent
+criterion then rejected, with the tube distribution agreeing. That is the system working rather than
+an awkward edge case — and it is the clearest illustration of what the `≥3 cells` floor lets through
+at its boundary.
+
 ```{r site-plot, fig.height=5}
 cells_long <- sites %>%
   dplyr::select(site_id, gene, context, dplyr::starts_with("cells_")) %>%
