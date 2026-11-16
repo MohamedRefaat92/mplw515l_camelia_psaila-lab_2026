@@ -187,16 +187,42 @@ read_bwa_hits <- function(sam, opt = IS_DEFAULTS) {
   if (!any(keep)) return(empty_hit_table())
 
   provenance <- do.call(rbind, strsplit(field(1)[keep], "|", fixed = TRUE))
+  rev <- bitwAnd(flag[keep], 0x10) != 0L
+  bwa_pos <- as.integer(field(4)[keep])
+
+  # The junction is NOT bwa's POS on the minus strand.
+  #
+  # A 3' clip is the host sequence FOLLOWING the provirus, so in the read it runs
+  # [provirus ... 3236][h1 h2 ... hL] and the base abutting the integration junction is h1, the
+  # clip's *first* base. bwa reports the leftmost reference coordinate of the alignment, which is
+  # h1 only when the clip aligned forward; when it aligned reverse-complemented, h1 sits at the
+  # alignment's far end instead. Taking POS regardless puts minus-strand sites a whole clip length
+  # away from their true junction -- about 48 bp here, and silently, because every clip at one site
+  # shares a strand so the cluster still looks tight.
+  #
+  # Caught by the 5' target-site-duplication check: plus-strand sites came out at the expected 4 bp
+  # offset while minus-strand ones sat at 45. Do not "simplify" this back to POS.
+  junction <- ifelse(rev, bwa_pos + ref_span(field(6)[keep]) - 1L, bwa_pos)
+
   dplyr::tibble(
     chrom    = chrom[keep],
-    pos      = as.integer(field(4)[keep]),
-    strand   = ifelse(bitwAnd(flag[keep], 0x10) != 0L, "-", "+"),
+    pos      = as.integer(junction),
+    strand   = ifelse(rev, "-", "+"),
     mapq     = mapq[keep],
     tube     = provenance[, 1],
     barcode  = provenance[, 2],
     umi      = provenance[, 3],
     clip_len = nchar(field(10)[keep])
   )
+}
+
+#' Bases of the reference an alignment spans, from its CIGAR.
+#'
+#' M/D/N/=/X consume reference, I/S/H/P do not. Written out rather than calling
+#' GenomicAlignments::cigarWidthAlongReferenceSpace(), which is deprecated.
+ref_span <- function(cigar) {
+  ops <- regmatches(cigar, gregexpr("[0-9]+[MDN=X]", cigar))
+  vapply(ops, function(x) sum(as.integer(sub("[MDN=X]$", "", x))), numeric(1))
 }
 
 empty_hit_table <- function() {

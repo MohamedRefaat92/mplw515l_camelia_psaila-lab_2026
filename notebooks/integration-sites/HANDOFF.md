@@ -109,7 +109,7 @@ estimate suggested.
    of its rare read-through molecules happened to be sequenced. Most members of a real clone carry no
    label. **Clone sizes here are samples, not counts.**
 4. **Per-cell confidence is near-uniform and low.** 96% of assignments rest on a single UMI. Confidence
-   lives at the *site* level (109 independent cells for IS01), not the cell level. Do not use read
+   lives at the *site* level (123 independent cells for IS01), not the cell level. Do not use read
    depth to pick "high-confidence cells" — the variation is mostly PCR.
 5. **Repetitive flanks are silently lost.** A junction whose host sequence is repetitive yields MAPQ-0
    clips. Sites are enriched for integration into unique sequence, which partly confounds the
@@ -157,16 +157,16 @@ contaminant filterable by sequence.
 
 ## 7. Results, and the three independent validations
 
-9 sites, 320 distinct cells labelled.
+9 sites, 339 distinct cells labelled.
 
 | id | locus | gene | cells | note |
 |---|---|---|---|---|
-| IS01 | chr13:83,681,262 | *Mef2c* | 109 | |
+| IS01 | chr13:83,681,311 | *Mef2c* | 123 | |
 | IS02 | chr9:53,079,916 | *Ddx10* | 84 | |
 | IS03 | chr19:38,933,742 | *Hells* | 50 | |
-| IS04 | chr7:83,792,589 | *Abhd17c* | 42 | |
+| IS04 | chr7:83,792,638 | *Abhd17c* | 48 | |
 | IS05 | chr9:64,711,166 | *Gm36459* | 23 | **Rx_4 (HSC) only** |
-| IS06 | chr1:67,556,932 | intergenic | 5 | |
+| IS06 | chr1:67,556,980 | intergenic | 5 | |
 | IS07 | chr18:17,071,116 | intergenic | 4 | |
 | IS08 | chr2:31,009,148 | *Fnbp1* | 3 | |
 | IS09 | JH584304.1:35,417 | intergenic | 3 | **probably noise** — at the floor, on an unplaced scaffold, and present *only* in Rx_3 and Rx_7, the lowest-signal tubes. A real site appearing exclusively in low-signal tubes is backwards. |
@@ -217,6 +217,16 @@ Read this before debugging anything. Several of these cost hours.
 - **"Ambient is ruled out by the wild-type tubes" — wrong.** A WT tube has no vector anywhere, so it
   bounds only cross-tube and mismapping error. A sorted-negative tube containing transduced cells has
   its own internal ambient pool. Different controls bound different things.
+- **Minus-strand junctions were reported ~48 bp off, and lost cells.** `read_bwa_hits()` took bwa's
+  `POS` as the junction. A 3′ clip's junction-adjacent base is its *first*, which is `POS` only when
+  the clip aligned forward; reverse-complemented it sits at the alignment's far end. Worse than a
+  wrong coordinate: `POS` = junction − reflen + 1, and reflen varies with clip length, so clips from
+  one minus-strand junction scattered over ~37 bp and the 20 bp clustering window split them,
+  dropping fragments below the cell floor. Fixing it moved IS01, IS04 and IS06 and recovered 20
+  assignments (323 → 343). Invisible by inspection, because each fragment still clustered tightly.
+  Found only by the 5′ TSD check — plus-strand sites came out at the expected 4 bp while minus-strand
+  sat at 45. **This is the argument for building the second channel: it is the only thing that caught
+  it.**
 
 **Infrastructure traps**
 
