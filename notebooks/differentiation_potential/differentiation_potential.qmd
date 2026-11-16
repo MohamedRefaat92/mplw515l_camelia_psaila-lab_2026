@@ -1,0 +1,137 @@
+---
+title: "Compositional Analysis"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+library(Seurat)
+library(miloR)
+library(SingleCellExperiment)
+library(ggplot2)
+library(patchwork)
+library(DT)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+library(targets)
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+## CytoTRACE
+```{r}
+tar_load(mpn_processed_hsc_fullcc)
+tar_load(cytotrace_hsc)
+mpn_processed_hsc_fullcc <- Seurat::AddMetaData(mpn_processed_hsc_fullcc, 
+                                         cytotrace_hsc)
+```
+
+```{r}
+mpn_processed_hsc_fullcc@meta.data %>% 
+  mutate(clust = sNN_pca.SCT_30_res.1.5) %>% 
+  group_by(clust)%>%
+  mutate(preKNN_CytoTRACE2_Score_clust_scale = (preKNN_CytoTRACE2_Score-min(preKNN_CytoTRACE2_Score))/(max(preKNN_CytoTRACE2_Score)-min(preKNN_CytoTRACE2_Score)) ) %>%
+  ungroup()%>%
+  ggplot(aes(clust, preKNN_CytoTRACE2_Score_clust_scale, fill = sample.name))+
+  geom_boxplot(position = position_dodge())
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc, names(cytotrace_hsc)[sapply(cytotrace_hsc,is.double)]) %>% 
+  patchwork::wrap_plots()&
+  scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+DimPlot(mpn_processed_hsc_fullcc,label = TRUE,label.size = 5)
+VlnPlot(mpn_processed_hsc_fullcc,features = "CytoTRACE2_Relative",split.by = "sample.name")
+mpn_processed_hsc_fullcc$seurat_clusters <- as.character(mpn_processed_hsc_fullcc$seurat_clusters)
+l <- lapply(unique(mpn_processed_hsc_fullcc$seurat_clusters),function(clust)
+  VlnPlot(subset(mpn_processed_hsc_fullcc, seurat_clusters %in% clust),
+                                    features = "CytoTRACE2_Relative",
+                                    group.by = "sample.name")+
+    ggtitle(clust))
+names(l) <- unique(mpn_processed_hsc_fullcc$seurat_clusters)
+
+DimPlot(mpn_processed_hsc_fullcc,group.by = names(cytotrace_hsc)[!sapply(cytotrace_hsc,is.double)])
+DimPlot(mpn_processed_hsc_fullcc,group.by = "sample.name", split.by = "CytoTRACE2_Potency")
+
+```
+
+```{r}
+mpn_processed_hsc_fullcc@meta.data %>% 
+    mutate(clust = factor(sNN_pca.SCT_30_res.0.9)) %>% 
+    group_by(sample.name, clust)%>%
+    summarize(med = mean(preKNN_CytoTRACE2_Score) ) %>%
+    ungroup() %>%
+    pivot_wider(names_from = sample.name, values_from = med) %>% mutate(grp =  `HSC_Het_CD41+mCh+` > `HSC_WT_CD41+`)%>%
+    pivot_longer(cols = c(`HSC_Het_CD41+mCh+`, `HSC_Het_CD41+mCh-`,`HSC_WT_CD41+` ),names_to = "sample.name",values_to = "med")%>%
+    mutate(sample.name = factor(sample.name,levels = c("HSC_WT_CD41+","HSC_Het_CD41+mCh-", "HSC_Het_CD41+mCh+" )))%>%
+  
+    ggplot(aes(sample.name, med,group = clust,color = clust))+
+  geom_point()+geom_line()+facet_wrap(~grp,ncol = 1)
+```
+
+
+## SCENT
+```{r}
+tar_load(scent_scores_hsc)
+mpn_processed_hsc_fullcc$scentscore <- scent_scores_hsc[rownames(mpn_processed_hsc_fullcc@meta.data),"scaled_potency"]
+FeaturePlot(mpn_processed_hsc_fullcc,"scentscore",
+            split.by = "sample.name",
+            combine = FALSE) %>% 
+  patchwork::wrap_plots()&
+  scale_color_viridis_c(option = "turbo",limits = c(0,1))
+FeatureScatter(mpn_processed_hsc_fullcc, "scentscore", "nFeature_RNA",group.by = "sample.name")
+DefaultAssay(mpn_processed_hsc_fullcc) <- "RNA"
+mpn_processed_hsc_fullcc <- NormalizeData(mpn_processed_hsc_fullcc)
+```
+
+```{r}
+get_scent_potency <- function(srt_obj, scent_net) {
+
+  # Match network genes to Seurat object
+  genes_in_srt <- rownames(srt_obj@assays$SCT@data)
+  mouse_to_human <- map_ortho_gene(genes_in_srt)
+  human_shared <- intersect(rownames(scent_net),names(mouse_to_human))
+  mouse_shared <- mouse_to_human[human_shared]
+
+  # Subset to shared genes
+  net_filtered <- scent_net[human_shared, human_shared]
+  rm(scent_net);gc()
+  expr_mat     <- as.matrix(srt_obj@assays$SCT@data[mouse_shared,])
+  rownames(expr_mat) <- human_shared
+
+  # Run CCAT
+  potency_scores <- SCENT::CompCCAT(expr_mat, net_filtered)
+
+  # Return data.frame
+  data.frame(
+    cell.name      = colnames(expr_mat),
+    potency        = potency_scores,
+    scaled_potency = potency_scores / max(potency_scores),
+    row.names      = colnames(expr_mat)
+  )
+}
+
+library(SCENT)
+data(dataLiver)
+dim(scLiver.m)
+
+ccat.v <- CompCCAT(exp = scLiver.m, ppiA = net13Jun12.m)
+boxplot(ccat.v ~ names(phenoLiver.v),xlab="Embryonic stages",ylab="CCAT",col=colorLiver.v)
+
+ccat.v$nfeats <- colSums(scLiver.m>1) 
+
+```
+
+{{< include ../_session-info.qmd >}}

@@ -1,0 +1,136 @@
+---
+title: "Stroma (Rx_1, Rx_2)"
+---
+
+```{r setup}
+#| include: false
+library(dplyr)
+library(knitr)
+library(DT)
+library(yaml)
+
+cfg          <- yaml::read_yaml(file.path("metadata/project_config.yaml"))
+output_dir   <- file.path(getwd(), cfg$paths$output_dir, cfg$paths$run_label,
+                           "stroma")
+subset_label <- "Stroma (Rx_1, Rx_2)"
+source(file.path("analysis/_chapter_template.R"))
+```
+
+---
+
+# Dimensionality Reduction
+
+## Elbow plot
+
+```{r elbow}
+#| fig-cap: "PCA elbow plot. Dashed line = chosen n_harmony_dims."
+#| out-width: "80%"
+knitr::include_graphics(chapter_figure("elbow_plot.png"))
+```
+
+## PCA — PC1 vs PC2 (pre-Harmony)
+
+```{r pca}
+#| fig-cap: "First two PCs coloured by sample, before Harmony integration."
+#| out-width: "100%"
+knitr::include_graphics(chapter_figure("pca_pc1_pc2.png"))
+```
+
+## Harmony — H1 vs H2 (post-integration)
+
+```{r harmony}
+#| fig-cap: "First two Harmony embeddings coloured by sample."
+#| out-width: "100%"
+knitr::include_graphics(chapter_figure("harmony_h1_h2.png"))
+```
+
+---
+
+# Clustering
+
+## UMAP plots
+
+```{r umap-sample}
+#| fig-cap: "UMAP coloured by sample identity."
+#| out-width: "100%"
+knitr::include_graphics(chapter_figure("umap_sample.png"))
+```
+
+```{r umap-cluster}
+#| fig-cap: !expr paste0("UMAP coloured by cluster (resolution ", marker_res, ").")
+#| out-width: "100%"
+knitr::include_graphics(chapter_figure(paste0("umap_cluster_res", marker_res, ".png")))
+```
+
+## Cluster sizes
+
+```{r cluster-sizes}
+clust_long <- read.csv(chapter_table("cluster_size_summary.csv"),
+                       stringsAsFactors = FALSE)
+tbl <- clust_long[clust_long$resolution == paste0("res.", marker_res),
+                  c("cluster", "n_cells", "pct_cells")]
+tbl$cluster <- factor(tbl$cluster, levels = tbl$cluster[order(-tbl$n_cells)])
+
+ggplot(tbl, aes(x = cluster, y = n_cells)) +
+  geom_col(fill = "steelblue", alpha = 0.85) +
+  geom_text(aes(label = paste0(round(pct_cells, 1), "%")), vjust = -0.4, size = 3) +
+  labs(title = paste0("Cluster sizes — ", subset_label, "  (res ", marker_res, ")"),
+       x = "Cluster", y = "# cells") +
+  theme_bw()
+```
+
+---
+
+# Markers
+
+Top 10 differentially expressed genes per cluster (resolution `r marker_res`).
+
+```{r markers-table}
+markers <- read.csv(chapter_table(paste0("cluster_markers_res", marker_res, ".csv")),
+                    stringsAsFactors = FALSE)
+top_markers <- markers |>
+  dplyr::group_by(cluster) |>
+  dplyr::slice_max(order_by = avg_log2FC, n = 10) |>
+  dplyr::ungroup() |>
+  dplyr::select(cluster, gene, avg_log2FC, pct.1, pct.2, p_val_adj) |>
+  dplyr::mutate(
+    avg_log2FC = round(avg_log2FC, 3),
+    pct.1      = round(pct.1, 3),
+    pct.2      = round(pct.2, 3),
+    p_val_adj  = signif(p_val_adj, 3)
+  )
+DT::datatable(
+  top_markers,
+  caption  = "Top 10 markers per cluster (ranked by avg_log2FC)",
+  rownames = FALSE,
+  filter   = "top",
+  options  = list(pageLength = 20, scrollX = TRUE)
+)
+```
+
+## Top marker expression on UMAP
+
+```{r marker-feature-plots}
+#| out-width: "100%"
+knitr::include_graphics(chapter_figure("marker_feature_plots.png"))
+```
+
+---
+
+# Canonical marker expression
+
+Average expression (colour) and percentage of expressing cells (size) per cluster
+for canonical bone marrow cell type markers.
+
+```{r bubble-plot}
+#| out-width: "100%"
+knitr::include_graphics(chapter_figure("canonical_markers_bubble.png"))
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,434 @@
+---
+title: "HSC — Compartment Focus"
+author: "Mohamed Shoeb"
+date: today
+format:
+  revealjs:
+    embed-resources: true
+    theme: simple
+    slide-number: true
+    toc: false
+    fig-align: center
+    fig-dpi: 120
+    code-fold: false
+    echo: false
+    width: 1600
+    height: 900
+    margin: 0.05
+execute:
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(targets)
+library(tidyverse)
+library(cowplot)
+options(future.globals.maxSize = 8 * 1024^3)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+targets::tar_load(qc_params)
+targets::tar_load(metadata_flagged_all)
+targets::tar_load(mt_genes)
+targets::tar_load(rp_genes)
+targets::tar_load(hb_genes)
+
+df         <- metadata_flagged_all
+df_margins <- df %>% mutate(sample.name = "All")
+df_plot    <- bind_rows(df, df_margins)
+
+clust_col <- "sNN_pca.SCT_20_res.0.1"
+
+tar_load(annotation_config)
+ct <- annotation_config$cell_types
+ct_markers <- lapply(ct, \(x) as.character(x$markers))
+cell_type_labels <- setNames(
+  rep(names(ct_markers), lengths(ct_markers)),
+  unlist(ct_markers)
+)
+```
+
+# QC
+
+## Cells retained after QC filtering
+
+```{r before-after-barplot}
+#| fig-width: 12
+#| fig-height: 6
+df |>
+  dplyr::mutate(status = ifelse(pass_cell, "Clean", "Removed")) |>
+  dplyr::count(compartment, sample.name, status) |>
+  dplyr::mutate(status = factor(status, levels = c("Clean", "Removed"))) |>
+  ggplot(aes(x = sample.name, y = n, fill = status)) +
+  geom_col() +
+  scale_fill_manual(values = c("Clean" = "#2166ac", "Removed" = "#d6604d"), name = NULL) +
+  facet_wrap(~compartment, scales = "free_x", nrow = 1) +
+  labs(x = NULL, y = "Number of cells") +
+  theme_cowplot(font_size = 14) +
+  theme(axis.text.x   = element_text(angle = 45, hjust = 1),
+        strip.text    = element_text(size = 14),
+        legend.position = "top")
+```
+
+## Per-compartment QC thresholds
+
+Global: mitochondrial % ≤ `r qc_params$mito_percent_max`%, haemoglobin % ≤ `r qc_params$hb_percent_max`%.
+
+```{r cutoff-table}
+compartment_qc <- qc_params$compartment_qc
+cutoff_df <- do.call(rbind, lapply(names(compartment_qc), function(comp) {
+  x <- compartment_qc[[comp]]
+  data.frame(Compartment = comp,
+             nFeature_min = x$nFeature_min, nFeature_max = x$nFeature_max,
+             ribo_pct_min = x$ribo_percent_min, ribo_pct_max = x$ribo_percent_max,
+             stringsAsFactors = FALSE)
+}))
+knitr::kable(cutoff_df,
+             col.names = c("Compartment", "nFeature min", "nFeature max",
+                           "Ribo % min", "Ribo % max"),
+             align = "lrrrr")
+```
+
+## QC filter co-occurrence {.smaller}
+
+```{r qc-cooccurrence-heatmap}
+#| fig-width: 14
+#| fig-height: 5
+qc_flags   <- c("pass_mt", "pass_nFeature", "pass_rp", "pass_hb", "pass_hto", "pass_dbl")
+nice_names <- c(pass_mt = "Mito %", pass_nFeature = "nFeature",
+                pass_rp = "Ribo %",  pass_hb = "Hb %",
+                pass_hto = "HTO",    pass_dbl = "Doublet")
+
+cooc_per_compartment <- function(md) {
+  flag_mat <- as.matrix(md[, qc_flags])
+  n        <- length(qc_flags)
+  cooc     <- matrix(0L, n, n, dimnames = list(qc_flags, qc_flags))
+  for (i in seq_len(n))
+    for (j in seq_len(n))
+      cooc[i, j] <- sum(!flag_mat[, i] & !flag_mat[, j])
+  long <- reshape2::melt(cooc, varnames = c("metric_x", "metric_y"), value.name = "n_cells")
+  long$metric_x <- factor(nice_names[as.character(long$metric_x)], levels = nice_names)
+  long$metric_y <- factor(nice_names[as.character(long$metric_y)], levels = rev(nice_names))
+  long
+}
+
+cooc_long <- dplyr::bind_rows(
+  lapply(split(df, df$compartment), cooc_per_compartment),
+  .id = "compartment"
+)
+
+ggplot(cooc_long, aes(metric_x, metric_y, fill = n_cells)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = n_cells,
+                colour = n_cells > max(n_cells) * 0.5), size = 3.5) +
+  scale_colour_manual(values = c("TRUE" = "white", "FALSE" = "grey20"), guide = "none") +
+  scale_fill_gradient(low = "#f7fbff", high = "#08519c",
+                      name = "Cells failing\nboth metrics") +
+  facet_wrap(~compartment, nrow = 1) +
+  labs(title = "Co-occurrence of QC filter failures per compartment", x = NULL, y = NULL) +
+  theme_cowplot(font_size = 13) +
+  theme(axis.text.x   = element_text(angle = 45, hjust = 1),
+        strip.text    = element_text(size = 13),
+        legend.position = "right")
+```
+
+# Pre-QC UMAPs
+
+## Stroma
+
+```{r umap-raw-stroma}
+#| fig-width: 14
+#| fig-height: 7
+targets::tar_load(mpn_raw_processed_stroma)
+plot_umap_groups_ext(mpn_raw_processed_stroma,
+                     group_i = "pass_cell", reduction = "umap.nn",
+                     legend_title = "Passes QC",
+                     split.by = "sample.name", label = FALSE)
+```
+
+## Stroma — QC features
+
+```{r umap-raw-stroma-features}
+#| fig-width: 14
+#| fig-height: 7
+plot_umap_feature_ext(mpn_raw_processed_stroma,
+                      reduction = "umap.nn",
+                      features = c("nFeature_RNA", "percent.mt", "percent.rp"))
+rm(mpn_raw_processed_stroma); gc()
+```
+
+## HSC
+
+```{r umap-raw-hsc}
+#| fig-width: 14
+#| fig-height: 7
+targets::tar_load(mpn_raw_processed_hsc)
+plot_umap_groups_ext(mpn_raw_processed_hsc,
+                     group_i = "pass_cell", reduction = "umap.nn",
+                     legend_title = "Passes QC",
+                     split.by = "sample.name", label = FALSE)
+```
+
+## HSC — QC features
+
+```{r umap-raw-hsc-features}
+#| fig-width: 14
+#| fig-height: 7
+plot_umap_feature_ext(mpn_raw_processed_hsc,
+                      reduction = "umap.nn",
+                      features = c("nFeature_RNA", "percent.mt", "percent.rp"))
+rm(mpn_raw_processed_hsc); gc()
+```
+
+## MNC
+
+```{r umap-raw-mnc}
+#| fig-width: 14
+#| fig-height: 7
+targets::tar_load(mpn_raw_processed_mnc)
+plot_umap_groups_ext(mpn_raw_processed_mnc,
+                     group_i = "pass_cell", reduction = "umap.nn",
+                     legend_title = "Passes QC",
+                     split.by = "sample.name", label = FALSE)
+```
+
+## MNC — QC features
+
+```{r umap-raw-mnc-features}
+#| fig-width: 14
+#| fig-height: 7
+plot_umap_feature_ext(mpn_raw_processed_mnc,
+                      reduction = "umap.nn",
+                      features = c("nFeature_RNA", "percent.mt", "percent.rp"))
+rm(mpn_raw_processed_mnc); gc()
+```
+
+# Dimensionality reduction
+
+## HSC — clusters & cell cycle
+
+```{r umap-overview-hsc}
+#| fig-width: 14
+#| fig-height: 7
+tar_load(mpn_processed_hsc)
+plot_umap_groups_ext(mpn_processed_hsc,
+                     group_i = clust_col, reduction = "umap.nn",
+                     legend_title = "Cluster",
+                     split.by = "sample.name", label = TRUE, label_size = 5)
+```
+
+## HSC — cell cycle
+
+```{r umap-phase-hsc}
+#| fig-width: 14
+#| fig-height: 7
+plot_umap_groups_ext(mpn_processed_hsc,
+                     group_i = "Phase", reduction = "umap.nn",
+                     legend_title = "Cell cycle phase",
+                     split.by = "sample.name", label = TRUE, label_size = 5)
+```
+
+## MNC — clusters
+
+```{r umap-overview-mnc}
+#| fig-width: 14
+#| fig-height: 7
+tar_load(mpn_processed_mnc)
+plot_umap_groups_ext(mpn_processed_mnc,
+                     group_i = clust_col, reduction = "umap.nn",
+                     legend_title = "Cluster",
+                     split.by = "sample.name", label = TRUE, label_size = 5)
+```
+
+## MNC — cell cycle
+
+```{r umap-phase-mnc}
+#| fig-width: 14
+#| fig-height: 7
+plot_umap_groups_ext(mpn_processed_mnc,
+                     group_i = "Phase", reduction = "umap.nn",
+                     legend_title = "Cell cycle phase",
+                     split.by = "sample.name", label = TRUE, label_size = 5)
+```
+
+## Stroma — clusters
+
+```{r umap-overview-stroma-post}
+#| fig-width: 14
+#| fig-height: 7
+tar_load(mpn_processed_stroma)
+plot_umap_groups_ext(mpn_processed_stroma,
+                     group_i = clust_col, reduction = "umap.nn",
+                     legend_title = "Cluster",
+                     split.by = "sample.name", label = TRUE, label_size = 5)
+```
+
+## Stroma — cell cycle
+
+```{r umap-phase-stroma}
+#| fig-width: 14
+#| fig-height: 7
+plot_umap_groups_ext(mpn_processed_stroma,
+                     group_i = "Phase", reduction = "umap.nn",
+                     legend_title = "Cell cycle phase",
+                     split.by = "sample.name", label = TRUE, label_size = 5)
+```
+
+# Canonical markers
+
+## HSC
+
+```{r bubble-hsc}
+#| fig-width: 16
+#| fig-height: 8
+marker_genes_hsc <- unlist(ct_markers)
+marker_genes_hsc <- marker_genes_hsc[marker_genes_hsc %in% rownames(mpn_processed_hsc)]
+cell_type_labels_hsc <- cell_type_labels[marker_genes_hsc]
+
+p_umap_hsc <- lean_dimplot(
+  Seurat::DimPlot(mpn_processed_hsc, group.by = clust_col, reduction = "umap.nn"),
+  colour_col = clust_col, legend_title = "Cluster",
+  label = TRUE, label_size = 4
+) + theme(legend.position = "none")
+
+p_dot_hsc <- Seurat::DotPlot(mpn_processed_hsc, features = marker_genes_hsc,
+                              group.by = clust_col,
+                              cols = c("lightgrey", "#2166ac"), dot.scale = 4) +
+  scale_x_discrete(labels = setNames(names(cell_type_labels_hsc), marker_genes_hsc)) +
+  labs(x = NULL, y = "Cluster", title = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 9),
+        plot.margin = margin(l = 5))
+
+p_umap_hsc + p_dot_hsc + patchwork::plot_layout(widths = c(1, 2.5))
+```
+
+## MNC
+
+```{r bubble-mnc}
+#| fig-width: 16
+#| fig-height: 8
+marker_genes_mnc <- unlist(ct_markers)
+marker_genes_mnc <- marker_genes_mnc[marker_genes_mnc %in% rownames(mpn_processed_mnc)]
+cell_type_labels_mnc <- cell_type_labels[marker_genes_mnc]
+
+p_umap_mnc <- lean_dimplot(
+  Seurat::DimPlot(mpn_processed_mnc, group.by = clust_col, reduction = "umap.nn"),
+  colour_col = clust_col, legend_title = "Cluster",
+  label = TRUE, label_size = 4
+) + theme(legend.position = "none")
+
+p_dot_mnc <- Seurat::DotPlot(mpn_processed_mnc, features = marker_genes_mnc,
+                              group.by = clust_col,
+                              cols = c("lightgrey", "#2166ac"), dot.scale = 4) +
+  scale_x_discrete(labels = setNames(names(cell_type_labels_mnc), marker_genes_mnc)) +
+  labs(x = NULL, y = "Cluster", title = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 9),
+        plot.margin = margin(l = 5))
+
+p_umap_mnc + p_dot_mnc + patchwork::plot_layout(widths = c(1, 2.5))
+```
+
+## Stroma
+
+```{r bubble-stroma}
+#| fig-width: 16
+#| fig-height: 8
+marker_genes_stroma <- unlist(ct_markers)
+marker_genes_stroma <- marker_genes_stroma[marker_genes_stroma %in% rownames(mpn_processed_stroma)]
+cell_type_labels_stroma <- cell_type_labels[marker_genes_stroma]
+
+p_umap_stroma <- lean_dimplot(
+  Seurat::DimPlot(mpn_processed_stroma, group.by = clust_col, reduction = "umap.nn"),
+  colour_col = clust_col, legend_title = "Cluster",
+  label = TRUE, label_size = 4
+) + theme(legend.position = "none")
+
+p_dot_stroma <- Seurat::DotPlot(mpn_processed_stroma, features = marker_genes_stroma,
+                                group.by = clust_col,
+                                cols = c("lightgrey", "#2166ac"), dot.scale = 4) +
+  scale_x_discrete(labels = setNames(names(cell_type_labels_stroma), marker_genes_stroma)) +
+  labs(x = NULL, y = "Cluster", title = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 9),
+        axis.text.y = element_text(size = 9),
+        plot.margin = margin(l = 5))
+
+p_umap_stroma + p_dot_stroma + patchwork::plot_layout(widths = c(1, 2.5))
+```
+
+# Markers — WT vs HET+/HET−
+
+## HSC — top DE genes {.smaller}
+
+```{r markers-hsc}
+tar_load(delegate_samples_markers_hsc)
+diff_tbl_sig_hsc <- delegate_samples_markers_hsc %>%
+  filter(padj <= 0.001, abs(log_fc) >= 0.25)
+
+diff_tbl_sig_hsc %>%
+  dplyr::group_by(cluster, group1) %>%
+  dplyr::slice_max(abs(log_fc), n = 5) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(log_fc = round(log_fc, 3), padj = signif(padj, 3)) %>%
+  knitr::kable()
+```
+
+## HSC — sex genes drive top hits
+
+```{r sex-genes-hsc}
+#| fig-width: 14
+#| fig-height: 6
+plot_umap_feature_ext(mpn_processed_hsc,
+                      reduction = "umap.nn",
+                      features = c("Xist", "Uty", "Ddx3y", "Kdm5d"),
+                      split.by = "sample.name")
+rm(mpn_processed_hsc); gc()
+```
+
+## MNC — top DE genes {.smaller}
+
+```{r markers-mnc}
+tar_load(delegate_samples_markers_mnc)
+diff_tbl_sig_mnc <- delegate_samples_markers_mnc %>%
+  filter(padj <= 0.001, abs(log_fc) >= 0.25)
+
+diff_tbl_sig_mnc %>%
+  dplyr::group_by(cluster, group1) %>%
+  dplyr::slice_max(abs(log_fc), n = 5) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(log_fc = round(log_fc, 3), padj = signif(padj, 3)) %>%
+  knitr::kable()
+```
+
+## MNC — sex genes
+
+```{r sex-genes-mnc}
+#| fig-width: 14
+#| fig-height: 6
+plot_umap_feature_ext(mpn_processed_mnc,
+                      reduction = "umap.nn",
+                      features = c("Xist", "Uty", "Ddx3y", "Kdm5d"),
+                      split.by = "sample.name")
+rm(mpn_processed_mnc); gc()
+```
+
+## Stroma — top DE genes {.smaller}
+
+```{r markers-stroma}
+tar_load(delegate_samples_markers_stroma)
+diff_tbl_sig_stroma <- delegate_samples_markers_stroma %>%
+  filter(padj <= 0.001, abs(log_fc) >= 0.25)
+
+diff_tbl_sig_stroma %>%
+  dplyr::group_by(cluster, group1) %>%
+  dplyr::slice_max(abs(log_fc), n = 5) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(log_fc = round(log_fc, 3), padj = signif(padj, 3)) %>%
+  knitr::kable()
+rm(mpn_processed_stroma); gc()
+```

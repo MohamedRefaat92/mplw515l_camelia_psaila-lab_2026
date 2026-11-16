@@ -1,0 +1,1214 @@
+---
+title: "Reference-based Annotation"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(targets)
+library(mclust)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+RESOLUTIONS <- c(0.1, 0.5, 1, 5, 10, 20)
+
+# Active references — target name pattern: proj_<ref_id>_<subset>
+REFERENCES <- list(
+  ferchen_26_mm_bm  = "Ferchen 2026 BM (mm)",
+  mca_mm_pbmc       = "MCA Peripheral Blood",
+  mca_mm_bm         = "MCA Bone Marrow",
+  mca_mm_bm_ckit    = "MCA BM c-Kit",
+  mca_mm_bm_mesench = "MCA BM Mesenchyme",
+  zeng_25_hs_bm     = "Zeng 2025 BM (hs→mm)"
+)
+REF_IDS <- names(REFERENCES)
+```
+
+Label transfer from 6 curated references across Stroma, HSC, and MNC compartments.
+
+- **Ferchen 2026** — mouse bone marrow (Azimuth, mm).
+- **MCA** — Mouse Cell Atlas: Peripheral Blood, Bone Marrow, BM c-Kit, BM Mesenchyme (Azimuth, mm).
+- **Zeng 2025** — BoneMarrowMap human BM projected cross-species via ortholog mapping (PCA transfer, hs→mm).
+
+Each reference section has:
+
+- **Projected query: labels** — query cells on the reference UMAP, coloured by predicted label (Azimuth refs only).
+- **Projected query: density** — kernel density of query cells on the reference UMAP (Azimuth refs only).
+- **Mapping score** — query UMAP coloured by mapping confidence.
+- **Summary** — mapping-score violins, resolution × label heatmaps, and ARI curves.
+
+```{r data-load}
+tar_load(anno_meta_hsc);             tar_load(annotation_recluster_hsc)
+tar_load(anno_meta_mnc);             tar_load(annotation_recluster_mnc)
+tar_load(anno_meta_stroma);          tar_load(annotation_recluster_stroma)
+
+hsc_df    <- anno_merge_recluster(anno_meta_hsc,    annotation_recluster_hsc)
+mnc_df    <- anno_merge_recluster(anno_meta_mnc,    annotation_recluster_mnc)
+stroma_df <- anno_merge_recluster(anno_meta_stroma, annotation_recluster_stroma)
+rm(anno_meta_hsc, annotation_recluster_hsc,
+   anno_meta_mnc, annotation_recluster_mnc,
+   anno_meta_stroma, annotation_recluster_stroma)
+gc()
+```
+
+```{r proj-load-helper, include=FALSE}
+# Load and merge projection data for one reference.
+# Stops with a clear error if any compartment target is missing — build the pipeline first.
+load_proj <- function(ref_id) {
+  list(
+    hsc    = anno_merge_proj(hsc_df,    tar_read_raw(paste0("proj_", ref_id, "_hsc"))),
+    mnc    = anno_merge_proj(mnc_df,    tar_read_raw(paste0("proj_", ref_id, "_mnc"))),
+    stroma = anno_merge_proj(stroma_df, tar_read_raw(paste0("proj_", ref_id, "_stroma")))
+  )
+}
+
+# Load reference UMAP data.frame from a named pipeline target.
+# Stops with a clear error if the target has not been built yet.
+load_ref_umap <- function(target_name) {
+  tar_read_raw(target_name)
+}
+
+# Build shared colour palette for reference + predicted cell types.
+make_pal <- function(ref_df, dfs, label = "cell_type") {
+  predicted_label <- paste0("predicted.",label)
+  pred <- unlist(lapply(dfs, function(d) {
+    if (predicted_label %in% colnames(d)) d[[predicted_label]] else NULL
+  }))
+  anno_make_type_pal(ref_df, pred, label)
+}
+```
+
+------------------------------------------------------------------------
+
+## Ferchen 2026 BM (mm)
+
+```{r ferchen-setup, include=FALSE}
+.name     <- "Ferchen 2026 BM (mm)"
+.label    <- "Level2"
+.ref_key  <- "UMAP"      # ref_df columns: UMAP1, UMAP2
+.proj_key <- "UMAP_"  # query columns:  refumap_1, refumap_2
+.ref_df   <- load_ref_umap("ferchen_26_mm_bm_umap")
+.dfs      <- load_proj("ferchen_26_mm_bm")
+.pal      <- make_pal(.ref_df, .dfs, .label)
+```
+
+### Projected query: labels
+
+::: panel-tabset
+#### HSC
+
+```{r ferchen-labels-hsc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r ferchen-labels-mnc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r ferchen-labels-stroma, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Projected query: density
+
+::: panel-tabset
+#### HSC
+
+```{r ferchen-density-hsc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r ferchen-density-mnc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r ferchen-density-stroma, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Mapping score
+
+::: panel-tabset
+#### HSC
+
+```{r ferchen-mapping-hsc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "hsc", .label)
+```
+
+#### MNC
+
+```{r ferchen-mapping-mnc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "mnc", .label)
+```
+
+#### Stroma
+
+```{r ferchen-mapping-stroma, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "stroma", .label)
+```
+:::
+
+### Summary
+
+::: panel-tabset
+#### Mapping score violins
+
+```{r ferchen-violins, fig.width=10, fig.height=24}
+ref_plot_violins(.dfs, .name, .label)
+```
+
+#### Resolution heatmaps
+
+```{r ferchen-heatmaps, fig.width=9, fig.height=6}
+ref_draw_heatmaps(.dfs, .name, .label)
+```
+
+#### ARI
+
+```{r ferchen-ari, fig.width=7, fig.height=4}
+ref_plot_ari(.dfs, .name, RESOLUTIONS, .label)
+```
+:::
+
+------------------------------------------------------------------------
+
+## Zeng 2025 BM (hs→mm)
+
+Cross-species projection: query cells renamed to human orthologs → transferred onto Zeng 2025 BoneMarrowMap via PCA anchors. Labels: `predicted.CellType` and `predicted.CellType_Broad`. No reference UMAP projection (different label structure — density/labels panels are not available).
+
+```{r zeng-setup, include=FALSE,message=FALSE}
+.name     <- "Zeng 2025 BM (hs→mm)"
+.label    <- "CellType_Broad"   # predicted column: predicted.CellType_Broad
+.ref_key  <- "UMAP_"             # unused (no ref UMAP), kept for API consistency
+.proj_key <- "refUMAP_"
+.ref_df   <- load_ref_umap("zeng_25_hs_bm_umap")
+.dfs      <- load_proj("zeng_25_hs_bm")
+.pal      <- make_pal(.ref_df, .dfs, .label)
+```
+
+### Projected query: labels
+
+::: panel-tabset
+#### HSC
+
+```{r zeng-labels-hsc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r zeng-labels-mnc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r zeng-labels-stroma, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Projected query: density
+
+::: panel-tabset
+#### HSC
+
+```{r zeng-density-hsc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r zeng-density-mnc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r zeng-density-stroma, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+### Mapping score
+
+::: panel-tabset
+#### HSC
+
+```{r zeng-mapping-hsc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "hsc", .label)
+```
+
+#### MNC
+
+```{r zeng-mapping-mnc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "mnc", .label)
+```
+
+#### Stroma
+
+```{r zeng-mapping-stroma, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "stroma", .label)
+```
+:::
+
+### Summary
+
+::: panel-tabset
+#### Mapping score violins
+
+```{r zeng-violins, fig.width=10, fig.height=24}
+ref_plot_violins(.dfs, .name, .label)
+```
+
+#### Resolution heatmaps
+
+```{r zeng-heatmaps, fig.width=9, fig.height=6}
+ref_draw_heatmaps(.dfs, .name, .label)
+```
+
+#### ARI
+
+```{r zeng-ari, fig.width=7, fig.height=4}
+ref_plot_ari(.dfs, .name, RESOLUTIONS, .label)
+```
+:::
+
+------------------------------------------------------------------------
+
+## Hematlas Bone Marrow
+
+```{r hematlas-bm-setup, include=FALSE}
+.name     <- "Hematlas Bone Marrow"
+.label    <- "Cell_type"
+.ref_key  <- "UMAP"
+.proj_key <- "UMAP_"
+.ref_df   <- load_ref_umap("hematlas_mm_bm")
+.dfs      <- load_proj("hematlas_mm_bm")
+.pal      <- make_pal(.ref_df, .dfs, .label)
+```
+
+### Projected query: labels
+
+::: panel-tabset
+#### HSC
+
+```{r hematlas-bm-labels-hsc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r hematlas-bm-labels-mnc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r hematlas-bm-labels-stroma, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Projected query: density
+
+::: panel-tabset
+#### HSC
+
+```{r hematlas-bm-density-hsc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r hematlas-bm-density-mnc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r hematlas-bm-density-stroma, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Mapping score
+
+::: panel-tabset
+#### HSC
+
+```{r hematlas-bm-mapping-hsc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "hsc",label = .label)
+```
+
+#### MNC
+
+```{r hematlas-bm-mapping-mnc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "mnc",label = .label)
+```
+
+#### Stroma
+
+```{r hematlas-bm-mapping-stroma, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "stroma",label = .label)
+```
+:::
+
+### Summary
+
+::: panel-tabset
+#### Mapping score violins
+
+```{r hematlas-bm-violins, fig.width=10, fig.height=24}
+ref_plot_violins(.dfs, .name,label = .label)
+```
+
+#### Resolution heatmaps
+
+```{r hematlas-bm-heatmaps, fig.width=9, fig.height=6}
+ref_draw_heatmaps(.dfs, .name)
+```
+
+#### ARI
+
+```{r hematlas-bm-ari, fig.width=7, fig.height=4}
+ref_plot_ari(.dfs, .name, RESOLUTIONS)
+```
+:::
+
+------------------------------------------------------------------------
+
+
+## Hematlas Fetal Liver
+
+```{r hematlas-fl-setup, include=FALSE}
+.name     <- "Hematlas Fetal liver"
+.label    <- "Cell_type"
+.ref_key  <- "UMAP"
+.proj_key <- "UMAP_"
+.ref_df   <- load_ref_umap("hematlas_mm_fl")
+.dfs      <- load_proj("hematlas_mm_fl")
+.pal      <- make_pal(.ref_df, .dfs, .label)
+```
+
+### Projected query: labels
+
+::: panel-tabset
+#### HSC
+
+```{r hematlas-fl-labels-hsc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r hematlas-fl-labels-mnc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r hematlas-fl-labels-stroma, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Projected query: density
+
+::: panel-tabset
+#### HSC
+
+```{r hematlas-fl-density-hsc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r hematlas-fl-density-mnc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r hematlas-fl-density-stroma, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Mapping score
+
+::: panel-tabset
+#### HSC
+
+```{r hematlas-fl-mapping-hsc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "hsc",label = .label)
+```
+
+#### MNC
+
+```{r hematlas-fl-mapping-mnc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "mnc",label = .label)
+```
+
+#### Stroma
+
+```{r hematlas-fl-mapping-stroma, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "stroma",label = .label)
+```
+:::
+
+### Summary
+
+::: panel-tabset
+#### Mapping score violins
+
+```{r hematlas-fl-violins, fig.width=10, fig.height=24}
+ref_plot_violins(.dfs, .name,label = .label)
+```
+
+#### Resolution heatmaps
+
+```{r hematlas-fl-heatmaps, fig.width=9, fig.height=6}
+ref_draw_heatmaps(.dfs, .name)
+```
+
+#### ARI
+
+```{r hematlas-fl-ari, fig.width=7, fig.height=4}
+ref_plot_ari(.dfs, .name, RESOLUTIONS)
+```
+:::
+
+------------------------------------------------------------------------
+
+## MCA BM c-Kit
+
+```{r mca-ckit-setup, include=FALSE}
+.name     <- "MCA BM c-Kit"
+.label    <- "cell_type"
+.ref_key  <- "UMAP"
+.proj_key <- "UMAP_"
+.ref_df   <- load_ref_umap("mca_mm_bm_ckit_umap")
+.dfs      <- load_proj("mca_mm_bm_ckit")
+.pal      <- make_pal(.ref_df, .dfs, .label)
+```
+
+### Projected query: labels
+
+::: panel-tabset
+#### HSC
+
+```{r mca-ckit-labels-hsc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r mca-ckit-labels-mnc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r mca-ckit-labels-stroma, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Projected query: density
+
+::: panel-tabset
+#### HSC
+
+```{r mca-ckit-density-hsc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r mca-ckit-density-mnc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r mca-ckit-density-stroma, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Mapping score
+
+::: panel-tabset
+#### HSC
+
+```{r mca-ckit-mapping-hsc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "hsc")
+```
+
+#### MNC
+
+```{r mca-ckit-mapping-mnc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "mnc")
+```
+
+#### Stroma
+
+```{r mca-ckit-mapping-stroma, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "stroma")
+```
+:::
+
+### Summary
+
+::: panel-tabset
+#### Mapping score violins
+
+```{r mca-ckit-violins, fig.width=10, fig.height=24}
+ref_plot_violins(.dfs, .name)
+```
+
+#### Resolution heatmaps
+
+```{r mca-ckit-heatmaps, fig.width=9, fig.height=6}
+ref_draw_heatmaps(.dfs, .name)
+```
+
+#### ARI
+
+```{r mca-ckit-ari, fig.width=7, fig.height=4}
+ref_plot_ari(.dfs, .name, RESOLUTIONS)
+```
+:::
+
+------------------------------------------------------------------------
+
+## MCA BM Mesenchyme
+
+```{r mca-mes-setup, include=FALSE}
+.name     <- "MCA BM Mesenchyme"
+.label    <- "cell_type"
+.ref_key  <- "UMAP"
+.proj_key <- "UMAP_"
+.ref_df   <- load_ref_umap("mca_mm_bm_mesench_umap")
+.dfs      <- load_proj("mca_mm_bm_mesench")
+.pal      <- make_pal(.ref_df, .dfs, .label)
+```
+
+### Projected query: labels
+
+::: panel-tabset
+#### HSC
+
+```{r mca-mes-labels-hsc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r mca-mes-labels-mnc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r mca-mes-labels-stroma, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Projected query: density
+
+::: panel-tabset
+#### HSC
+
+```{r mca-mes-density-hsc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r mca-mes-density-mnc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r mca-mes-density-stroma, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Mapping score
+
+::: panel-tabset
+#### HSC
+
+```{r mca-mes-mapping-hsc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "hsc")
+```
+
+#### MNC
+
+```{r mca-mes-mapping-mnc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "mnc")
+```
+
+#### Stroma
+
+```{r mca-mes-mapping-stroma, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "stroma")
+```
+:::
+
+### Summary
+
+::: panel-tabset
+#### Mapping score violins
+
+```{r mca-mes-violins, fig.width=10, fig.height=24}
+ref_plot_violins(.dfs, .name)
+```
+
+#### Resolution heatmaps
+
+```{r mca-mes-heatmaps, fig.width=9, fig.height=6}
+ref_draw_heatmaps(.dfs, .name)
+```
+
+#### ARI
+
+```{r mca-mes-ari, fig.width=7, fig.height=4}
+ref_plot_ari(.dfs, .name, RESOLUTIONS)
+```
+:::
+------------------------------------------------------------------------
+
+## MCA Peripheral Blood
+
+```{r mca-pbmc-setup, include=FALSE}
+.name     <- "MCA Peripheral Blood"
+.label    <- "cell_type"
+.ref_key  <- "UMAP"
+.proj_key <- "UMAP_"
+.ref_df   <- load_ref_umap("mca_mm_pbmc_umap")
+.dfs      <- load_proj("mca_mm_pbmc")
+.pal      <- make_pal(.ref_df, .dfs, .label)
+```
+
+### Projected query: labels
+
+::: panel-tabset
+#### HSC
+
+```{r mca-pbmc-labels-hsc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r mca-pbmc-labels-mnc, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r mca-pbmc-labels-stroma, fig.width=11, fig.height=4.5}
+ref_plot_labels(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Projected query: density
+
+::: panel-tabset
+#### HSC
+
+```{r mca-pbmc-density-hsc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "hsc", .label, .proj_key, .ref_key)
+```
+
+#### MNC
+
+```{r mca-pbmc-density-mnc, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "mnc", .label, .proj_key, .ref_key)
+```
+
+#### Stroma
+
+```{r mca-pbmc-density-stroma, fig.width=11, fig.height=4.5}
+ref_plot_density2(.dfs, .ref_df, .pal, .name, "stroma", .label, .proj_key, .ref_key)
+```
+:::
+
+### Mapping score
+
+::: panel-tabset
+#### HSC
+
+```{r mca-pbmc-mapping-hsc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "hsc")
+```
+
+#### MNC
+
+```{r mca-pbmc-mapping-mnc, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "mnc")
+```
+
+#### Stroma
+
+```{r mca-pbmc-mapping-stroma, fig.width=11, fig.height=4.5}
+ref_plot_mapping(.dfs, .pal, "stroma")
+```
+:::
+
+### Summary
+
+::: panel-tabset
+#### Mapping score violins
+
+```{r mca-pbmc-violins, fig.width=10, fig.height=24}
+ref_plot_violins(.dfs, .name)
+```
+
+#### Resolution heatmaps
+
+```{r mca-pbmc-heatmaps, fig.width=9, fig.height=6}
+ref_draw_heatmaps(.dfs, .name)
+```
+
+#### ARI
+
+```{r mca-pbmc-ari, fig.width=7, fig.height=4}
+ref_plot_ari(.dfs, .name, RESOLUTIONS)
+```
+:::
+
+
+------------------------------------------------------------------------
+
+
+------------------------------------------------------------------------
+
+## SingleR annotation
+
+Automated label transfer using bulk RNA-seq references from `celldex`.
+Three references chosen for haematopoiesis / blood development relevance:
+
+- **NovershternHematopoieticData** — 211 human haematopoietic bulk samples,
+  38 cell types spanning all major lineages (Novershtern *et al.* 2011).
+- **ImmGenData** — mouse Immunological Genome Project; comprehensive immune
+  atlas (mouse, most directly comparable to BM data).
+- **MouseRNAseqData** — mouse bulk RNA-seq compendium; broad cell types useful
+  as a sanity check across all three compartments.
+
+```{r singler-libs, message=FALSE}
+library(SingleR)
+library(celldex)
+library(BiocParallel)
+```
+
+```{r singler-refs, message=FALSE}
+tar_load(mm_hs_ortho_long)   # columns: Mouse.gene.name, human_ortho
+
+ref_novershtern  <- celldex::NovershternHematopoieticData()
+ref_immgen       <- celldex::ImmGenData()
+ref_mouse_rnaseq <- celldex::MouseRNAseqData()
+
+# Rename Novershtern (human) rownames → mouse ortholog symbols so they align
+# with the query SCT matrix.  Keep only strict 1:1 pairs to avoid duplicate
+# rownames (many-to-many entries like HSD3B1/2 are dropped).
+ortho_1to1 <- mm_hs_ortho_long |>
+  dplyr::filter(human_ortho %in% rownames(ref_novershtern)) |>
+  dplyr::group_by(human_ortho)      |> dplyr::filter(dplyr::n() == 1) |> dplyr::ungroup() |>
+  dplyr::group_by(Mouse.gene.name)  |> dplyr::filter(dplyr::n() == 1) |> dplyr::ungroup()
+
+ref_novershtern_mm <- ref_novershtern[ortho_1to1$human_ortho, ]
+rownames(ref_novershtern_mm) <- ortho_1to1$Mouse.gene.name
+
+message(sprintf("Novershtern: %d human genes → %d 1:1 mouse orthologs retained",
+                nrow(ref_novershtern), nrow(ref_novershtern_mm)))
+
+SINGLER_REFS <- list(
+  "Novershtern Haematopoietic" = list(ref = ref_novershtern_mm, label_col = "label.main"),
+  "ImmGen (mouse)"             = list(ref = ref_immgen,          label_col = "label.main"),
+  "Mouse RNAseq (broad)"       = list(ref = ref_mouse_rnaseq,    label_col = "label.main")
+)
+```
+
+```{r singler-helpers, include=FALSE}
+# Run SingleR for one expression matrix against all SINGLER_REFS.
+# Returns a named list of SingleR result objects.
+run_singler_all <- function(expr_mat) {
+  lapply(SINGLER_REFS, function(r) {
+    SingleR::SingleR(
+      test    = expr_mat,
+      ref     = r$ref,
+      labels  = r$ref[[r$label_col]],
+      BPPARAM = BiocParallel::SerialParam()
+    )
+  })
+}
+
+# UMAP coloured by SingleR predicted labels.
+plot_singler_umap <- function(umap_df, pred, title, n_max = 30000L) {
+  pred_df <- data.frame(cell_id = rownames(pred), label = pred$labels,
+                        stringsAsFactors = FALSE)
+  # hsc_df / mnc_df / stroma_df carry cell_id as a plain column (anno_merge_recluster
+  # uses merge(), so rownames are integers — not barcodes).
+  if (!"cell_id" %in% colnames(umap_df))
+    umap_df <- tibble::rownames_to_column(umap_df, "cell_id")
+  df <- dplyr::inner_join(umap_df, pred_df, by = "cell_id")
+
+  if (nrow(df) == 0) {
+    warning("plot_singler_umap: no cells matched — check cell ID format.")
+    return(invisible(NULL))
+  }
+  if (nrow(df) > n_max) df <- df[sample(nrow(df), n_max), ]
+
+  lvls  <- sort(unique(df$label))
+  n_col <- max(3L, min(length(lvls), 12L))   # brewer.pal requires n >= 3
+  pal   <- setNames(
+    colorRampPalette(RColorBrewer::brewer.pal(n_col, "Paired"))(length(lvls)),
+    lvls
+  )
+  ggplot2::ggplot(df, ggplot2::aes(UMAP1, UMAP2, colour = label)) +
+    ggplot2::geom_point(size = 0.3, alpha = 0.6) +
+    ggplot2::scale_colour_manual(values = pal, name = NULL) +
+    ggplot2::guides(colour = ggplot2::guide_legend(
+      override.aes = list(size = 3), ncol = 1)) +
+    ggplot2::labs(title = title) +
+    ggplot2::theme_void(base_size = 10) +
+    ggplot2::theme(legend.text = ggplot2::element_text(size = 7))
+}
+
+# Score heatmap with optional cell subsampling (plotScoreHeatmap is slow at > 2k cells).
+plot_singler_scores <- function(pred, n_sample = 500L, title = NULL) {
+  if (nrow(pred) > n_sample) {
+    idx  <- sample(nrow(pred), n_sample)
+    pred <- pred[idx, ]
+  }
+  SingleR::plotScoreHeatmap(pred, show.labels = TRUE,
+                            main = title %||% "")
+}
+
+# Label bar-chart: proportion of cells per predicted label.
+plot_singler_bar <- function(pred, title = NULL) {
+  df <- as.data.frame(table(label = pred$labels)) |>
+    dplyr::mutate(prop = Freq / sum(Freq)) |>
+    dplyr::arrange(dplyr::desc(prop))
+  df$label <- factor(df$label, levels = df$label)
+  ggplot2::ggplot(df, ggplot2::aes(x = label, y = prop)) +
+    ggplot2::geom_col(fill = "#4393c3") +
+    ggplot2::geom_text(ggplot2::aes(label = scales::percent(prop, accuracy = 0.1)),
+                       hjust = -0.1, size = 3) +
+    ggplot2::coord_flip() +
+    ggplot2::scale_y_continuous(labels = scales::percent, expand = ggplot2::expansion(mult = c(0, 0.25))) +
+    ggplot2::labs(x = NULL, y = "Proportion of cells", title = title) +
+    ggplot2::theme_classic(base_size = 10)
+}
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+```
+
+---
+
+### HSC
+
+```{r singler-hsc-run, message=FALSE}
+singler_hsc <- run_singler_all(GetAssayData(mpn_processed_hsc_fullcc,"RNA"))
+```
+
+::: panel-tabset
+#### Novershtern — UMAP
+
+```{r singler-hsc-nov-umap, fig.width=10, fig.height=5}
+plot_singler_umap(hsc_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_hsc[["Novershtern Haematopoietic"]],
+                  "HSC — Novershtern Haematopoietic")
+```
+
+#### Novershtern — labels
+
+```{r singler-hsc-nov-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_hsc[["Novershtern Haematopoietic"]],
+                 "HSC — Novershtern: label distribution")
+```
+
+#### Novershtern — scores
+
+```{r singler-hsc-nov-scores, fig.width=9, fig.height=6}
+plot_singler_scores(singler_hsc[["Novershtern Haematopoietic"]],
+                    title = "HSC — Novershtern: score heatmap (n=500 cells)")
+```
+
+#### Novershtern — delta
+
+```{r singler-hsc-nov-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_hsc[["Novershtern Haematopoietic"]],
+                               ncol = 4)
+```
+
+#### ImmGen — UMAP
+
+```{r singler-hsc-immgen-umap, fig.width=10, fig.height=5}
+plot_singler_umap(hsc_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_hsc[["ImmGen (mouse)"]],
+                  "HSC — ImmGen (mouse)")
+```
+
+#### ImmGen — labels
+
+```{r singler-hsc-immgen-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_hsc[["ImmGen (mouse)"]],
+                 "HSC — ImmGen: label distribution")
+```
+
+#### ImmGen — scores
+
+```{r singler-hsc-immgen-scores, fig.width=9, fig.height=6}
+plot_singler_scores(singler_hsc[["ImmGen (mouse)"]],
+                    title = "HSC — ImmGen: score heatmap (n=500 cells)")
+```
+
+#### ImmGen — delta
+
+```{r singler-hsc-immgen-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_hsc[["ImmGen (mouse)"]],
+                               ncol = 4)
+```
+
+#### Mouse RNAseq — UMAP
+
+```{r singler-hsc-mouse-umap, fig.width=10, fig.height=5}
+plot_singler_umap(hsc_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_hsc[["Mouse RNAseq (broad)"]],
+                  "HSC — Mouse RNAseq (broad)")
+```
+
+#### Mouse RNAseq — labels
+
+```{r singler-hsc-mouse-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_hsc[["Mouse RNAseq (broad)"]],
+                 "HSC — Mouse RNAseq: label distribution")
+```
+
+#### Mouse RNAseq — delta
+
+```{r singler-hsc-mouse-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_hsc[["Mouse RNAseq (broad)"]],
+                               ncol = 4)
+```
+:::
+
+```{r singler-hsc-cleanup}
+rm(singler_hsc); gc()
+```
+
+---
+
+### MNC
+
+```{r singler-mnc-run, message=FALSE}
+tar_load(anno_expr_mnc)
+singler_mnc <- run_singler_all(anno_expr_mnc)
+rm(anno_expr_mnc); gc()
+```
+
+::: panel-tabset
+#### Novershtern — UMAP
+
+```{r singler-mnc-nov-umap, fig.width=10, fig.height=5}
+plot_singler_umap(mnc_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_mnc[["Novershtern Haematopoietic"]],
+                  "MNC — Novershtern Haematopoietic")
+```
+
+#### Novershtern — labels
+
+```{r singler-mnc-nov-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_mnc[["Novershtern Haematopoietic"]],
+                 "MNC — Novershtern: label distribution")
+```
+
+#### Novershtern — scores
+
+```{r singler-mnc-nov-scores, fig.width=9, fig.height=6}
+plot_singler_scores(singler_mnc[["Novershtern Haematopoietic"]],
+                    title = "MNC — Novershtern: score heatmap (n=500 cells)")
+```
+
+#### Novershtern — delta
+
+```{r singler-mnc-nov-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_mnc[["Novershtern Haematopoietic"]],
+                               ncol = 4)
+```
+
+#### ImmGen — UMAP
+
+```{r singler-mnc-immgen-umap, fig.width=10, fig.height=5}
+plot_singler_umap(mnc_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_mnc[["ImmGen (mouse)"]],
+                  "MNC — ImmGen (mouse)")
+```
+
+#### ImmGen — labels
+
+```{r singler-mnc-immgen-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_mnc[["ImmGen (mouse)"]],
+                 "MNC — ImmGen: label distribution")
+```
+
+#### ImmGen — scores
+
+```{r singler-mnc-immgen-scores, fig.width=9, fig.height=6}
+plot_singler_scores(singler_mnc[["ImmGen (mouse)"]],
+                    title = "MNC — ImmGen: score heatmap (n=500 cells)")
+```
+
+#### ImmGen — delta
+
+```{r singler-mnc-immgen-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_mnc[["ImmGen (mouse)"]],
+                               ncol = 4)
+```
+
+#### Mouse RNAseq — UMAP
+
+```{r singler-mnc-mouse-umap, fig.width=10, fig.height=5}
+plot_singler_umap(mnc_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_mnc[["Mouse RNAseq (broad)"]],
+                  "MNC — Mouse RNAseq (broad)")
+```
+
+#### Mouse RNAseq — labels
+
+```{r singler-mnc-mouse-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_mnc[["Mouse RNAseq (broad)"]],
+                 "MNC — Mouse RNAseq: label distribution")
+```
+
+#### Mouse RNAseq — delta
+
+```{r singler-mnc-mouse-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_mnc[["Mouse RNAseq (broad)"]],
+                               ncol = 4)
+```
+:::
+
+```{r singler-mnc-cleanup}
+rm(singler_mnc); gc()
+```
+
+---
+
+### Stroma
+
+```{r singler-stroma-run, message=FALSE}
+tar_load(anno_expr_stroma)
+singler_stroma <- run_singler_all(anno_expr_stroma)
+rm(anno_expr_stroma); gc()
+```
+
+::: panel-tabset
+#### Novershtern — UMAP
+
+```{r singler-stroma-nov-umap, fig.width=10, fig.height=5}
+plot_singler_umap(stroma_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_stroma[["Novershtern Haematopoietic"]],
+                  "Stroma — Novershtern Haematopoietic")
+```
+
+#### Novershtern — labels
+
+```{r singler-stroma-nov-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_stroma[["Novershtern Haematopoietic"]],
+                 "Stroma — Novershtern: label distribution")
+```
+
+#### Novershtern — delta
+
+```{r singler-stroma-nov-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_stroma[["Novershtern Haematopoietic"]],
+                               ncol = 4)
+```
+
+#### ImmGen — UMAP
+
+```{r singler-stroma-immgen-umap, fig.width=10, fig.height=5}
+plot_singler_umap(stroma_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_stroma[["ImmGen (mouse)"]],
+                  "Stroma — ImmGen (mouse)")
+```
+
+#### ImmGen — labels
+
+```{r singler-stroma-immgen-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_stroma[["ImmGen (mouse)"]],
+                 "Stroma — ImmGen: label distribution")
+```
+
+#### ImmGen — delta
+
+```{r singler-stroma-immgen-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_stroma[["ImmGen (mouse)"]],
+                               ncol = 4)
+```
+
+#### Mouse RNAseq — UMAP
+
+```{r singler-stroma-mouse-umap, fig.width=10, fig.height=5}
+plot_singler_umap(stroma_df[, c("cell_id","UMAP1","UMAP2")],
+                  singler_stroma[["Mouse RNAseq (broad)"]],
+                  "Stroma — Mouse RNAseq (broad)")
+```
+
+#### Mouse RNAseq — labels
+
+```{r singler-stroma-mouse-bar, fig.width=7, fig.height=5}
+plot_singler_bar(singler_stroma[["Mouse RNAseq (broad)"]],
+                 "Stroma — Mouse RNAseq: label distribution")
+```
+
+#### Mouse RNAseq — delta
+
+```{r singler-stroma-mouse-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_stroma[["Mouse RNAseq (broad)"]],
+                               ncol = 4)
+```
+:::
+
+```{r singler-stroma-cleanup}
+rm(singler_stroma, ref_novershtern, ref_immgen, ref_mouse_rnaseq); gc()
+```
+
+------------------------------------------------------------------------
+
+```{r final-cleanup}
+rm(hsc_df, mnc_df, stroma_df, .dfs, .ref_df, .pal, .name, .label)
+gc()
+```
+
+{{< include ../_session-info.qmd >}}

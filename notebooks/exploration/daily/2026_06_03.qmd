@@ -1,0 +1,87 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Ptk2",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Il2rg",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Pdgfb",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Mylk",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Ccn1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Ccnt1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Id1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Id3",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Serpine1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Il15ra",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Pros1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Col4a6",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Itgav",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Csf3",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Matn4",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Bmp4",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Adamts",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Adamts1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Gja1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Gda",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Zmat3",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Phlda2",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Rhbdf2",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Actn1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Sdc2",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Fap",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Il7",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Cavin2",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Hpgds",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+
+```
+
+<https://onlinelibrary.wiley.com/doi/full/10.1111/acel.70475>
+
+```{r}
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Rab13",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Cxcl2",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Vcam1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+FeaturePlot(mpn_processed_hsc_fullcc,features = "Gsn",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)
+```
+
+```{r}
+fibro <- read.csv("data/marker_list_claude/Fibrosis_Stromal_Markers.csv")
+fibro_lst <- fibro %>% with(split(Mouse_Ortholog, Cell_State_or_Program))
+mat    <- Seurat::GetAssayData(mpn_processed_hsc_fullcc,
+                               assay = "SCT",
+                               layer = "data")
+
+scores <- UCell::ScoreSignatures_UCell(mat, features = fibro_lst)
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc,
+                                        scores)
+
+pdf("fibro.pdf",height = 5,width = 15)
+l <- lapply(colnames(scores),function(gs){
+  FeaturePlot(mpn_processed_hsc_fullcc,features = gs,reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+})
+l
+dev.off()
+```

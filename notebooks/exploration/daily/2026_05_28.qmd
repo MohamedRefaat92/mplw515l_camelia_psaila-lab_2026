@@ -1,0 +1,35 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(miloDE)
+```
+
+```{r}
+targets::tar_load(milo_hsc_obj)
+targets::tar_load(milo_within_ngb_pos_neg_de)
+targets::tar_load(milo_hsc_da)
+
+de_stat = miloDE::convert_de_stat(milo_within_ngb_pos_neg_de)
+
+```
+
+```{r}
+stat_de_magnitude = miloDE::rank_neighbourhoods_by_DE_magnitude(de_stat)
+
+miloDE::plot_DE_single_gene(milo_hsc_obj,
+                            milo_within_ngb_pos_neg_de,
+                            gene = "Klf1",
+                            layout = "umap.nn",
+                            alpha = 1)& 
+    ggplot2::scale_fill_gradient2(
+        low    = "blue",
+        mid    =  "white",
+        high   = "red",
+        limits =c(-2,2))
+```

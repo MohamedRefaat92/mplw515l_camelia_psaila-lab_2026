@@ -1,0 +1,458 @@
+---
+title: "CellRank — HSC Trajectory (CytoTRACE2, res 1.5)"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+library(DT)
+library(knitr)
+
+VELOCITY_DIR       <- file.path("output/objects/cellrank/cytotrace_res1_5")
+CELLRANK_TABLE_DIR <- file.path(VELOCITY_DIR, "tables")
+CELLRANK_FIG_DIR   <- file.path(VELOCITY_DIR, "figures")
+CLUSTER_COL        <- "sNN_pca.SCT_30_res.1.5"
+TARGET_CLUSTER     <- "1"
+```
+
+## Overview
+
+CellRank trajectory inference on the HSC compartment (50,056 cells) using
+**CytoTRACE2 score** as the pseudotime proxy. CytoTRACE2 reflects
+transcriptional complexity: higher scores indicate more stem-like, less
+differentiated states. The `PseudotimeKernel` translates these scores into
+directed transition probabilities that guide cells from progenitor to terminal
+fates.
+
+**Workflow summary**
+
+| Step | Method | Output |
+|------|--------|--------|
+| Pseudotime | CytoTRACE2 score (pre-computed) | `cytotrace2_score` in obs |
+| Transition matrix | `PseudotimeKernel` (0.8) + `ConnectivityKernel` (0.2) | directed graph |
+| Terminal states | CFLARE — sparse eigendecomposition | 14 macrostates |
+| Fate probabilities | Linear system per terminal state | per-cell fate scores |
+| Driver genes | Fate–expression correlation per cluster | ranked gene lists |
+| Gene trends | GAM along pseudotime | expression curves |
+
+> **Cluster column:** `sNN_pca.SCT_30_res.1.5` (33 clusters). Terminal state
+> names encode the dominant cluster label at **res 0.9** (used during the
+> CellRank Python run); per-cluster statistics in sections 5 and 8 are
+> computed at res 1.5.
+
+---
+
+## 1  CytoTRACE2 pseudotime
+
+```{r cytotrace-umap, fig.cap="Left: CytoTRACE2 score (RdYlBu_r, high = stem-like). Right: cluster labels at res 0.9 (used for terminal-state naming).", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "overview_umap.png"))
+```
+
+**Interpretation.** CytoTRACE2 score reflects transcriptional complexity:
+cells expressing more unique genes score higher and are inferred to be more
+primitive. A gradient from high-scoring progenitor regions to lower-scoring,
+more committed regions is expected across the UMAP. The right panel shows
+the res 0.9 cluster structure used to name terminal states (e.g. `7_1`
+= first CFLARE state dominated by cluster 7 at res 0.9).
+
+> **Direction note.** `PseudotimeKernel` directs transitions toward *higher*
+> pseudotime values. CytoTRACE2 is high = stem-like, so terminal states
+> correspond to the most primitive progenitor attractors — not committed
+> endpoints. To model forward differentiation, invert:
+> `cytotrace2_pseudotime = 1 − cytotrace2_score`.
+
+---
+
+## 2  Kernel projection — directed transitions
+
+```{r kernel-projection, fig.cap="Transition probability arrows projected onto UMAP. Arrow direction reflects the inferred differentiation flow derived from CytoTRACE2 pseudotime.", out.width="90%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "kernel_projection.png"))
+```
+
+**Interpretation.** Each arrow summarises the net expected displacement of a
+cell under the transition matrix.
+
+- **PseudotimeKernel (80%)** — biases transitions towards cells with higher
+  CytoTRACE2 score (i.e., towards more stem-like states under uninverted score).
+- **ConnectivityKernel (20%)** — local neighbourhood smoothing, preventing
+  sharp directional discontinuities.
+
+Coherent arrow streams indicate genuine directional flow; disordered arrows
+in a region suggest either progenitor plasticity or ambiguous pseudotime
+ordering there.
+
+---
+
+## 3  CFLARE eigenspectrum
+
+```{r cflare-spectrum, fig.cap="Real part of the leading eigenvalues of the transition matrix. The eigenvalue gap indicates the number of quasi-stable macrostates.", out.width="70%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "cflare_spectrum.png"))
+```
+
+**Interpretation.** Eigenvalues near 1 correspond to absorbing or
+near-absorbing states — populations where trajectories tend to end. CFLARE
+(`k = 6` eigenvectors, 14 predicted states) is used instead of GPCCA because
+the dense Schur decomposition at 50k cells requires ~23 GB. The spectrum can
+be used to revisit the `k` choice: a visible gap after the retained eigenvalues
+validates it.
+
+---
+
+## 4  Terminal states
+
+```{r terminal-states, fig.cap="CFLARE terminal states on UMAP. 14 macrostates identified; names encode dominant res-0.9 cluster label.", out.width="90%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "terminal_states.png"))
+```
+
+**Interpretation.** CFLARE identified **14 terminal states** from `k = 6`
+eigenvectors. State names (e.g., `5_1`, `3_2`) encode the dominant cluster
+label at res 0.9 followed by a counter for states sharing that cluster.
+Biologically, each terminal state represents a transcriptional attractor:
+expected attractors include megakaryocyte progenitors, erythroid progenitors,
+and lymphoid/myeloid-committed populations.
+
+---
+
+## 5  Fate probabilities
+
+```{r fate-probs-umap, fig.cap="Per-cell fate probability for each of the 14 terminal states on UMAP. Probabilities sum to 1 per cell.", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "fate_probabilities.png"))
+```
+
+**Interpretation.** Cells committed to a single fate show probability ≈ 1 for
+that state. Multipotent progenitors distribute probability across several fates.
+Cross-referencing with known lineage markers (`Gata1` for erythroid,
+`Pf4`/`Vwf` for MK, `Csf1r` for myeloid) annotates each macrostate.
+
+### 5.1  Mean fate probability per cluster (res 1.5)
+
+```{r fate-per-cluster}
+fp <- read.csv(file.path(CELLRANK_TABLE_DIR, "fate_prob_per_cluster.csv"),
+               check.names = FALSE)
+colnames(fp)[1] <- "cluster"
+fp$cluster <- as.character(fp$cluster)
+
+fp_round <- fp
+fp_round[, -1] <- round(fp[, -1], 3)
+
+DT::datatable(
+  fp_round,
+  rownames = FALSE,
+  caption  = "Mean fate probability per cluster (rows) at res 1.5 for each CytoTRACE2 terminal state (columns).",
+  options  = list(scrollX = TRUE, pageLength = 15, dom = "ft")
+) |>
+  DT::formatStyle(
+    columns          = colnames(fp_round)[-1],
+    background       = DT::styleColorBar(c(0, 1), "#b8d4e8"),
+    backgroundSize   = "90% 70%",
+    backgroundRepeat = "no-repeat",
+    backgroundPosition = "center"
+  )
+```
+
+```{r fate-heatmap, fig.height=8, fig.width=12, fig.cap="Heatmap of mean fate probability per cluster at res 1.5. Rows = clusters, columns = terminal states."}
+mat <- as.matrix(fp[, -1])
+rownames(mat) <- fp$cluster
+mat_scaled <- apply(mat, 2, function(x) (x - min(x)) / (max(x) - min(x) + 1e-9))
+
+pheatmap(
+  mat_scaled,
+  color           = colorRampPalette(c("white", "#2166ac"))(100),
+  cluster_rows    = TRUE,
+  cluster_cols    = TRUE,
+  display_numbers = round(mat, 2),
+  number_color    = "black",
+  fontsize_number = 5,
+  fontsize_row    = 8,
+  fontsize_col    = 8,
+  angle_col       = 45,
+  main            = "Mean fate probability per cluster — res 1.5 (CytoTRACE2)\n(colour = column-scaled; numbers = raw probability)"
+)
+```
+
+### 5.2  Fate probabilities by condition
+
+```{r fate-by-condition, fig.cap="Fate probability distributions per terminal state split by sample. Shifts between WT, Het mCh−, and Het mCh+ indicate condition-specific lineage biases.", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "fate_by_condition.png"))
+```
+
+---
+
+## 6  Lineage driver genes
+
+```{r lineage-drivers, results="asis"}
+driver_dir  <- file.path(CELLRANK_FIG_DIR, "lineage_drivers")
+driver_pngs <- sort(list.files(driver_dir, pattern = "\\.png$", full.names = TRUE))
+
+for (png in driver_pngs) {
+  ts_name <- tools::file_path_sans_ext(basename(png))
+  cat(sprintf("\n### Terminal state: %s\n\n", ts_name))
+  cat(sprintf('<img src="%s" style="width:90%%;display:block;margin:auto;">\n\n',
+              xfun::base64_uri(png)))
+}
+```
+
+**Interpretation.** Driver genes have the highest correlation between
+expression level and the probability of reaching a given terminal state.
+
+| Marker | Lineage |
+|--------|---------|
+| `Gata1`, `Klf1` | Erythroid |
+| `Pf4`, `Vwf`, `Mpl` | Megakaryocyte |
+| `Mpo`, `Csf1r` | Myeloid / monocyte |
+| `Cd34`, `Kit`, `Slamf1` | Progenitor |
+
+---
+
+## 7  Gene expression trends along pseudotime
+
+```{r gene-trends, fig.cap="GAM-smoothed expression of canonical HSC and lineage marker genes along CytoTRACE2 pseudotime, per terminal state.", out.width="100%", fig.height=14}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "gene_trends.png"))
+```
+
+**Interpretation.** Each panel shows how expression changes as cells progress
+along the pseudotime axis towards each terminal fate. Divergent trends between
+terminal states confirm that CellRank has resolved distinct lineage trajectories.
+
+---
+
+## 8  Cluster-level transition matrix (res 1.5)
+
+The cluster × cluster transition matrix $T^{cl}$ is aggregated from the
+full-resolution sparse Markov matrix and row-normalised. Entry $T^{cl}_{ij}$
+is the expected fraction of outgoing flux from cluster $i$ that reaches cluster
+$j$ in one step. Values computed at **res 1.5** (33 clusters).
+
+```{r cl-trans-table}
+cl_trans <- read.csv(file.path(CELLRANK_TABLE_DIR, "cluster_transition_matrix.csv"),
+                     check.names = FALSE, row.names = 1)
+
+DT::datatable(
+  round(cl_trans, 3),
+  caption = "Cluster × cluster one-step Markov transition probabilities — res 1.5 (rows sum to 1). CytoTRACE2 kernel.",
+  options = list(scrollX = TRUE, pageLength = 15, dom = "ft")
+) |>
+  DT::formatStyle(
+    columns          = colnames(cl_trans),
+    background       = DT::styleColorBar(c(0, 1), "#fed976"),
+    backgroundSize   = "90% 70%",
+    backgroundRepeat = "no-repeat",
+    backgroundPosition = "center"
+  )
+```
+
+```{r cl-trans-heatmap, fig.height=10, fig.width=10, fig.cap="Cluster transition probability heatmap — res 1.5 (CytoTRACE2). High diagonal = terminal/slow clusters; high off-diagonal = directed flux."}
+mat_plot <- as.matrix(cl_trans)
+cl_order <- tryCatch(
+  as.character(sort(as.numeric(rownames(mat_plot)))),
+  error = function(e) rownames(mat_plot)
+)
+mat_plot <- mat_plot[cl_order, cl_order]
+
+breaks <- c(seq(0, 0.1, length.out = 90), seq(0.1, 1.0, length.out = 11))
+breaks <- sort(unique(breaks))
+
+pheatmap(
+  mat_plot,
+  color           = colorRampPalette(c("#f7f7f7", "#fed976", "#b10026"))(length(breaks) - 1),
+  breaks          = breaks,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  display_numbers = round(mat_plot, 2),
+  number_color    = "black",
+  fontsize_number = 4,
+  fontsize_row    = 8,
+  fontsize_col    = 8,
+  angle_col       = 45,
+  main            = "CellRank cluster transition probabilities — res 1.5 (CytoTRACE2)\nRows sum to 1"
+)
+```
+
+---
+
+## 9  Cluster 1 fate analysis
+
+Cluster 1 (at res 1.5) is examined as a potential intermediate or progenitor
+state. This section (a) profiles the fate probability distribution for cluster 1
+cells, (b) identifies clusters that send the greatest Markov flux *into* cluster
+1 (candidate clusters of origin), and (c) compares fate profiles of candidate
+origin clusters with cluster 1.
+
+### 9.1  Fate probability profile of cluster 1
+
+```{r c1-fate-profile, fig.height=5, fig.width=9, fig.cap="Mean fate probability for cluster 1 cells across all 14 CytoTRACE2 terminal states."}
+fp1 <- fp |>
+  filter(cluster == TARGET_CLUSTER) |>
+  select(-cluster) |>
+  pivot_longer(everything(), names_to = "terminal_state", values_to = "mean_prob") |>
+  arrange(desc(mean_prob))
+
+ggplot(fp1, aes(x = reorder(terminal_state, -mean_prob), y = mean_prob)) +
+  geom_col(fill = "#2166ac", colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(mean_prob, 3)), vjust = -0.4, size = 3) +
+  labs(
+    title    = paste0("Cluster ", TARGET_CLUSTER, " — Mean fate probability (CytoTRACE2)"),
+    x        = "Terminal state",
+    y        = "Mean fate probability",
+    caption  = "Cluster resolution: sNN_pca.SCT_30_res.1.5"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r c1-fate-table}
+DT::datatable(
+  fp1 |> mutate(mean_prob = round(mean_prob, 4)),
+  rownames = FALSE,
+  caption  = paste0("Cluster ", TARGET_CLUSTER, " fate probabilities, ranked by mean probability."),
+  options  = list(pageLength = 20, dom = "t")
+)
+```
+
+### 9.2  Candidate clusters of origin
+
+Clusters that send the most Markov flux into cluster 1 are the most likely
+progenitor sources. The column of the transition matrix for cluster 1
+($T^{cl}_{i,1}$) gives the per-step probability of transitioning from cluster
+$i$ to cluster 1.
+
+```{r c1-origin-candidates, fig.height=5, fig.width=9, fig.cap="Inbound Markov flux into cluster 1 from all other clusters. Bars ranked by transition probability."}
+cl_trans_sorted <- cl_trans[
+  tryCatch(as.character(sort(as.numeric(rownames(cl_trans)))), error = function(e) rownames(cl_trans)),
+  , drop = FALSE
+]
+
+inbound <- data.frame(
+  source_cluster = rownames(cl_trans_sorted),
+  prob_to_c1     = cl_trans_sorted[, TARGET_CLUSTER]
+) |>
+  filter(source_cluster != TARGET_CLUSTER) |>
+  arrange(desc(prob_to_c1))
+
+TOP_N <- 10
+top_origins <- inbound |> slice_head(n = TOP_N)
+
+ggplot(top_origins,
+       aes(x = reorder(source_cluster, -prob_to_c1), y = prob_to_c1)) +
+  geom_col(fill = "#d6604d", colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(prob_to_c1, 3)), vjust = -0.4, size = 3) +
+  labs(
+    title   = paste0("Top ", TOP_N, " candidate origin clusters for cluster ", TARGET_CLUSTER,
+                     " (CytoTRACE2)"),
+    x       = "Source cluster",
+    y       = paste0("P(source → cluster ", TARGET_CLUSTER, ") per Markov step"),
+    caption = "Cluster resolution: sNN_pca.SCT_30_res.1.5"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r c1-origin-table}
+DT::datatable(
+  inbound |> mutate(prob_to_c1 = round(prob_to_c1, 4)),
+  rownames = FALSE,
+  caption  = paste0("All clusters ranked by Markov flux into cluster ", TARGET_CLUSTER, "."),
+  options  = list(pageLength = 15, dom = "ft")
+)
+```
+
+### 9.3  Fate comparison: origin clusters vs cluster 1
+
+Rows below compare the mean fate probability profile of cluster 1 against
+the top origin clusters identified above, revealing whether the origin
+populations share or diverge from cluster 1's fate landscape.
+
+```{r c1-fate-comparison, fig.height=7, fig.width=12, fig.cap="Mean fate probability heatmap for cluster 1 and its top candidate origin clusters. Colour = column-scaled probability; numbers = raw values."}
+origin_clusters <- top_origins$source_cluster[seq_len(min(8, nrow(top_origins)))]
+show_clusters   <- c(origin_clusters, TARGET_CLUSTER)
+
+fp_subset <- fp |>
+  filter(cluster %in% show_clusters) |>
+  mutate(cluster = factor(cluster, levels = show_clusters))
+
+mat_sub <- as.matrix(fp_subset[, -1])
+rownames(mat_sub) <- fp_subset$cluster
+
+mat_sub_scaled <- apply(mat_sub, 2, function(x) (x - min(x)) / (max(x) - min(x) + 1e-9))
+
+# Highlight cluster 1 row
+row_ann <- data.frame(
+  type = ifelse(rownames(mat_sub) == TARGET_CLUSTER, "Target (cluster 1)", "Origin candidate"),
+  row.names = rownames(mat_sub)
+)
+ann_colors <- list(type = c("Target (cluster 1)" = "#d6604d", "Origin candidate" = "#92c5de"))
+
+pheatmap(
+  mat_sub_scaled,
+  color            = colorRampPalette(c("white", "#2166ac"))(100),
+  cluster_rows     = FALSE,
+  cluster_cols     = TRUE,
+  annotation_row   = row_ann,
+  annotation_colors = ann_colors,
+  display_numbers  = round(mat_sub, 3),
+  number_color     = "black",
+  fontsize_number  = 6,
+  fontsize_row     = 10,
+  fontsize_col     = 9,
+  angle_col        = 45,
+  main             = paste0("Fate profiles: cluster ", TARGET_CLUSTER,
+                            " vs candidate origin clusters (CytoTRACE2)\n",
+                            "(colour = column-scaled; numbers = raw probability)")
+)
+```
+
+---
+
+## Methods
+
+### How CellRank works
+
+CellRank frames trajectory inference as a **finite, absorbing Markov chain**.
+The transition matrix $T$ encodes the probability of moving from cell $i$ to
+cell $j$ in one step, constructed from:
+
+**`PseudotimeKernel`** — assigns transition weights using a sigmoid:
+
+$$w_{ij} = \sigma\!\left(\nu \cdot \frac{t_j - t_i}{\text{std}(t)}\right)$$
+
+where $t$ is the pseudotime variable. High-$t$ neighbours are favoured;
+low-$t$ neighbours are penalised.
+
+**`ConnectivityKernel`** — symmetrised $k$-NN graph; adds smoothing only
+(undirected). Combined at 80:20 ratio.
+
+**CFLARE** identifies terminal states from the top $k$ eigenvectors of $T$
+(eigenvalues near 1 = near-absorbing states). Fate probabilities are solved
+from the linear system $(I - Q)\Pi = R$ per terminal state using GMRES + ILU.
+
+### CytoTRACE2 as pseudotime
+
+CytoTRACE2 scores cells on transcriptional complexity. It is a *potency* score,
+not a *trajectory* score — it has no knowledge of the specific differentiation
+graph. In the current run, higher CytoTRACE2 = higher pseudotime, so terminal
+states correspond to the most primitive progenitor attractors. Inverting
+(`1 − score`) would produce forward-differentiation terminal states.
+
+### Cluster transition matrix (res 1.5)
+
+The cluster-level matrix $T^{cl}_{ij}$ is derived by row-normalised aggregation
+over the full-resolution cell-level sparse matrix:
+
+$$T^{cl}_{ij} = \frac{1}{n_i} \sum_{a \in C_i} \sum_{b \in C_j} T_{ab}$$
+
+Computed at res 1.5 (33 clusters) from the stored `transition_matrix.npz`.
+
+{{< include ../_session-info.qmd >}}

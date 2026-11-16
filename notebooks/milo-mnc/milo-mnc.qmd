@@ -1,0 +1,449 @@
+---
+title: "Milo — Differential Abundance (MNC)"
+author:
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+# Introduction
+
+Milo tests differential abundance (DA) by fitting a negative-binomial GLM on cell counts within KNN neighbourhoods across conditions. Neighbourhoods enriched or depleted in Het mCh+ or Het mCh− cells relative to WT are identified at a spatial FDR threshold. All three contrasts share a single KNN graph built on all MNC cells, so neighbourhood indices are directly comparable across comparisons.
+
+```{r setup}
+library(Seurat)
+library(miloR)
+library(SingleCellExperiment)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(DT)
+library(htmltools)
+library(dplyr)
+library(tidyr)
+library(targets)
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r helpers}
+plot_milo_contrasts_single <- function(res, fdr = 0.1) {
+  da        <- res$da_results
+  clust_var <- res$cluster_col
+
+  clust_order <- da %>%
+    dplyr::group_by(.data[[clust_var]]) %>%
+    dplyr::summarise(med_lfc = median(logFC, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(med_lfc) %>%
+    dplyr::pull(.data[[clust_var]])
+  da[[clust_var]] <- factor(da[[clust_var]], levels = clust_order)
+
+  plotDAbeeswarm(da, group.by = clust_var, alpha = 0.5) +
+    ggplot2::scale_color_gradient2(
+      low  = scales::muted("blue"),
+      mid  = "white",
+      high = scales::muted("red")) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    labs(title = paste(res$model_contrast, "— beeswarm"),
+         x = "Cluster", y = "log2 FC") +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+da_table <- function(res, caption = "") {
+  clust_var <- res$cluster_col
+  if (is.null(clust_var) || is.na(clust_var))
+    clust_var <- grep("^sNN_", colnames(res$da_results), value = TRUE)[1]
+
+  res$da_results %>%
+    dplyr::arrange(SpatialFDR) %>%
+    dplyr::select(Nhood, all_of(clust_var), logFC, PValue, SpatialFDR) %>%
+    dplyr::rename(Cluster = all_of(clust_var)) %>%
+    dplyr::mutate(across(where(is.numeric), \(x) round(x, 4))) %>%
+    DT::datatable(caption = caption, rownames = FALSE,
+                  options = list(pageLength = 15, scrollX = TRUE)) %>%
+    DT::formatStyle("SpatialFDR",
+                    backgroundColor = DT::styleInterval(0.1, c("#fff0f0", "white")))
+}
+
+lfc_nhood_scatter <- function(da_neg, da_pos, clust_col, title = "",
+                              lim = 10, subset_clusts = NULL) {
+  df <- data.frame(
+    mch_neg = da_neg$logFC,
+    mch_pos = da_pos$logFC,
+    clust   = da_neg[[clust_col]]
+  )
+  if (!is.null(subset_clusts)) df <- dplyr::filter(df, clust %in% subset_clusts)
+
+  ggplot(df) +
+    geom_abline(slope = 1, intercept = 0, colour = "black", linewidth = 0.5, lty = 2) +
+    geom_hline(yintercept = 0, colour = "black", linewidth = 0.5, lty = 2) +
+    geom_vline(xintercept = 0, colour = "black", linewidth = 0.5, lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg, mch_pos), size = 1.2) +
+    scale_color_viridis_c(name = "Cell density") +
+    scale_x_continuous(name = "mChNeg vs WT  (Milo log FC)", limits = c(-lim, lim)) +
+    scale_y_continuous(name = "mChPos vs WT  (Milo log FC)", limits = c(-lim, lim)) +
+    labs(title = title) +
+    coord_fixed() +
+    theme_bw(base_size = 11)
+}
+```
+
+------------------------------------------------------------------------
+
+# Data preview {#sec-data-preview}
+
+UMAP of the MNC object with cluster labels (res 0.9) and per-condition split.
+
+```{r preview-load}
+targets::tar_load(mpn_processed_mnc)
+clust_col_preview <- grep("sNN_pca.*_res\\.0\\.9$",
+                          colnames(mpn_processed_mnc@meta.data), value = TRUE)[1]
+```
+
+```{r preview-umap-clusters, fig.height=6, fig.width=14}
+p_cl <- DimPlot(mpn_processed_mnc, group.by = clust_col_preview,
+                reduction = "umap.nn", label = TRUE, label.size = 7) +
+  NoLegend() + labs(title = "MNC clusters (res 0.9)")
+
+p_cond <- DimPlot(mpn_processed_mnc, group.by = "sample.name",
+                  reduction = "umap.nn") +
+  labs(title = "MNC — condition")
+
+p_cl | p_cond
+```
+
+```{r preview-umap-split, fig.height=6, fig.width=18}
+DimPlot(mpn_processed_mnc, group.by = clust_col_preview,
+        reduction = "umap.nn", split.by = "sample.name",
+        label = TRUE, label.size = 7) +
+  NoLegend() + labs(title = "MNC clusters split by condition")
+```
+
+Replicate structure: rows are HTO pseudo-replicates (`dm2_class`), columns are conditions (`sample.name`). This shows whether each pseudo-replicate within a condition covers the same cell-state landscape.
+
+```{r preview-umap-dm2-facet, fig.height=10, fig.width=15}
+umap_df <- cbind(
+  Embeddings(mpn_processed_mnc, "umap.nn"),
+  mpn_processed_mnc@meta.data[, c("dm2_class", "sample.name", clust_col_preview)]
+) |> as.data.frame()
+colnames(umap_df)[1:2] <- c("UMAP1", "UMAP2")
+umap_df$dm2_class   <- factor(umap_df$dm2_class)
+umap_df$sample.name <- factor(umap_df$sample.name)
+
+ggplot(umap_df, aes(UMAP1, UMAP2, colour = .data[[clust_col_preview]])) +
+  geom_point(size = 0.2, alpha = 0.4) +
+  facet_grid(dm2_class ~ sample.name) +
+  labs(x = NULL, y = NULL, colour = "Cluster") +
+  theme_bw(base_size = 11) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 9)) +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1), nrow = 4))
+```
+
+```{r preview-cleanup}
+rm(mpn_processed_mnc); invisible(gc(verbose = FALSE))
+```
+
+------------------------------------------------------------------------
+
+# Milo differential abundance {#sec-milo-da}
+
+Differential abundance of MNC cell neighbourhoods between genotype groups. All contrasts share a single KNN graph (`milo_mnc_obj`), so neighbourhood indices are directly comparable. logFC \> 0 means enriched in the mutant condition.
+
+```{r mnc-milo-load}
+targets::tar_load(names = c(milo_mnc_da, milo_mnc_obj))
+```
+
+## Beeswarm plots
+
+::: panel-tabset
+### mChNeg vs WT
+
+```{r mnc-milo-beeswarm-neg, fig.height=7, fig.width=10}
+plot_milo_contrasts_single(milo_mnc_da$mChNeg_vs_WT)
+```
+
+### mChPos vs WT
+
+```{r mnc-milo-beeswarm-pos, fig.height=7, fig.width=10}
+plot_milo_contrasts_single(milo_mnc_da$mChPos_vs_WT)
+```
+
+### mChPos vs mChNeg
+
+```{r mnc-milo-beeswarm-pos-neg, fig.height=7, fig.width=10}
+plot_milo_contrasts_single(milo_mnc_da$mChPos_vs_mChNeg)
+```
+:::
+
+## Neighbourhood graphs
+
+::: panel-tabset
+### Het mCh− vs WT
+
+```{r mnc-nhood-graph-neg, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_mnc_obj, milo_mnc_da$mChNeg_vs_WT$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+  labs(title = milo_mnc_da$mChNeg_vs_WT$model_contrast, fill = "log2FC") +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-10, 10))
+```
+
+### Het mCh+ vs WT
+
+```{r mnc-nhood-graph-pos, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_mnc_obj, milo_mnc_da$mChPos_vs_WT$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+  labs(title = milo_mnc_da$mChPos_vs_WT$model_contrast, fill = "log2FC") +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-10, 10))
+```
+
+### Het mCh+ vs mCh−
+
+```{r mnc-nhood-graph-pos-neg, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_mnc_obj, milo_mnc_da$mChPos_vs_mChNeg$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+  labs(title = milo_mnc_da$mChPos_vs_mChNeg$model_contrast, fill = "log2FC") +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-10, 10))
+```
+:::
+
+## Neighbourhood LFC scatter
+
+Shared KNN graph → neighbourhood indices are identical across contrasts. Each point is one neighbourhood; colour = local density.
+
+::: panel-tabset
+### All neighbourhoods
+
+```{r mnc-nhood-lfc-scatter-all, fig.height=5, fig.width=6}
+clust_col <- milo_mnc_da$mChNeg_vs_WT$cluster_col
+lfc_nhood_scatter(
+  milo_mnc_da$mChNeg_vs_WT$da_results,
+  milo_mnc_da$mChPos_vs_WT$da_results,
+  clust_col = clust_col,
+  title = "All neighbourhoods"
+)
+```
+
+### By individual cluster
+
+```{r mnc-nhood-lfc-scatter-by-indiv, fig.height=40, fig.width=14}
+all_clusts <- sort(unique(as.character(
+  milo_mnc_da$mChNeg_vs_WT$da_results[[clust_col]])))
+purrr::map(all_clusts, function(cl) {
+  lfc_nhood_scatter(
+    milo_mnc_da$mChNeg_vs_WT$da_results,
+    milo_mnc_da$mChPos_vs_WT$da_results,
+    clust_col     = clust_col,
+    subset_clusts = cl,
+    title         = paste("Cluster", cl)
+  )
+}) |> patchwork::wrap_plots(ncol = 3)
+```
+:::
+
+## Volcano
+
+Per-neighbourhood volcano plot (logFC vs −log₁₀ spatial FDR).
+
+::: panel-tabset
+### mChNeg vs WT
+
+```{r mnc-milo-volcano-neg, fig.height=5, fig.width=6}
+da_vol <- milo_mnc_da$mChNeg_vs_WT$da_results %>%
+  dplyr::mutate(
+    sig  = SpatialFDR < 0.1,
+    dir  = dplyr::case_when(
+             sig & logFC > 0 ~ "Enriched in mChNeg",
+             sig & logFC < 0 ~ "Depleted in mChNeg",
+             TRUE            ~ "n.s."),
+    neg_log_fdr = -log10(SpatialFDR)
+  )
+ggplot(da_vol, aes(logFC, neg_log_fdr, colour = dir)) +
+  geom_point(size = 1.4, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(
+    values = c("Enriched in mChNeg" = "#B2182B",
+               "Depleted in mChNeg" = "#2166AC",
+               "n.s."              = "grey70"),
+    name = "") +
+  labs(x = "log2 FC (mChNeg vs WT)",
+       y = expression(-log[10](spatial~FDR)),
+       title = "MNC Milo — mChNeg vs WT") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+### mChPos vs WT
+
+```{r mnc-milo-volcano-pos, fig.height=5, fig.width=6}
+da_vol <- milo_mnc_da$mChPos_vs_WT$da_results %>%
+  dplyr::mutate(
+    sig  = SpatialFDR < 0.1,
+    dir  = dplyr::case_when(
+             sig & logFC > 0 ~ "Enriched in mChPos",
+             sig & logFC < 0 ~ "Depleted in mChPos",
+             TRUE            ~ "n.s."),
+    neg_log_fdr = -log10(SpatialFDR)
+  )
+ggplot(da_vol, aes(logFC, neg_log_fdr, colour = dir)) +
+  geom_point(size = 1.4, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(
+    values = c("Enriched in mChPos" = "#B2182B",
+               "Depleted in mChPos" = "#2166AC",
+               "n.s."              = "grey70"),
+    name = "") +
+  labs(x = "log2 FC (mChPos vs WT)",
+       y = expression(-log[10](spatial~FDR)),
+       title = "MNC Milo — mChPos vs WT") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+### mChPos vs mChNeg
+
+```{r mnc-milo-volcano-pos-neg, fig.height=5, fig.width=6}
+da_vol <- milo_mnc_da$mChPos_vs_mChNeg$da_results %>%
+  dplyr::mutate(
+    sig  = SpatialFDR < 0.1,
+    dir  = dplyr::case_when(
+             sig & logFC > 0 ~ "Enriched in mChPos",
+             sig & logFC < 0 ~ "Depleted in mChPos",
+             TRUE            ~ "n.s."),
+    neg_log_fdr = -log10(SpatialFDR)
+  )
+ggplot(da_vol, aes(logFC, neg_log_fdr, colour = dir)) +
+  geom_point(size = 1.4, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(
+    values = c("Enriched in mChPos" = "#B2182B",
+               "Depleted in mChPos" = "#2166AC",
+               "n.s."              = "grey70"),
+    name = "") +
+  labs(x = "log2 FC (mChPos vs mChNeg)",
+       y = expression(-log[10](spatial~FDR)),
+       title = "MNC Milo — mChPos vs mChNeg") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top")
+```
+:::
+
+```{r mnc-cleanup}
+rm(milo_mnc_da, milo_mnc_obj)
+invisible(gc(verbose = FALSE))
+```
+
+------------------------------------------------------------------------
+
+# Limitations
+
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+
+------------------------------------------------------------------------
+
+# Extra
+
+## Neighbourhood grouping {#sec-nhood-groups}
+
+Significant DA neighbourhoods grouped by overlap (`groupNhoods`).
+
+```{r mnc-nhood-groups-load}
+targets::tar_load(names = c(milo_mnc_da, milo_mnc_obj))
+```
+
+```{r mnc-nhood-groups}
+da_fdr <- 0.1
+da_pos_groups <- miloR::groupNhoods(milo_mnc_obj,
+                                    milo_mnc_da$mChPos_vs_WT$da_results,
+                                    compute.new = FALSE,
+                                    da.fdr = da_fdr)
+da_neg_groups <- miloR::groupNhoods(milo_mnc_obj,
+                                    milo_mnc_da$mChNeg_vs_WT$da_results,
+                                    compute.new = FALSE,
+                                    da.fdr = da_fdr)
+```
+
+```{r mnc-nhood-groups-plot, fig.height=5, fig.width=12}
+plt_pos <- plot_nhood_graph_groups(milo_mnc_obj, da_pos_groups,
+                                   colour_by = "NhoodGroup", layout = "umap.nn") +
+  ggtitle("mChPos vs WT")
+plt_neg <- plot_nhood_graph_groups(milo_mnc_obj, da_neg_groups,
+                                   colour_by = "NhoodGroup", layout = "umap.nn") +
+  ggtitle("mChNeg vs WT")
+plt_pos | plt_neg
+```
+
+```{r mnc-nhood-groups-umap, fig.height=5, fig.width=6}
+targets::tar_load(mpn_processed_mnc)
+
+nhood_mat   <- miloR::nhoods(milo_mnc_obj)
+grp_vec     <- setNames(da_pos_groups$NhoodGroup, as.character(da_pos_groups$Nhood))
+grp_aligned <- as.numeric(grp_vec[as.character(seq_len(ncol(nhood_mat)))])
+grp_mat     <- model.matrix(~ factor(grp_aligned) - 1)
+colnames(grp_mat) <- levels(factor(grp_aligned))
+cell_grp_mat <- nhood_mat %*% grp_mat
+cell_grp_vec <- apply(cell_grp_mat, 1, which.max)
+
+mpn_processed_mnc$milo_ngb_grps <- cell_grp_vec
+DimPlot(mpn_processed_mnc, group.by = "milo_ngb_grps",
+        label = TRUE, reduction = "umap.nn") &
+  NoLegend() &
+  labs(title = "mChPos DA groups on cell UMAP")
+```
+
+```{r mnc-extra-cleanup}
+rm(milo_mnc_da, milo_mnc_obj, mpn_processed_mnc, da_pos_groups, da_neg_groups)
+invisible(gc(verbose = FALSE))
+```
+
+{{< include ../_session-info.qmd >}}

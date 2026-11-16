@@ -1,0 +1,837 @@
+---
+title: "HSC Trajectory Inference — Slingshot (mCh+)"
+format:
+  html:
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(slingshot)
+library(igraph)
+library(ggraph)
+library(graphlayouts)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(ggrepel)
+library(viridis)
+library(ggridges)
+
+
+theme_set(theme_cowplot(font_size = 11))
+
+cond_pal   <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+cond_order <- c("WT", "mCh-", "mCh+")
+
+label_condition <- function(x) {
+  dplyr::case_when(
+    grepl("WT",      x) ~ "WT",
+    grepl("mCh-",   x) ~ "mCh-",
+    grepl("mCh\\+", x) ~ "mCh+",
+    TRUE                ~ x
+  )
+}
+```
+
+# Overview
+
+Trajectory inference for **mCh+ Het** HSC cells using **Slingshot** (Street et al. 2018).
+Cluster labels are transferred from the full-cohort clustering
+(`sNN_pca.SCT_30_res.0.9` on `mpn_processed_hsc_fullcc`).
+
+| Step | Method |
+|---|---|
+| Graph backbone | MST on cluster centroids in PCA space |
+| Curve fitting | Simultaneous principal curves per lineage |
+| Pseudotime | Arc length along each fitted curve |
+| Visualisation | UMAP coloured by pseudotime; per-cluster distributions |
+
+---
+
+# 1  Load data
+
+```{r config}
+# ── Trajectory parameters — edit this chunk only ──────────────────────────────
+CLUS_COL        <- "sNN_pca.SCT_30_res.0.9"  # cluster column (full-cohort)
+N_PCA_DIMS      <- 15L
+PCA_NAME        <- "pca.SCT"
+
+EXCLUDE_CLUSTER <- c("16", "17", "20")
+START_CLUSTER   <- "5"
+END_CLUSTER     <- c("7", "4", "8", "6", "15", "0", "14", "13")
+```
+
+```{r load}
+mpn_processed_hsc <- targets::tar_read(mpn_processed_hsc_mchpos_fullcc)
+mpn_full          <- targets::tar_read(mpn_processed_hsc_fullcc)
+clus_meta         <- mpn_full@meta.data[, CLUS_COL, drop = FALSE]
+# Full-cohort UMAP for condition cells — extracted before rm() for second overlay
+umap_full_raw  <- as.data.frame(
+  mpn_full@reductions$umap@cell.embeddings[colnames(mpn_processed_hsc), ])
+umap_cols_full <- colnames(umap_full_raw)
+rm(mpn_full); invisible(gc())
+# Transfer full-cohort cluster labels; AddMetaData matches by cell barcode
+mpn_processed_hsc <- Seurat::AddMetaData(mpn_processed_hsc, clus_meta)
+
+# ── Cell and cluster vectors ───────────────────────────────────────────────────
+clus_all <- as.character(mpn_processed_hsc@meta.data[[CLUS_COL]])
+names(clus_all) <- colnames(mpn_processed_hsc)
+
+sling_cells <- names(clus_all)[!clus_all %in% EXCLUDE_CLUSTER]
+clus        <- clus_all[sling_cells]
+n_cl        <- length(unique(clus))
+
+cat("Total cells:", length(clus_all), "\n")
+cat("Excluded clusters:", if (length(EXCLUDE_CLUSTER)) paste(EXCLUDE_CLUSTER, collapse = ", ") else "none", "\n")
+cat("Cells for inference:", length(sling_cells), "in", n_cl, "clusters\n")
+
+# ── Embeddings (pre-filtered to sling_cells) ───────────────────────────────────
+pca_emb <- Seurat::Embeddings(mpn_processed_hsc, PCA_NAME)[sling_cells, seq_len(N_PCA_DIMS)] |>
+  as.data.frame()
+
+umap_emb  <- as.data.frame(mpn_processed_hsc@reductions$umap@cell.embeddings)[sling_cells, ]
+umap_cols <- colnames(umap_emb)
+
+umap_df <- umap_emb |>
+  dplyr::rename(umap1 = 1, umap2 = 2) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::mutate(
+    cluster   = clus,
+    condition = label_condition(mpn_processed_hsc$sample.name[sling_cells])
+  )
+
+centroids <- umap_df |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarise(x = median(umap1), y = median(umap2), .groups = "drop") |>
+  tibble::column_to_rownames("cluster")
+
+# ── Full-cohort embedding coords (all condition cells; centroids from sling_cells only) ──
+umap_df_full <- umap_full_raw |>
+  dplyr::rename(umap1 = 1, umap2 = 2) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::mutate(
+    cluster   = clus_all[cell_id],
+    condition = label_condition(mpn_processed_hsc$sample.name[cell_id])
+  )
+
+centroids_full <- umap_df_full |>
+  dplyr::filter(cell_id %in% sling_cells) |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarise(x = median(umap1), y = median(umap2), .groups = "drop") |>
+  tibble::column_to_rownames("cluster")
+```
+
+---
+
+# 2  Run Slingshot
+
+```{r slingshot-run}
+set.seed(42)
+sling_obj <- slingshot::slingshot(
+  data          = pca_emb,
+  clusterLabels = clus,
+  #start.clus    = START_CLUSTER,
+  end.clus      = END_CLUSTER,
+  dist.method   = "scaled.diag",
+  extend        = "n",
+  allow.breaks  = FALSE)
+
+n_lineages <- length(slingshot::slingLineages(sling_obj))
+cat("Lineages detected:", n_lineages, "\n")
+for (i in seq_len(n_lineages)) {
+  cat("  Lineage", i, ":",
+      paste(slingshot::slingLineages(sling_obj)[[i]], collapse = " → "), "\n")
+}
+```
+
+---
+
+# 3  Extract pseudotime
+
+```{r pseudotime-extract}
+sling_cell_df <- function(sling_ctr) {
+  raw_pt <- slingshot::slingPseudotime(sling_ctr)
+
+  pseudotime_df <- apply(raw_pt, 2, function(x) {
+    x1 <- x[!is.na(x)]
+    x[!is.na(x)] <- (x1 - min(x1)) / (max(x1) - min(x1)) * 100
+    x
+  }) |>
+    as.data.frame() |>
+    dplyr::rename_with(~ paste0("pseudotime_", .)) |>
+    dplyr::mutate(
+      mean_pseudotime   = rowMeans(dplyr::pick(dplyr::everything()), na.rm = TRUE),
+      median_pseudotime = apply(dplyr::pick(dplyr::everything()), 1, median, na.rm = TRUE),
+      max_pseudotime    = apply(dplyr::pick(dplyr::everything()), 1, max,    na.rm = TRUE),
+      min_pseudotime    = apply(dplyr::pick(dplyr::everything()), 1, min,    na.rm = TRUE)
+    )
+
+  order_df <- apply(raw_pt, 2, function(x) {
+    x[!is.na(x)] <- rank(x[!is.na(x)])
+    x
+  }) |>
+    as.data.frame() |>
+    dplyr::rename_with(~ paste0("order_", .)) |>
+    dplyr::mutate(mean_order = rowMeans(dplyr::pick(dplyr::everything()), na.rm = TRUE))
+
+  dplyr::bind_cols(as.data.frame(raw_pt), pseudotime_df, order_df)
+}
+
+sling_df <- sling_cell_df(sling_obj)
+sling_df$cluster   <- clus[rownames(sling_df)]
+sling_df$condition <- label_condition(mpn_processed_hsc$sample.name[rownames(sling_df)])
+
+lineage_cols  <- grep("^pseudotime_Lineage", colnames(sling_df), value = TRUE)
+lineage_names <- sub("pseudotime_", "", lineage_cols)
+
+cat("Pseudotime columns:", paste(lineage_cols, collapse = ", "), "\n")
+cat("Cells per lineage (non-NA):\n")
+for (lc in lineage_cols) cat(" ", lc, ":", sum(!is.na(sling_df[[lc]])), "\n")
+```
+
+---
+
+# 4  MST visualisations
+
+## Tree layout (Reingold-Tilford)
+
+```{r mst-tree}
+g_mst    <- slingshot::slingMST(sling_obj)
+mst_root <- if (!is.null(START_CLUSTER)) START_CLUSTER else
+              V(g_mst)$name[which.max(igraph::betweenness(g_mst))]
+cat("MST root:", mst_root, "\n")
+
+set.seed(42)
+rt_layout           <- igraph::layout_as_tree(g_mst, root = mst_root, flip.y = TRUE)
+rownames(rt_layout) <- V(g_mst)$name
+colnames(rt_layout) <- c("x", "y")
+
+nodes_rt <- as.data.frame(rt_layout) |> tibble::rownames_to_column("cluster")
+edges_rt <- igraph::as_data_frame(g_mst, what = "edges") |>
+  dplyr::left_join(nodes_rt |> dplyr::rename(from = cluster, x_from = x, y_from = y), by = "from") |>
+  dplyr::left_join(nodes_rt |> dplyr::rename(to   = cluster, x_to   = x, y_to   = y), by = "to")
+
+ggplot() +
+  geom_segment(data = edges_rt,
+               aes(x = x_from, y = y_from, xend = x_to, yend = y_to),
+               colour = "steelblue4", linewidth = 1.2) +
+  geom_point(data = nodes_rt, aes(x, y),
+             shape = 21, fill = "steelblue4", colour = "white", size = 8, stroke = 0.8) +
+  ggrepel::geom_label_repel(data = nodes_rt, aes(x, y, label = cluster),
+                             size = 3, label.size = 0.2,
+                             fill = alpha("white", 0.8), max.overlaps = 30) +
+  labs(title = "Slingshot MST — Reingold-Tilford tree layout",
+       subtitle = paste("Root:", mst_root)) +
+  theme_void() +
+  theme(plot.title    = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 10))
+```
+
+## MST overlaid on UMAP
+
+### Condition-specific embedding
+
+```{r mst-umap}
+edges_umap <- igraph::as_data_frame(g_mst, what = "edges") |>
+  dplyr::left_join(
+    centroids |> tibble::rownames_to_column("cluster") |>
+      dplyr::rename(from = cluster, x_from = x, y_from = y), by = "from") |>
+  dplyr::left_join(
+    centroids |> tibble::rownames_to_column("cluster") |>
+      dplyr::rename(to   = cluster, x_to   = x, y_to   = y), by = "to")
+
+ggplot() +
+  geom_point(data = umap_df, aes(umap1, umap2),
+             colour = "grey88", size = 0.2, alpha = 0.4) +
+  geom_segment(data = edges_umap,
+               aes(x = x_from, y = y_from, xend = x_to, yend = y_to),
+               colour = "steelblue4", linewidth = 1.5, alpha = 0.9) +
+  geom_point(data = centroids |> tibble::rownames_to_column("cluster"),
+             aes(x, y),
+             shape = 21, fill = "steelblue4", colour = "white", size = 5, stroke = 0.8) +
+  ggrepel::geom_label_repel(
+    data = centroids |> tibble::rownames_to_column("cluster"),
+    aes(x, y, label = cluster),
+    size = 2.5, label.size = 0.2,
+    fill = alpha("white", 0.75), max.overlaps = 30) +
+  labs(x = umap_cols[1], y = umap_cols[2],
+       title = "Slingshot MST — condition-specific UMAP") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", size = 12))
+```
+
+### Full-cohort embedding
+
+```{r mst-umap-full}
+edges_umap_full <- igraph::as_data_frame(g_mst, what = "edges") |>
+  dplyr::left_join(
+    centroids_full |> tibble::rownames_to_column("cluster") |>
+      dplyr::rename(from = cluster, x_from = x, y_from = y), by = "from") |>
+  dplyr::left_join(
+    centroids_full |> tibble::rownames_to_column("cluster") |>
+      dplyr::rename(to   = cluster, x_to   = x, y_to   = y), by = "to")
+
+ggplot() +
+  geom_point(data = umap_df_full, aes(umap1, umap2),
+             colour = "grey88", size = 0.2, alpha = 0.4) +
+  geom_segment(data = edges_umap_full,
+               aes(x = x_from, y = y_from, xend = x_to, yend = y_to),
+               colour = "steelblue4", linewidth = 1.5, alpha = 0.9) +
+  geom_point(data = centroids_full |> tibble::rownames_to_column("cluster"),
+             aes(x, y),
+             shape = 21, fill = "steelblue4", colour = "white", size = 5, stroke = 0.8) +
+  ggrepel::geom_label_repel(
+    data = centroids_full |> tibble::rownames_to_column("cluster"),
+    aes(x, y, label = cluster),
+    size = 2.5, label.size = 0.2,
+    fill = alpha("white", 0.75), max.overlaps = 30) +
+  labs(x = umap_cols_full[1], y = umap_cols_full[2],
+       title = "Slingshot MST — full-cohort UMAP") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", size = 12))
+```
+
+---
+
+# 5  Pseudotime UMAPs
+
+## Mean pseudotime (all lineages)
+
+```{r pt-umap-mean, fig.width=8, fig.height=6}
+pt_umap_df <- umap_df |>
+  dplyr::left_join(
+    sling_df |>
+      tibble::rownames_to_column("cell_id") |>
+      dplyr::select(cell_id, mean_pseudotime, dplyr::all_of(lineage_cols)),
+    by = "cell_id")
+
+ggplot(pt_umap_df |> dplyr::arrange(is.na(mean_pseudotime))) +
+  geom_point(aes(umap1, umap2, colour = mean_pseudotime),
+             size = 0.4, alpha = 0.7) +
+  scale_colour_viridis_c(option = "plasma", name = "Mean\npseudotime",
+                         na.value = "grey88") +
+  labs(x = umap_cols[1], y = umap_cols[2],
+       title = "Mean pseudotime across all lineages") +
+  theme_void() +
+  theme(plot.title      = element_text(face = "bold", size = 12),
+        legend.position = "right")
+```
+
+## Per-lineage pseudotime
+
+```{r pt-umap-lineages, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 6
+plots_lin <- lapply(lineage_cols, function(lc) {
+  lname <- sub("pseudotime_", "", lc)
+  lin   <- slingshot::slingLineages(sling_obj)[[lname]]
+  ggplot(pt_umap_df |> dplyr::arrange(is.na(.data[[lc]]))) +
+    geom_point(aes(umap1, umap2), size = 0.35, alpha = 0.7, color = "grey90") +
+    geom_point(aes(umap1, umap2, colour = .data[[lc]]), size = 0.35, alpha = 0.7) +
+    scale_colour_viridis_c(option = "viridis", name = "Pseudotime", na.value = NA) +
+    labs(x = NULL, y = NULL,
+         title    = lname,
+         subtitle = paste(lin, collapse = " → ")) +
+    theme_void() +
+    theme(plot.title        = element_text(face = "bold", size = 10),
+          plot.subtitle     = element_text(size = 7, colour = "grey40"),
+          legend.key.height = unit(0.4, "cm"))
+})
+
+patchwork::wrap_plots(plots_lin, ncol = 2) +
+  patchwork::plot_annotation(
+    title = "Per-lineage pseudotime",
+    theme = theme(plot.title = element_text(face = "bold", size = 12)))
+```
+
+## Slingshot principal curves on UMAP
+
+```{r pt-curves, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 6
+curve_dfs <- lapply(seq_len(n_lineages), function(i) {
+  lc    <- lineage_cols[i]
+  lname <- sub("pseudotime_", "", lc)
+  pt_umap_df |>
+    dplyr::filter(!is.na(.data[[lc]])) |>
+    dplyr::mutate(lineage = lname, pseudotime = .data[[lc]])
+})
+
+ggplot() +
+  geom_point(data = umap_df, aes(umap1, umap2),
+             colour = "grey88", size = 0.2, alpha = 0.4) +
+  geom_point(data = dplyr::bind_rows(curve_dfs),
+             aes(umap1, umap2, colour = pseudotime),
+             size = 0.35, alpha = 0.6) +
+  geom_segment(data = edges_umap,
+               aes(x = x_from, y = y_from, xend = x_to, yend = y_to),
+               colour = "black", linewidth = 1, alpha = 0.6) +
+  scale_colour_viridis_c(option = "plasma", name = "Pseudotime") +
+  facet_wrap(~ lineage, ncol = 2) +
+  labs(x = umap_cols[1], y = umap_cols[2],
+       title = "Lineage cells coloured by pseudotime + MST backbone") +
+  theme_void() +
+  theme(plot.title      = element_text(face = "bold", size = 12),
+        strip.text      = element_text(face = "bold", size = 10),
+        legend.position = "right")
+```
+
+## PCA coloured by pseudotime
+
+```{r pt-pca-setup}
+pt_pca_df <- as.data.frame(pca_emb) |>
+  dplyr::rename(PC_1 = 1, PC_2 = 2) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::left_join(
+    sling_df |>
+      tibble::rownames_to_column("cell_id") |>
+      dplyr::select(cell_id, cluster, condition, mean_pseudotime,
+                    dplyr::all_of(lineage_cols)),
+    by = "cell_id"
+  )
+```
+
+```{r pt-pca-mean, fig.width=7, fig.height=6}
+ggplot(pt_pca_df |> dplyr::arrange(is.na(mean_pseudotime))) +
+  geom_point(aes(PC_1, PC_2, colour = mean_pseudotime),
+             size = 0.5, alpha = 0.7) +
+  scale_colour_viridis_c(option = "plasma", name = "Mean\npseudotime",
+                         na.value = "grey88") +
+  labs(x = "PC_1", y = "PC_2",
+       title = "PCA — Mean pseudotime across all lineages") +
+  theme_void() +
+  theme(plot.title      = element_text(face = "bold", size = 12),
+        legend.position = "right")
+```
+
+```{r pt-pca-lineages, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 6
+plots_pca_lin <- lapply(lineage_cols, function(lc) {
+  lname <- sub("pseudotime_", "", lc)
+  lin   <- slingshot::slingLineages(sling_obj)[[lname]]
+  ggplot(pt_pca_df |> dplyr::arrange(is.na(.data[[lc]]))) +
+    geom_point(aes(PC_1, PC_2), size = 0.35, alpha = 0.7, color = "grey90") +
+    geom_point(aes(PC_1, PC_2, colour = .data[[lc]]), size = 0.35, alpha = 0.7) +
+    scale_colour_viridis_c(option = "viridis", name = "Pseudotime", na.value = NA) +
+    labs(x = "PC_1", y = "PC_2",
+         title    = lname,
+         subtitle = paste(lin, collapse = " → ")) +
+    theme_void() +
+    theme(plot.title        = element_text(face = "bold", size = 10),
+          plot.subtitle     = element_text(size = 7, colour = "grey40"),
+          legend.key.height = unit(0.4, "cm"))
+})
+
+patchwork::wrap_plots(plots_pca_lin, ncol = 2) +
+  patchwork::plot_annotation(
+    title = "Per-lineage pseudotime in PCA space",
+    theme = theme(plot.title = element_text(face = "bold", size = 12)))
+```
+
+## Slingshot principal curves on PCA
+
+```{r pt-pca-curves, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 6
+curve_pca_dfs <- lapply(seq_len(n_lineages), function(i) {
+  lc    <- lineage_cols[i]
+  lname <- sub("pseudotime_", "", lc)
+  crv   <- slingshot::slingCurves(sling_obj)[[i]]
+  data.frame(PC_1 = crv$s[, 1], PC_2 = crv$s[, 2],
+             PC_3 = crv$s[, 3], PC_4 = crv$s[, 4],
+             PC_5 = crv$s[, 5], lineage = lname)
+})
+
+plots_pca_crv <- lapply(seq_len(n_lineages), function(i) {
+  lc     <- lineage_cols[i]
+  lname  <- sub("pseudotime_", "", lc)
+  lin    <- slingshot::slingLineages(sling_obj)[[lname]]
+  crv_df <- curve_pca_dfs[[i]]
+  ggplot() +
+    geom_point(data = pt_pca_df, aes(PC_1, PC_2),
+               colour = "grey88", size = 0.2, alpha = 0.4) +
+    geom_point(data = pt_pca_df |> dplyr::filter(!is.na(.data[[lc]])),
+               aes(PC_1, PC_2, colour = .data[[lc]]),
+               size = 0.45, alpha = 0.7) +
+    geom_path(data = crv_df, aes(PC_1, PC_2),
+              colour = "black", linewidth = 1, alpha = 0.7,
+              arrow = arrow(length = unit(0.15, "cm"), type = "closed", ends = "last")) +
+    scale_colour_viridis_c(option = "plasma", name = "Pseudotime", na.value = "grey88") +
+    labs(x = "PC_1", y = "PC_2",
+         title    = lname,
+         subtitle = paste(lin, collapse = " → ")) +
+    theme_void() +
+    theme(plot.title        = element_text(face = "bold", size = 10),
+          plot.subtitle     = element_text(size = 7, colour = "grey40"),
+          legend.key.height = unit(0.4, "cm"))
+})
+
+patchwork::wrap_plots(plots_pca_crv, ncol = 2) +
+  patchwork::plot_annotation(
+    title = "Slingshot principal curves in PCA space",
+    theme = theme(plot.title = element_text(face = "bold", size = 12)))
+```
+
+---
+
+# 6  Pseudotime distributions
+
+```{r pt-long-build}
+pt_long <- sling_df |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::select(cell_id, cluster, condition, dplyr::all_of(lineage_cols)) |>
+  tidyr::pivot_longer(dplyr::all_of(lineage_cols),
+                      names_to  = "lineage",
+                      values_to = "pseudotime") |>
+  dplyr::filter(!is.na(pseudotime)) |>
+  dplyr::mutate(lineage   = sub("pseudotime_", "", lineage),
+                cluster   = factor(cluster),
+                condition = factor(condition, levels = cond_order))
+```
+
+## Per cluster × lineage
+
+```{r pt-cluster-density, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 4
+ggplot(pt_long, aes(x = pseudotime, y = cluster, fill = cluster)) +
+  ggridges::geom_density_ridges(scale = 1.2, alpha = 0.7,
+                                 linewidth = 0.3, colour = "white",
+                                 rel_min_height = 0.01) +
+  scale_fill_manual(values = scales::hue_pal()(n_cl), guide = "none") +
+  scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) +
+  facet_wrap(~ lineage, ncol = 2) +
+  labs(x = "Pseudotime (0–100)", y = "Cluster",
+       title = "Cell density along pseudotime — per cluster") +
+  theme(strip.text    = element_text(face = "bold"),
+        panel.spacing = unit(1, "lines"),
+        axis.text.y   = element_text(size = 7))
+```
+
+## Per condition (genotype)
+
+```{r pt-condition-density, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 3
+ggplot(pt_long, aes(x = pseudotime, y = condition, fill = condition)) +
+  ggridges::geom_density_ridges(scale = 1.1, alpha = 0.75,
+                                 linewidth = 0.3, colour = "white",
+                                 rel_min_height = 0.01) +
+  scale_fill_manual(values = cond_pal, guide = "none") +
+  scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) +
+  scale_y_discrete(limits = rev(cond_order)) +
+  facet_wrap(~ lineage, ncol = 2) +
+  labs(x = "Pseudotime (0–100)", y = NULL,
+       title = "Cell density along pseudotime — per condition") +
+  theme(strip.text    = element_text(face = "bold"),
+        panel.spacing = unit(1, "lines"))
+```
+
+## Overlay — frequency polygons on a common axis
+
+```{r pt-cluster-freqpoly, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 3
+ggplot(pt_long, aes(x = pseudotime, colour = cluster)) +
+  geom_freqpoly(aes(y = after_stat(density)),
+                binwidth = 5, linewidth = 0.55, alpha = 0.85) +
+  scale_colour_manual(values = scales::hue_pal()(n_cl), name = "Cluster") +
+  scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) +
+  facet_wrap(~ lineage, ncol = 2) +
+  labs(x = "Pseudotime (0–100)", y = "Density",
+       title = "Cell frequency along pseudotime — per cluster") +
+  theme(strip.text      = element_text(face = "bold"),
+        panel.spacing   = unit(1, "lines"),
+        legend.position = "right")
+```
+
+```{r pt-condition-freqpoly, fig.width=12}
+#| fig.height: !expr ceiling(n_lineages / 2) * 3
+ggplot(pt_long, aes(x = pseudotime, colour = condition)) +
+  geom_freqpoly(aes(y = after_stat(count)),
+                binwidth = 5, linewidth = 0.7, alpha = 0.9) +
+  scale_colour_manual(values = cond_pal, name = "Condition", limits = cond_order) +
+  scale_x_continuous(limits = c(0, 100), expand = c(0, 0)) +
+  facet_wrap(~ lineage, ncol = 2) +
+  labs(x = "Pseudotime (0–100)", y = "Count",
+       title = "Cell frequency along pseudotime — per condition") +
+  theme(strip.text      = element_text(face = "bold"),
+        panel.spacing   = unit(1, "lines"),
+        legend.position = "right")
+```
+
+---
+
+# 7  Pseudotime UMAP split by condition
+
+```{r pt-umap-condition, fig.width=14, fig.height=4}
+ggplot(pt_umap_df |> dplyr::arrange(is.na(mean_pseudotime))) +
+  geom_point(aes(umap1, umap2, colour = mean_pseudotime),
+             size = 0.4, alpha = 0.7) +
+  scale_colour_viridis_c(option = "plasma", name = "Mean\npseudotime",
+                         na.value = "grey88") +
+  facet_wrap(~ condition, nrow = 1) +
+  labs(x = umap_cols[1], y = umap_cols[2],
+       title = "Mean pseudotime split by condition") +
+  theme_void() +
+  theme(plot.title      = element_text(face = "bold", size = 12),
+        strip.text      = element_text(face = "bold", size = 11),
+        legend.position = "right")
+```
+
+---
+
+# 8  Lineage assignment summary
+
+```{r lineage-summary}
+summary_df <- pt_long |>
+  dplyr::count(lineage, cluster, condition) |>
+  tidyr::pivot_wider(names_from = condition, values_from = n, values_fill = 0L)
+
+DT::datatable(
+  summary_df,
+  rownames = FALSE,
+  caption  = "Cells per lineage × cluster × condition",
+  options  = list(pageLength = 20, scrollX = TRUE)
+)
+```
+
+---
+
+# 9  Smooth gene expression along lineages
+
+## Helper function
+
+```{r smooth-expr-fn}
+get_smooth_expr_lineage <- function(lins, lin_markers_lst, sling_df, srt,
+                                    n_bins = 50, loess_span = 0.75) {
+  lin_markers_df <- tibble::enframe(lin_markers_lst,
+                                    name  = "clust_marker",
+                                    value = "gene_symbol") |>
+    tidyr::unnest(cols = gene_symbol)
+
+  traj_long_df <- sling_df[, lins, drop = FALSE] |>
+    tibble::rownames_to_column("cell_id") |>
+    tidyr::pivot_longer(-cell_id, names_to = "lins", values_to = "pseudotime") |>
+    dplyr::mutate(lins = sub("pseudotime_", "", lins)) |>
+    dplyr::group_by(lins) |>
+    dplyr::mutate(
+      pt_norm = (pseudotime - min(pseudotime, na.rm = TRUE)) /
+                (max(pseudotime, na.rm = TRUE) - min(pseudotime, na.rm = TRUE)) * 100
+    ) |>
+    dplyr::ungroup()
+
+  sct_norm_mat <- Seurat::GetAssayData(srt, assay = "SCT", layer = "data")
+  sct_norm_mat <- sct_norm_mat[
+    intersect(lin_markers_df$gene_symbol, rownames(sct_norm_mat)), , drop = FALSE]
+
+  sct_long_df <- sct_norm_mat |>
+    as.matrix() |> as.data.frame() |>
+    tibble::rownames_to_column("gene_symbol") |>
+    tidyr::pivot_longer(-gene_symbol, names_to = "cell_id", values_to = "sct") |>
+    dplyr::left_join(lin_markers_df, by = "gene_symbol")
+
+  dplyr::full_join(traj_long_df, sct_long_df, by = "cell_id",
+                   relationship = "many-to-many") |>
+    dplyr::filter(!is.na(pseudotime)) |>
+    dplyr::mutate(pt_bin_id = cut(pt_norm, breaks = n_bins,
+                                  labels = FALSE, include.lowest = TRUE)) |>
+    dplyr::group_by(lins, gene_symbol, pt_bin_id, clust_marker) |>
+    dplyr::summarise(mean_sct = mean(sct, na.rm = TRUE),
+                     pt_norm  = mean(pt_norm, na.rm = TRUE), .groups = "drop") |>
+    dplyr::group_by(lins, gene_symbol) |>
+    dplyr::reframe({
+      d      <- dplyr::pick(dplyr::everything())
+      fit    <- loess(mean_sct ~ pt_norm, data = d, span = loess_span, degree = 1)
+      pt_seq <- seq(0, 100, length.out = 100)
+      tibble::tibble(pseudotime_bin   = pt_seq,
+                     smooth_norm_expr = predict(fit, pt_seq),
+                     clust_marker     = dplyr::first(d$clust_marker))
+    }) |>
+    dplyr::mutate(
+      clust_marker = factor(clust_marker, levels = names(lin_markers_lst)),
+      lineage      = factor(lins, levels = sub("pseudotime_", "", lineage_cols))
+    )
+}
+```
+
+## Helper function — per condition
+
+```{r smooth-expr-cond-fn}
+get_smooth_expr_by_condition <- function(lins, lin_markers_lst, sling_df, srt,
+                                         condition_col = "condition",
+                                         n_bins = 50, loess_span = 0.75) {
+  lin_markers_df <- tibble::enframe(lin_markers_lst,
+                                    name  = "clust_marker",
+                                    value = "gene_symbol") |>
+    tidyr::unnest(cols = gene_symbol)
+
+  traj_long_df <- sling_df[, c(lins, condition_col), drop = FALSE] |>
+    tibble::rownames_to_column("cell_id") |>
+    tidyr::pivot_longer(dplyr::all_of(lins), names_to = "lins", values_to = "pseudotime") |>
+    dplyr::mutate(lins = sub("pseudotime_", "", lins)) |>
+    dplyr::rename(condition = dplyr::all_of(condition_col)) |>
+    dplyr::group_by(lins) |>
+    dplyr::mutate(
+      pt_norm = (pseudotime - min(pseudotime, na.rm = TRUE)) /
+                (max(pseudotime, na.rm = TRUE) - min(pseudotime, na.rm = TRUE)) * 100
+    ) |>
+    dplyr::ungroup()
+
+  sct_norm_mat <- Seurat::GetAssayData(srt, assay = "SCT", layer = "data")
+  sct_norm_mat <- sct_norm_mat[
+    intersect(lin_markers_df$gene_symbol, rownames(sct_norm_mat)), , drop = FALSE]
+
+  sct_long_df <- sct_norm_mat |>
+    as.matrix() |> as.data.frame() |>
+    tibble::rownames_to_column("gene_symbol") |>
+    tidyr::pivot_longer(-gene_symbol, names_to = "cell_id", values_to = "sct") |>
+    dplyr::left_join(lin_markers_df, by = "gene_symbol")
+
+  dplyr::full_join(traj_long_df, sct_long_df, by = "cell_id",
+                   relationship = "many-to-many") |>
+    dplyr::filter(!is.na(pseudotime)) |>
+    dplyr::mutate(pt_bin_id = cut(pt_norm, breaks = n_bins,
+                                  labels = FALSE, include.lowest = TRUE)) |>
+    dplyr::group_by(lins, gene_symbol, condition, pt_bin_id, clust_marker) |>
+    dplyr::summarise(mean_sct = mean(sct, na.rm = TRUE),
+                     pt_norm  = mean(pt_norm, na.rm = TRUE), .groups = "drop") |>
+    dplyr::group_by(lins, gene_symbol, condition) |>
+    dplyr::reframe({
+      d      <- dplyr::pick(dplyr::everything())
+      pt_seq <- seq(min(d$pt_norm), max(d$pt_norm), length.out = 100)
+      fit    <- loess(mean_sct ~ pt_norm, data = d, span = loess_span, degree = 1)
+      tibble::tibble(pseudotime_bin   = pt_seq,
+                     smooth_norm_expr = predict(fit, pt_seq),
+                     clust_marker     = dplyr::first(d$clust_marker))
+    }) |>
+    dplyr::mutate(
+      clust_marker = factor(clust_marker, levels = names(lin_markers_lst)),
+      lineage      = factor(lins, levels = sub("pseudotime_", "", lineage_cols))
+    )
+}
+```
+
+## Parameters — marker genes per cluster label
+
+```{r smooth-expr-params}
+lin_markers_lst <- list(
+  "HSC/Prog" = c("Kit",    "Cd34"),
+  "MK"       = c("Itga2b", "Pf4"),
+  "Ery"      = c("Hba-a1", "Epor")
+)
+```
+
+## Compute smooth expression
+
+```{r smooth-expr-run}
+smooth_expr_df <- get_smooth_expr_lineage(
+  lins            = lineage_cols,
+  lin_markers_lst = lin_markers_lst,
+  sling_df        = sling_df,
+  srt             = mpn_processed_hsc
+)
+```
+
+## Line plot — smooth expression × lineage
+
+```{r smooth-expr-plot, fig.width=12}
+#| fig.height: !expr length(lin_markers_lst) * 1.8
+ggplot(smooth_expr_df,
+       aes(pseudotime_bin, smooth_norm_expr, colour = gene_symbol)) +
+  geom_line(linewidth = 0.8, show.legend = TRUE) +
+  facet_grid(clust_marker ~ lineage, scales = "free_y") +
+  scale_colour_brewer(palette = "Dark2", name = "Gene") +
+  labs(x = "Pseudotime bin (0–100)",
+       y = "Smoothed SCT expression",
+       title = "LOESS-smoothed gene expression along lineages") +
+  theme(strip.text.x    = element_text(face = "bold", size = 9),
+        strip.text.y    = element_text(face = "bold", size = 9, angle = 0),
+        panel.spacing   = unit(0.5, "lines"),
+        legend.position = "right")
+```
+
+---
+
+# 10  Binned expression along trajectories
+
+```{r bin-setup}
+library(ComplexHeatmap)
+library(circlize)
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+N_BINS_HM  <- 50L   # pseudotime bins
+N_TOP_GENES <- 200L  # HVGs ranked by bin-variance for the overview heatmap
+```
+
+```{r bin-compute}
+# One genes × n_bins matrix per lineage (raw pseudotime columns from sling_df)
+raw_pt_cols <- grep("^Lineage", colnames(slingshot::slingPseudotime(sling_obj)), value = TRUE)
+
+bin_mats <- setNames(
+  lapply(raw_pt_cols, function(lc) {
+    cat("Binning", lc, "...\n")
+    bin_expr_along_pseudotime(
+      srt         = mpn_processed_hsc,
+      sling_df    = as.data.frame(slingshot::slingPseudotime(sling_obj)),
+      lineage_col = lc,
+      n_bins      = N_BINS_HM,
+      assay       = "SCT",
+      layer       = "data",
+      smooth      = TRUE,
+      smooth_span = 0.3
+    )
+  }),
+  raw_pt_cols
+)
+
+cat("Bin matrices computed:\n")
+for (nm in names(bin_mats))
+  cat(" ", nm, "—", nrow(bin_mats[[nm]]), "genes ×", ncol(bin_mats[[nm]]), "bins\n")
+```
+
+## Top HVGs — all lineages side by side
+
+Genes ordered by peak pseudotime bin in Lineage1 (expression wave ordering).
+Colour = z-score per gene across bins; shared scale across panels.
+
+```{r bin-heatmap-top, fig.width=5}
+#| fig.height: !expr min(20, ceiling(N_TOP_GENES / 8))
+ComplexHeatmap::draw(
+  plot_lineage_heatmap(bin_mats,
+                        n_top      = N_TOP_GENES,
+                        gene_order = "peak",
+                        scale      = TRUE),
+  merge_legend = TRUE
+)
+```
+
+## Marker genes — ordered expression
+
+```{r bin-heatmap-markers, fig.width=5, fig.height=5}
+marker_genes <- c(
+  "Kit", "Cd34", "Slamf1",          # HSC/progenitor
+  "Itga2b", "Pf4", "Vwf", "Gp1bb",  # MK
+  "Hba-a1", "Epor", "Gata1",         # Ery
+  "Mpo", "Elane", "Cebpa"            # Myeloid
+)
+
+ComplexHeatmap::draw(
+  plot_lineage_heatmap(bin_mats,
+                        genes      = marker_genes,
+                        gene_order = marker_genes,
+                        scale      = TRUE,
+                        show_row_names = TRUE),
+  merge_legend = TRUE
+)
+```
+
+{{< include ../_session-info.qmd >}}

@@ -1,0 +1,242 @@
+---
+title: "2026_05_14"
+format: html
+editor: visual
+---
+
+```{r}
+
+```
+
+
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+
+```{r}
+targets::tar_load(mpn_processed_hsc_fullcc)
+```
+
+
+```{r}
+p1 <- VlnPlot(mpn_processed_hsc_fullcc,c( "nFeature_SCT"),,alpha = 0.2,sort = T,split.by = "sample.name", group.by = "sNN_pca.SCT_30_res.0.9")&theme(legend.position = "top")
+p2 <- DimPlot(mpn_processed_hsc_fullcc,group.by = "sNN_pca.SCT_30_res.0.9",label = TRUE)+theme_void()+NoLegend()
+p1 +p2+patchwork::plot_layout(widths = c(4,1),ncol = 2)
+```
+
+```{r}
+p1 <- VlnPlot(mpn_processed_hsc_fullcc,c( "G2M.Score"),raster = ,alpha = 0.2,sort = T,split.by = "sample.name", group.by = "sNN_pca.SCT_30_res.0.9")&theme(legend.position = "top")
+p2 <- DimPlot(mpn_processed_hsc_fullcc,group.by = "sNN_pca.SCT_30_res.0.9",label = TRUE)+theme_void()+NoLegend()
+p1 +p2+patchwork::plot_layout(widths = c(4,1),ncol = 2)
+```
+
+
+```{r}
+p1 <- VlnPlot(mpn_processed_hsc_fullcc,c( "S.Score"),raster = ,alpha = 0.2,sort = T,split.by = "sample.name", group.by = "sNN_pca.SCT_30_res.0.9")&theme(legend.position = "top")
+p2 <- DimPlot(mpn_processed_hsc_fullcc,group.by = "sNN_pca.SCT_30_res.0.9",label = TRUE)+theme_void()+NoLegend()
+p1 +p2+patchwork::plot_layout(widths = c(4,1),ncol = 2)
+```
+
+```{r}
+str_sub <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.0.9 %in% c("6"))
+grp_list <- str_sub@meta.data %>% with(split(rownames(.), sample.name))
+data <- GetAssayData(str_sub,assay = "SCT",layer = "data")
+
+sub_cond_var <- lapply(grp_list, function(grp){
+  feat_var <- data[, grp] %>% apply(1, var)
+  }) %>% 
+  do.call(cbind, .)
+
+sub_cond_mean <- lapply(grp_list, function(grp){
+  feat_var <- data[, grp] %>% apply(1, mean)
+  }) %>% 
+  do.call(cbind, .)
+
+sub_cond_norm <- sub_cond_var/sub_cond_mean
+
+```
+
+
+```{r}
+gene_data <- GetAssayData(str_sub,assay = "SCT",layer = "data")["Cd14",] %>% sort
+cell_sample <- str_sub@meta.data %>% with(set_names(sample.name, rownames(.)))
+
+data.frame(r = 1:length(gene_data),
+           expr = gene_data,grp = cell_sample[names(gene_data)])%>%
+  ggplot(aes(r, color = grp))+
+  geom_density()
+
+data.frame(r = 1:length(gene_data),
+           expr = gene_data,
+           grp = cell_sample[names(gene_data)])%>% 
+  ggplot(aes(r, fill = grp))+
+  geom_histogram()+
+  facet_wrap(~grp,ncol = 1)
+
+data.frame(r = 1:length(gene_data),
+           expr = gene_data,
+           grp = cell_sample[names(gene_data)])%>%
+    filter(gene_data>0) %>% 
+    ggplot(aes(r, fill = grp))+
+    geom_histogram()+
+    facet_wrap(~grp,ncol = 1)
+
+data.frame(r = 1:length(gene_data),
+           expr = gene_data,grp = cell_sample[names(gene_data)])%>%
+  ggplot(aes(expr, color = grp))+
+  geom_density()
+
+data.frame(r = 1:length(gene_data),
+           expr = gene_data,grp = cell_sample[names(gene_data)])%>%
+    ggplot(aes(grp, expr, color = grp))+
+    geom_jitter()
+
+data.frame(r = 1:length(gene_data),
+           expr = gene_data,
+           grp = cell_sample[names(gene_data)])%>% 
+  ggplot(aes(expr, fill = grp))+
+  geom_histogram()+
+  facet_wrap(~grp,ncol = 1)
+
+data.frame(r = 1:length(gene_data),
+           expr = gene_data,
+           grp = cell_sample[names(gene_data)])%>%
+    filter(gene_data>0) %>% 
+    ggplot(aes(expr, fill = grp))+
+    geom_histogram()+
+    facet_wrap(~grp,ncol = 1)
+
+```
+
+
+```{r}
+pos     <- Embeddings(srt_sub, "pca.SCT")[, 1:10]
+genes   <- c("Matn4","Cfap54","Lpl" ,"Podxl", "Col18a1", "Cd14")
+data    <- as.matrix(GetAssayData(srt_sub, assay = "SCT", layer = "data")[genes, ])
+res     <- Seurat::RunMoransI(data = data, pos = pos)
+tibble::tibble(
+  gene      = rownames(res),
+  morans_i  = res$observed,
+  p_value   = res$p.value,
+  p_adj     = p.adjust(res$p.value, method = "BH"),
+  condition = condition_label
+) |> dplyr::arrange(dplyr::desc(morans_i))
+```
+```{r}
+all_cells <- colnames(mpn_processed_hsc_fullcc)
+sub_cells <- colnames(srt_sub)
+x <- mpn_processed_hsc_fullcc@neighbors$neighbors_pca.SCT_30@nn.idx[ all_cells %in% sub_cells, ]
+data <- GetAssayData(srt_sub,assay = "SCT",layer = "data")
+
+DimPlot(mpn_processed_hsc_fullcc,cells.highlight = all_cells[x[1,]])
+
+gene_ng_avg <- apply(x, 1, function(ng){
+  cells <- all_cells[ng]
+  cells <- cells[cells %in% colnames(data)]
+  Matrix::rowMeans(data[,cells])
+})
+
+gene_ng_avg <- apply(x, 1, function(ng){
+  cells <- all_cells[ng]
+  cells <- cells[cells %in% colnames(data)]
+  Matrix::rowMeans(data[,cells])
+})
+colnames(gene_ng_avg) <- all_cells[ all_cells %in% sub_cells]
+
+ng_size <- apply(x, 1, function(ng){
+    cells <- all_cells[ng]
+    sum(cells %in% colnames(data))
+})
+
+gene_rnd_avg <- apply(x, 1, function(ng){
+  cells <- all_cells[ng]
+  cells <- cells[cells %in% colnames(data)]
+  s <- sample(sub_cells, length(cells))
+  Matrix::rowMeans(data[,s])
+})
+
+feat <- "Cd14"
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+  full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+  bind_rows(data.frame(sample.name = "random",value = gene_rnd_avg[feat,] )) %>% 
+  ggplot(aes(sample.name, value))+
+  geom_boxplot()
+
+
+```
+```{r}
+gene_rnd_avg <- apply(x, 1, function(ng){
+  cells <- all_cells[ng]
+  cells <- cells[cells %in% colnames(data)]
+  s <- sample(sub_cells, length(cells))
+  Matrix::rowMeans(data[,s])
+})
+gene_grp_avg <- apply(x, 1, function(ng){
+  cells <- all_cells[ng]
+  cells <- cells[cells %in% colnames(data)]
+  s <- sample(sub_cells, length(cells))
+  mean(cell_sample[s] == "HSC_WT_CD41+")
+})
+
+feat <- "Cd14"
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+    mutate(wt_prop = gene_grp_avg) %>%
+  ggplot(aes(wt_prop, value))+
+  geom_point()
+
+```
+
+
+```{r}
+install.packages("psych")
+
+```
+
+```{r}
+feat <- "Meis1"
+
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+    full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+  group_by(sample.name)%>%
+  summarize(k = e1071::kurtosis(value))
+
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+    full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+  group_by(sample.name)%>%
+  summarize(k = psych::kurtosi(value))
+
+```
+
+```{r}
+feat <- "Cd14"
+gene_data <- GetAssayData(str_sub,assay = "SCT",layer = "data")["Cd14",]
+x <- mclust::Mclust(gene_data, 3,verbose = FALSE)
+
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+  full_join(x$classification %>% enframe(name  = "cell_id", value = "grp")) %>%
+  mutate(grp= as.character(grp)) %>% 
+  full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+  ggplot(aes(grp, value))+
+  geom_jitter(size = 0.5, alpha  = 0.5)+
+  geom_boxplot()+
+  facet_wrap(~sample.name)
+
+
+```
+
+
+```{r}
+srt_sub   <-FindVariableFeatures(srt_sub,nfeatures = 100)
+x <- mpn_processed_hsc_fullcc@neighbors$neighbors_pca.SCT_30@nn.idx[ all_cells %in% sub_cells, ]
+data <- GetAssayData(str_sub,assay = "SCT",layer = "data")
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(sample.name = srt_sub$sample.name,
+                                              col = list(sample.name = setNames( c( "red", "green","blue"),unique(srt_sub$sample.name))))
+
+ComplexHeatmap::Heatmap(data[VariableFeatures(srt_sub),] %>% as.matrix(),
+                        show_column_names = FALSE,
+                        top_annotation = column_ha)
+```
+

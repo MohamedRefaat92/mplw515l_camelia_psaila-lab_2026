@@ -1,0 +1,134 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+stem_clusters <- c("7", "8")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters & Phase == "G1")%>% 
+  SCTransform(assay = "RNA") %>% 
+  RunPCA(assay = "SCT") %>% 
+  FindNeighbors(dims = 1:30) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:30,
+           reduction.name = "umap.pca")
+rna_counts <- GetAssayData(srt_sub, "RNA", layer = "counts")
+gene_detection <- Matrix::rowSums(rna_counts>=1)
+
+rna_counts[rna_counts>=1] <- 1
+var_genes <- VariableFeatures(srt_sub,nfeatures = 3000)
+#var_genes <-  Signac::FindTopFeatures(mat, min.cutoff = 'q0') %>% rownames()%>% head(300)
+
+mat <- Signac::RunTFIDF(object = rna_counts[var_genes,],
+                        method = 1)
+#top_var <-  Signac::FindTopFeatures(mat, min.cutoff = 'q0')
+
+srt_sub[["lsi_bin"]] <- Signac::RunSVD(mat[var_genes,])
+srt_sub <- RunUMAP(srt_sub, reduction = "lsi_bin",dims = 2:30,reduction.name = "umap.lsi")
+```
+
+```{r}
+DimPlot(srt_sub,
+        reduction = "lsi_bin",
+        group.by = "sample.name", 
+        split.by = "sample.name",
+        dims = c(2,3))
+```
+
+```{r}
+srt_sub[["lsi_bin"]]@cell.embeddings %>%
+  as.data.frame() %>%
+  mutate(grp = srt_sub$sample.name[rownames(.)]) %>%
+  ggplot(aes(LSI_8, color=grp))+
+  geom_density()
+
+```
+
+```{r}
+stem_clusters <- c("1")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters)%>% 
+  SCTransform(assay = "RNA",
+              vars.to.regress = c("S.Score", "G2M.Score"),
+              residual.features = setdiff(rownames(mpn_processed_hsc_fullcc), unlist(proc_params$exclude_reporters))) %>% 
+  RunPCA(assay = "SCT") %>% 
+  FindNeighbors(dims = 1:30) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:30,
+           reduction.name = "umap.pca")
+
+
+```
+
+```{r}
+stem_clusters <- c("6")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters)%>% 
+  SCTransform(assay = "RNA",
+              vars.to.regress = c("S.Score", "G2M.Score"),
+              residual.features = setdiff(rownames(mpn_processed_hsc_fullcc), unlist(proc_params$exclude_reporters))) %>% 
+  RunPCA(assay = "SCT") %>% 
+  FindNeighbors(dims = 1:30) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:30,
+           reduction.name = "umap.pca")
+
+
+```
+
+```{r}
+FeaturePlot(srt_sub,features = "Cdkn2a",reduction = "umap.pca",split.by = "sample.name")
+```
+
+```{r}
+FeaturePlot(srt_sub,features = "Fosl1",reduction = "umap.pca",split.by = "sample.name")
+```
+
+```{r}
+FeaturePlot(srt_sub,features = "Egr3",reduction = "umap.pca",split.by = "sample.name")
+```
+
+```{r}
+stem_clusters <- c("0")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters)%>% 
+  SCTransform(assay = "RNA",
+              vars.to.regress = c("S.Score", "G2M.Score"),
+              residual.features = setdiff(rownames(mpn_processed_hsc_fullcc), unlist(proc_params$exclude_reporters))) %>% 
+  RunPCA(assay = "SCT") %>% 
+  FindNeighbors(dims = 1:30) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:30,
+           reduction.name = "umap.pca")
+
+
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Lim2 <- GetAssayData(mpn_processed_hsc_fullcc, assay = "SCT",  layer = "data")["Lim2",]
+mpn_processed_hsc_fullcc <- Seurat::GroupCorrelation(mpn_processed_hsc_fullcc,
+                                                     assay = "SCT",
+                                                     slot = "data",
+                                                     var = c("Lim2"))
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% head
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,order = T,features = "Lim2",reduction = "umap.nn",split.by = "sample.name")
+```
+
+```{r}
+stem_clusters <- c("5")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters)%>% 
+  SCTransform(assay = "RNA",
+              residual.features = setdiff(rownames(mpn_processed_hsc_fullcc), unlist(proc_params$exclude_reporters))) %>% 
+  RunPCA(assay = "SCT") %>% 
+  FindNeighbors(dims = 1:30) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 3:30,
+           reduction.name = "umap.pca")
+
+```

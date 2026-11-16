@@ -1,0 +1,128 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+-   SOCS2 Controls Proliferation and Stemness of Hematopoietic Cells under Stress Conditions and Its Deregulation Marks Unfavorable Acute Leukemias
+
+    -   <https://doi.org/10.1158/0008-5472.CAN-14-3625>
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Socs2"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Pcp4l1"),split.by = "sample.name",order =F)&RestoreLegend()
+```
+
+```{r}
+
+cells <- mpn_processed_hsc_fullcc@meta.data %>% 
+  filter(sample.name == "HSC_WT_CD41+",
+         sNN_pca.SCT_30_res.0.9 %in% c("6", "8")) %>%
+  rownames()
+
+DimPlot(mpn_processed_hsc_wt_fullcc,
+        group.by = "sNN_pca.SCT_30_res.0.9",
+        label = TRUE,
+        cells.highlight = cells)&
+  NoLegend()
+```
+
+```{r}
+df <- read.csv("data/marker_list_claude/mouse_hematopoiesis_markers.csv")
+l <- df %>% with(split(.$gene, .$cell_type))
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$LT_HSC,split.by = "sample.name",order =F)&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$LT_HSC,split.by = "sample.name",order =F, ncol = 4)&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$LT_HSC,ncol = 4)&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$LT_HSC,ncol = 4,order = T)&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$ST_HSC_MPP1,ncol = 5,order = T)&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$Mk_biased_HSC,ncol = 5,order = T)&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$Stress_dissociation,ncol = 5,order = T)&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_wt_fullcc,features = l$Osteolineage,ncol = 5,order = T)&RestoreLegend()
+```
+
+```{r}
+eryth_clusters <- c("3","7", "9")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.9 %in% eryth_clusters)
+gene_detection <- Matrix::rowSums(GetAssayData(srt_sub,"RNA",layer = "counts")>=3)
+srt_sub <- srt_sub[gene_detection>=20,]
+options(future.globals.maxSize = 8 * 1024^3)
+srt_sub <- SCTransform(srt_sub)
+feats <- setdiff(VariableFeatures(srt_sub),sex_degs)
+lda_model <- MASS::lda(srt_sub[["SCT"]]@data[feats,] %>% t(),
+                       srt_sub$sample.name)
+lda_scores <- predict(lda_model, srt_sub[["SCT"]]@data[feats,] %>% t())$x 
+
+lda_scores %>% 
+  as.data.frame()%>%
+  mutate(sample.name = srt_sub$sample.name[rownames(.)]) %>% 
+    ggplot(aes(LD1, LD2, color = sample.name))+
+    geom_point()
+
+cbind(lda_model$scaling,cc_cor[rownames(lda_model$scaling),]) %>% View
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Mif"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+-   <https://www.mdpi.com/1422-0067/25/17/9287>
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Gm42047"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+-   <https://maayanlab.cloud/Harmonizome/gene/F12>
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("F12"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Jam3"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Bc1"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Tulp3"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Hspb1"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Ccnd1"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+-   <https://mpn-hub.com/medical-information/mylox-1-trial-loxl2-inhibition-for-the-treatment-of-mf>
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Loxl2"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Loxl2"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Ccl4", "Ccl5"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Rep15", "Parm1"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Rsad1","Fli1", "Parp8", "Nkg7", "Dnah8"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Nbea"),split.by = "sample.name",order =T)&RestoreLegend()
+```

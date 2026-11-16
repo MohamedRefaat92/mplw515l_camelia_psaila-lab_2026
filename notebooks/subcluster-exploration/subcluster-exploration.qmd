@@ -1,0 +1,190 @@
+---
+title: "Sub-cluster Exploration"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(targets)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+config     <- yaml::read_yaml(file.path("metadata/project_config.yaml"))
+sc_entries <- config$subclusters
+umap_name  <- "umap.nn"
+
+# Consistent sample.name palette across all plots.
+# Colours chosen per condition: WT = blue, Het/mCh- = green, mCh+ = orange.
+# Stroma only has WT and Het (no mCh split).
+sample_pal <- c(
+  "Stroma_WT"          = "#4393c3",
+  "Stroma_Het"         = "#d6604d",
+  "CD41+_HSC_WT"       = "#4393c3",
+  "CD41+ HSC_Het_mCh-" = "#74c476",
+  "CD41+_HSC_Het_mCh+" = "#fd8d3c",
+  "MNC_WT"             = "#4393c3",
+  "MNC_mCh-"           = "#1a9850",
+  "MNC_mCh+"           = "#d73027"
+)
+```
+
+Layout per sub-cluster:
+
+1. **Overview row** — UMAP of re-processed sub-cluster coloured by `sample.name`
+   + stacked % bar showing proportion and cell count per sample.
+2. **Per-sample silhouette rows** — for each `sample.name` present:
+   - *Left*: cells of that sample highlighted on the **sub-cluster** UMAP
+     (grey = other sub-cluster cells).
+   - *Right*: cells of that sample highlighted on the **parent compartment** UMAP
+     (grey = all other parent cells).
+
+```{r helpers}
+# ── Pie chart: % + n per sample ─────────────────────────────────────────────
+# Works on a Seurat object OR a data.frame with sample.name column.
+plot_sample_pie <- function(x, cols, title = "") {
+  snames <- if (inherits(x, "Seurat")) x$sample.name else x$sample.name
+  df <- as.data.frame(table(sample = snames)) %>%
+    dplyr::mutate(pct   = 100 * Freq / sum(Freq),
+                  label = sprintf("%d\n%.1f%%", Freq, pct))
+
+  ggplot(df, aes("", pct, fill = sample)) +
+    geom_col(width = 1, colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = label),
+              position = position_stack(vjust = 0.5),
+              size = 2.8, colour = "white", fontface = "bold",
+              lineheight = 0.9) +
+    coord_polar(theta = "y", start = 0) +
+    scale_fill_manual(values = cols, drop = TRUE) +
+    labs(title = title, x = NULL, y = NULL, fill = "Sample") +
+    theme_void(base_size = 11) +
+    theme(legend.key.size  = unit(0.35, "cm"),
+          legend.text      = element_text(size = 7),
+          plot.title       = element_text(size = 10, hjust = 0.5))
+}
+
+# ── Silhouette: highlight one sample on an embedding ────────────────────────
+# emb_src: either a Seurat object (uses Embeddings()) or a data.frame with
+#          UMAP1/UMAP2 and cell_id columns (from anno_meta_*).
+plot_highlight <- function(emb_src, fg_cells, colour, reduction = NULL, title = "") {
+  if (inherits(emb_src, "Seurat")) {
+    emb <- as.data.frame(Embeddings(emb_src, reduction))
+    colnames(emb) <- c("UMAP_1", "UMAP_2")
+    emb$cell_id <- rownames(emb)
+  } else {
+    emb <- emb_src[, c("cell_id", "UMAP1", "UMAP2")]
+    colnames(emb) <- c("cell_id", "UMAP_1", "UMAP_2")
+  }
+  emb$highlight  <- emb$cell_id %in% fg_cells
+
+  ggplot() +
+    geom_point(data = emb[!emb$highlight, ],
+               aes(UMAP_1, UMAP_2),
+               colour = "grey88", size = 0.35, alpha = 0.6) +
+    geom_point(data = emb[emb$highlight, ],
+               aes(UMAP_1, UMAP_2),
+               colour = colour, size = 0.7, alpha = 0.9) +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_bw(base_size = 10) +
+    theme(panel.grid  = element_blank(),
+          axis.text   = element_blank(),
+          axis.ticks  = element_blank(),
+          plot.title  = element_text(size = 9))
+}
+```
+
+```{r plots, results="asis"}
+compartments <- unique(vapply(sc_entries, `[[`, "", "compartment"))
+
+# Pre-load all anno_meta flat tables (UMAP coords only — no Seurat needed for parent context).
+bg_meta <- list(
+  stroma = { targets::tar_load(anno_meta_stroma); anno_meta_stroma },
+  hsc    = { targets::tar_load(anno_meta_hsc);    anno_meta_hsc    },
+  mnc    = { targets::tar_load(anno_meta_mnc);    anno_meta_mnc    }
+)
+rm(anno_meta_stroma, anno_meta_hsc, anno_meta_mnc)
+
+for (comp in compartments) {
+  comp_entries <- Filter(function(e) e$compartment == comp, sc_entries)
+  bg_df <- bg_meta[[comp]]   # data.frame: cell_id, UMAP1, UMAP2, sample.name, ...
+
+  cat(sprintf("\n## %s\n\n", toupper(comp)))
+  cat("::: {.panel-tabset}\n\n")
+
+  for (entry in comp_entries) {
+    target_name <- paste0("mpn_subclust_", entry$name)
+    clust_label <- paste("Cluster", paste(unlist(entry$clusters), collapse = ", "))
+    cat(sprintf("### %s\n\n", clust_label))
+
+    tar_load_raw(target_name)
+    fg_srt  <- get(target_name)
+    rm(list = target_name)
+
+    present <- unique(fg_srt$sample.name)
+    cols    <- sample_pal[intersect(names(sample_pal), present)]
+
+    # ── Row 1: overview UMAP + pie ──────────────────────────────────
+    p_umap <- plot_umap_groups(fg_srt,
+                               group_i      = "sample.name",
+                               cols         = cols,
+                               reduction    = umap_name,
+                               legend_title = "Sample") +
+      labs(title = "Sub-cluster re-processed") +
+      theme(plot.title       = element_text(size = 10, face = "bold"),
+            legend.position  = "top",
+            legend.direction = "horizontal",
+            legend.text      = element_text(size = 7),
+            legend.key.size  = unit(0.35, "cm"))
+
+    p_pie <- plot_sample_pie(fg_srt, cols,
+                             title = sprintf("n = %d cells", ncol(fg_srt)))
+
+    cat("```{=html}\n<div style='margin-bottom:6px'></div>\n```\n\n")
+    fig_overview <- p_umap + p_pie + plot_layout(widths = c(3, 1))
+    print(fig_overview)
+    cat("\n\n")
+
+    # ── Row 2+: per-sample silhouettes ──────────────────────────────
+    # fg cell IDs in sub-cluster; bg_df provides parent embedding.
+    fg_cells_all <- colnames(fg_srt)
+
+    for (sname in present) {
+      colour      <- sample_pal[[sname]]
+      sname_short <- gsub("CD41[+_]+", "", sname)  # trim for title
+      cells_sub   <- colnames(fg_srt)[fg_srt$sample.name == sname]
+      # parent context: sub-cluster cells of this sample in parent embedding
+      cells_par_fg <- intersect(cells_sub, bg_df$cell_id)
+
+      p_sil_sub <- plot_highlight(fg_srt, cells_sub, colour,
+                                  reduction = umap_name,
+                                  title     = sprintf("%s — sub-cluster", sname_short))
+
+      p_sil_par <- plot_highlight(bg_df, cells_par_fg, colour,
+                                  title     = sprintf("%s — in %s context",
+                                                      sname_short, toupper(comp)))
+
+      print(p_sil_sub | p_sil_par)
+      cat("\n\n")
+    }
+
+    rm(fg_srt); gc()
+  }
+
+  cat(":::\n\n")
+}
+rm(bg_meta); gc()
+```
+
+{{< include ../_session-info.qmd >}}

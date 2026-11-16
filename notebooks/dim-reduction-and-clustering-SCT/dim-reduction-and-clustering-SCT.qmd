@@ -1,0 +1,662 @@
+---
+title: "Dimensionality Reduction & Clustering (SCT)"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+Per-compartment exploration using **SCTransform** — the same assay and processing
+used by the targets pipeline.
+
+- **Section 1** shows the pipeline UMAP (from `mpn_processed_data_*` targets).
+- **Sections 2–3** show the elbow plot, PCA scatter, and PCA vs Harmony UMAP
+  comparison (from `dim_grid_sct_pre_*` targets).
+- **Sections 4–6** show UMAP and clustering results across the dims × k grid
+  (from `dim_grid_sct_runs_*` targets).
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(targets)
+```
+
+```{r params}
+targets::tar_load(proc_params)
+
+N_DIMS       <- proc_params$n_pca_dims
+K            <- proc_params$k_neighbors
+DIMS_GRID    <- unlist(proc_params$dim_grid_dims)
+K_GRID       <- unlist(proc_params$dim_grid_k)
+INSPECT_RES  <- proc_params$marker_resolution
+clust_prefix <- paste0("^sNN_pca\\.", proc_params$ref_assay, "_")
+
+SUBSET_NAMES <- c("hsc", "mnc", "stroma")
+
+# Order cells by expression in UMAP plots (high values on top)
+ORDER_CELLS  <- FALSE
+```
+
+```{r helpers}
+cluster_col_res <- function(md, res) {
+  pat <- paste0("_res\\.", gsub("\\.", "\\\\.", res), "$")
+  grep(pat, colnames(md), value = TRUE)[1]
+}
+
+scatter_emb <- function(df, x, y, colour_col, title, guide_title) {
+  ggplot(df, aes(x = .data[[x]], y = .data[[y]], colour = .data[[colour_col]])) +
+    geom_point(size = 0.7, alpha = 0.5) +
+    labs(title = title, colour = guide_title) +
+    guides(colour = guide_legend(override.aes = list(size = 4))) +
+    theme_bw() +
+    theme(legend.position = "bottom", legend.text = element_text(size = 7))
+}
+```
+
+---
+
+## 1. Pipeline UMAP (cached objects) {.tabset}
+
+::: {.panel-tabset}
+
+```{r pipeline-umap-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+
+  target_nm <- paste0("mpn_processed_data_", nm)
+  targets::tar_load_raw(target_nm)
+  srt <- get(target_nm)
+  rm(list = target_nm)
+
+  umap_emb           <- as.data.frame(Seurat::Embeddings(srt, "umap.nn")[, 1:2])
+  colnames(umap_emb) <- c("UMAP1", "UMAP2")
+  clust_cols         <- grep(clust_prefix, colnames(srt@meta.data), value = TRUE)
+  df                 <- cbind(umap_emb,
+                               srt@meta.data[, c("sample.name", clust_cols), drop = FALSE])
+  rm(srt); gc()
+
+  clust_col    <- cluster_col_res(df, INSPECT_RES)
+  df[[clust_col]] <- factor(df[[clust_col]])
+  centroids <- df |>
+    group_by(.data[[clust_col]]) |>
+    summarise(UMAP1 = median(UMAP1), UMAP2 = median(UMAP2), .groups = "drop")
+
+  p_sample <- scatter_emb(df, "UMAP1", "UMAP2", "sample.name",
+                          paste0(nm, " — coloured by sample"), "Sample")
+
+  p_cluster <- ggplot(df, aes(x = UMAP1, y = UMAP2, colour = .data[[clust_col]])) +
+    geom_point(size = 0.5, alpha = 0.5, show.legend = FALSE) +
+    ggrepel::geom_label_repel(data = centroids,
+                              aes(label = .data[[clust_col]]),
+                              size = 3, show.legend = FALSE,
+                              label.padding = unit(0.15, "lines"),
+                              max.overlaps = Inf) +
+    labs(title = paste0(nm, " — coloured by cluster  (res ", INSPECT_RES, ")")) +
+    theme_void(base_size = 9) +
+    theme(plot.title = element_text(hjust = 0.5))
+
+  print(p_sample | p_cluster)
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 2. SCTransform → PCA {.tabset}
+
+::: {.panel-tabset}
+
+```{r pca-tabs}
+#| results: asis
+#| fig-width: 7
+#| fig-height: 6
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+
+  target_nm <- paste0("dim_grid_sct_pre_", nm)
+  targets::tar_load_raw(target_nm)
+  pre <- get(target_nm)
+  rm(list = target_nm)
+
+  p_elbow <- ggplot(pre$elbow, aes(x = dims, y = stdev)) +
+    geom_point() +
+    geom_vline(xintercept = N_DIMS, linetype = "dashed", colour = "firebrick") +
+    labs(title    = paste0("PCA elbow — ", nm),
+         subtitle = paste0("Dashed = n_pca_dims = ", N_DIMS),
+         x = "PC", y = "Std Dev") +
+    theme_bw()
+
+  p_pca <- scatter_emb(pre$pca, "PC1", "PC2", "sample",
+                       paste0("PCA — ", nm), "Sample")
+
+  print(p_elbow / p_pca)
+  rm(pre); gc()
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 3. PCA vs Harmony UMAP — coloured by sample {.tabset}
+
+Visual comparison of UMAP computed from PCA vs Harmony-corrected embeddings.
+Harmony is run on `sample.name` for batch correction assessment only — it is
+not used in any downstream analysis.
+
+::: {.panel-tabset}
+
+```{r harmony-comparison-tabs}
+#| results: asis
+#| fig-width: 12
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+
+  target_nm <- paste0("dim_grid_sct_pre_", nm)
+  targets::tar_load_raw(target_nm)
+  pre <- get(target_nm)
+  rm(list = target_nm)
+
+  p_pca <- scatter_emb(pre$umap_nn, "UMAP1", "UMAP2", "sample",
+                       paste0(nm, " — Pipeline UMAP (umap.nn)"), "Sample")
+  p_har <- scatter_emb(pre$umap_harmony, "UMAP1", "UMAP2", "sample",
+                       paste0(nm, " — Harmony UMAP"), "Sample")
+  print(p_pca | p_har)
+  rm(pre); gc()
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 4. UMAP — coloured by sample {.tabset}
+
+::: {.panel-tabset}
+
+```{r umap-sample-tabs}
+#| results: asis
+#| fig-width: 15
+#| fig-height: 12
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+
+  target_nm <- paste0("dim_grid_sct_runs_", nm)
+  targets::tar_load_raw(target_nm)
+  runs <- get(target_nm)
+  rm(list = target_nm)
+
+  plots <- list()
+  for (lbl in names(runs)) {
+    df          <- runs[[lbl]]
+    plots[[lbl]] <- scatter_emb(df, "UMAP1", "UMAP2", "sample.name", lbl, "Sample") +
+      theme(legend.position = "bottom", legend.text = element_text(size = 7))
+  }
+  print(wrap_plots(plots, ncol = length(K_GRID)))
+  rm(runs); gc()
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 5. UMAP — coloured by cluster (res `r INSPECT_RES`) {.tabset}
+
+::: {.panel-tabset}
+
+```{r umap-cluster-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 8
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+
+  target_nm <- paste0("dim_grid_sct_runs_", nm)
+  targets::tar_load_raw(target_nm)
+  runs <- get(target_nm)
+  rm(list = target_nm)
+
+  plots <- list()
+  for (lbl in names(runs)) {
+    df        <- runs[[lbl]]
+    col       <- cluster_col_res(df, INSPECT_RES)
+    df[[col]] <- factor(df[[col]])
+    centroids <- df |> group_by(.data[[col]]) |>
+      summarise(UMAP1 = median(UMAP1), UMAP2 = median(UMAP2), .groups = "drop")
+    plots[[lbl]] <- ggplot(df, aes(x = UMAP1, y = UMAP2, colour = .data[[col]])) +
+      geom_point(size = 0.5, alpha = 0.5, show.legend = FALSE) +
+      ggrepel::geom_label_repel(data = centroids,
+                                aes(label = .data[[col]]),
+                                size = 3, show.legend = FALSE,
+                                label.padding = unit(0.15, "lines"),
+                                max.overlaps = Inf) +
+      labs(title = lbl) +
+      theme_void(base_size = 9) +
+      theme(plot.title = element_text(hjust = 0.5))
+  }
+  print(wrap_plots(plots, ncol = length(K_GRID)))
+  rm(runs); gc()
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 6. Resolution scan {.tabset}
+
+Pick one run per subset and inspect how cluster count varies with resolution.
+
+::: {.panel-tabset}
+
+```{r res-scan-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 8
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+
+  target_nm <- paste0("dim_grid_sct_runs_", nm)
+  targets::tar_load_raw(target_nm)
+  runs <- get(target_nm)
+  rm(list = target_nm)
+
+  inspect_run <- paste0("dims", N_DIMS, "_k", K)
+  if (!inspect_run %in% names(runs)) inspect_run <- names(runs)[1]
+  df <- runs[[inspect_run]]
+
+  clust_cols <- grep(paste0(clust_prefix, ".*_res\\."), colnames(df), value = TRUE)
+
+  res_rows <- list()
+  for (col in clust_cols) {
+    res_rows[[col]] <- data.frame(
+      resolution = sub(paste0(clust_prefix, "\\d+_"), "", col),
+      n_clusters = nlevels(factor(df[[col]]))
+    )
+  }
+  res_summary <- do.call(rbind, res_rows)
+  rm(res_rows)
+
+  p_bar <- ggplot(res_summary, aes(x = resolution, y = n_clusters)) +
+    geom_col(fill = "steelblue", alpha = 0.8) +
+    labs(title = paste0("Cluster count vs resolution — ", nm, " (", inspect_run, ")"),
+         x = "Resolution", y = "# clusters") +
+    theme_bw()
+
+  strip_plots <- list()
+  for (col in clust_cols) {
+    res_label    <- sub(paste0(clust_prefix, "\\d+_"), "", col)
+    n_cl         <- nlevels(factor(df[[col]]))
+    df[[col]]    <- factor(df[[col]])
+    centroids    <- df |> group_by(.data[[col]]) |>
+      summarise(UMAP1 = median(UMAP1), UMAP2 = median(UMAP2), .groups = "drop")
+    strip_plots[[col]] <- ggplot(df, aes(x = UMAP1, y = UMAP2, colour = .data[[col]])) +
+      geom_point(size = 0.4, alpha = 0.5, show.legend = FALSE) +
+      ggrepel::geom_label_repel(data = centroids, aes(label = .data[[col]]),
+                                size = 2.5, show.legend = FALSE,
+                                label.padding = unit(0.12, "lines"),
+                                max.overlaps = Inf) +
+      labs(title = paste0(res_label, "  (", n_cl, " cl)")) +
+      theme_void(base_size = 8) +
+      theme(plot.title = element_text(size = 8, hjust = 0.5))
+  }
+
+  col_inspect <- cluster_col_res(df, INSPECT_RES)
+  cluster_tbl <- df |>
+    count(.data[[col_inspect]], name = "n_cells") |>
+    rename(cluster = 1) |>
+    mutate(pct = round(100 * n_cells / sum(n_cells), 1)) |>
+    arrange(desc(n_cells))
+
+  p_sizes <- ggplot(cluster_tbl, aes(x = reorder(cluster, -n_cells), y = n_cells)) +
+    geom_col(fill = "mediumpurple", alpha = 0.8) +
+    geom_text(aes(label = paste0(pct, "%")), vjust = -0.4, size = 3) +
+    labs(title = paste0("Cluster sizes — ", nm, "  res ", INSPECT_RES),
+         x = "Cluster", y = "# cells") +
+    theme_bw()
+
+  print(p_bar)
+  print(wrap_plots(strip_plots, ncol = 3))
+  print(p_sizes)
+  rm(runs); gc()
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 7. SCENT potency scores (scaled) {.tabset}
+
+Compute signaling entropy (SCENT) potency scores to estimate cellular stemness/differentiation state. Scores are scaled 0-1 per compartment. Higher scores indicate higher potency (stemness); lower scores indicate more differentiated states.
+
+**Note:** Set `ORDER_CELLS = TRUE` in params chunk to plot high-potency cells on top (default: FALSE).
+
+::: {.panel-tabset}
+
+```{r scent-load}
+#| results: asis
+
+# Load precomputed SCENT metadata from targets (includes scores + metadata)
+scent_meta <- list()
+for (nm in SUBSET_NAMES) {
+  target_nm <- paste0("scent_meta_", nm)
+  targets::tar_load_raw(target_nm)
+  scent_meta[[nm]] <- get(target_nm)
+  rm(list = target_nm)
+}
+```
+
+```{r scent-umap-tabs}
+#| results: asis
+#| fig-width: 12
+#| fig-height: 8
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, "\n\n")
+
+  # Load Seurat object for UMAP coords and metadata
+  target_nm <- paste0("mpn_processed_data_", nm)
+  targets::tar_load_raw(target_nm)
+  srt <- get(target_nm)
+  rm(list = target_nm)
+
+  # Get UMAP coords and join with SCENT metadata
+  umap_emb <- Seurat::Embeddings(srt, "umap.nn")[, 1:2] %>%
+    as.data.frame() %>%
+    setNames(c("UMAP1", "UMAP2")) %>%
+    tibble::rownames_to_column("cell.name") %>%
+    dplyr::left_join(scent_meta[[nm]], by = "cell.name")
+
+  # Order cells by expression if requested (high values plotted on top)
+  if (ORDER_CELLS) {
+    umap_emb <- umap_emb %>% dplyr::arrange(scaled_potency)
+  }
+
+  # Scaled potency UMAP faceted by sample
+  p_scaled <- ggplot(umap_emb, aes(x = UMAP1, y = UMAP2, colour = scaled_potency)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    scale_colour_viridis_c(option = "turbo") +
+    facet_wrap(~ sample.name, ncol = 3) +
+    labs(title = paste0(nm, " — SCENT scaled potency (0-1)"),
+         colour = "Scaled\nPotency") +
+    theme_bw() +
+    theme(legend.position = "right")
+
+  print(p_scaled)
+
+  rm(srt); gc()
+  cat("\n\n")
+}
+```
+
+```{r scent-violin-tabs}
+#| results: asis
+#| fig-width: 12
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, " — Violin by cluster\n\n")
+
+  # Load Seurat object for metadata
+  target_nm <- paste0("mpn_processed_data_", nm)
+  targets::tar_load_raw(target_nm)
+  srt <- get(target_nm)
+  rm(list = target_nm)
+
+  # Get cluster column
+  clust_col <- cluster_col_res(srt@meta.data, INSPECT_RES)
+
+  # Prepare data for violin plot
+  plot_df <- tibble::tibble(
+    cell.name = colnames(srt),
+    cluster   = srt@meta.data[[clust_col]]
+  ) %>%
+    dplyr::left_join(scent_meta[[nm]], by = "cell.name")
+
+  # Order clusters by median scaled potency
+  cluster_order <- plot_df %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::summarise(median_potency = median(scaled_potency, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(desc(median_potency)) %>%
+    dplyr::pull(cluster)
+
+  plot_df$cluster <- factor(plot_df$cluster, levels = cluster_order)
+
+  # Scaled potency violin
+  p_scaled_violin <- ggplot(plot_df, aes(x = cluster, y = scaled_potency, fill = cluster)) +
+    geom_violin(scale = "width", alpha = 0.7, show.legend = FALSE) +
+    geom_boxplot(width = 0.1, alpha = 0.5, outlier.size = 0.5, show.legend = FALSE) +
+    labs(title = paste0(nm, " — SCENT scaled potency by cluster (res ", INSPECT_RES, ")"),
+         x = "Cluster", y = "Scaled potency (0-1)") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p_scaled_violin)
+
+  rm(srt); gc()
+  cat("\n\n")
+}
+```
+
+```{r scent-density-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, " — Density by sample\n\n")
+
+  # Density plot
+  p_density <- scent_meta[[nm]] %>%
+    ggplot(aes(x = scaled_potency, colour = sample.name)) +
+    geom_density(linewidth = 1) +
+    labs(title = paste0(nm, " — SCENT scaled potency density"),
+         x = "Scaled potency (0-1)", y = "Density",
+         colour = "Sample") +
+    theme_bw() +
+    theme(legend.position = "right")
+
+  print(p_density)
+  cat("\n\n")
+}
+```
+
+```{r scent-histogram-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, " — Histogram by sample\n\n")
+
+  # Histogram
+  p_histogram <- scent_meta[[nm]] %>%
+    ggplot(aes(x = scaled_potency, fill = sample.name)) +
+    geom_histogram(position = position_dodge(), bins = 50) +
+    labs(title = paste0(nm, " — SCENT scaled potency histogram"),
+         x = "Scaled potency (0-1)", y = "Count",
+         fill = "Sample") +
+    theme_bw() +
+    theme(legend.position = "right")
+
+  print(p_histogram)
+  cat("\n\n")
+}
+```
+
+```{r scent-scatter-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, " — Potency vs nFeature_RNA\n\n")
+
+  # Shuffle rows for random plotting order
+  plot_df <- scent_meta[[nm]] %>%
+    dplyr::slice_sample(prop = 1)
+
+  # Scatter plot with lm line per sample
+  p_scatter <- ggplot(plot_df, aes(x = nFeature_RNA, y = scaled_potency, colour = sample.name)) +
+    geom_point(size = 0.5, alpha = 0.3) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.2) +
+    labs(title = paste0(nm, " — SCENT potency vs gene count"),
+         x = "nFeature_RNA", y = "Scaled potency (0-1)",
+         colour = "Sample") +
+    theme_bw() +
+    theme(legend.position = "right")
+
+  print(p_scatter)
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 8. CytoTRACE differentiation scores {.tabset}
+
+Compute CytoTRACE scores to predict differentiation state. Higher scores indicate stem-like/progenitor states; lower scores indicate terminally differentiated cells.
+
+**Note:** Set `ORDER_CELLS = TRUE` in params chunk to plot high-scoring cells on top (default: FALSE).
+
+::: {.panel-tabset}
+
+```{r cytotrace-compute}
+#| results: asis
+
+cytotrace_results <- list()
+
+for (nm in SUBSET_NAMES) {
+  cat("Processing", nm, "...\n")
+
+  target_nm <- paste0("mpn_processed_data_", nm)
+  targets::tar_load_raw(target_nm)
+  srt <- get(target_nm)
+  rm(list = target_nm)
+
+  # Compute CytoTRACE scores
+  cytotrace_df <- get_cytotrace(srt)
+
+  # Add scores to metadata
+  srt <- Seurat::AddMetaData(srt, cytotrace_df[colnames(srt), "cytotrace"], col.name = "cytotrace")
+
+  cytotrace_results[[nm]] <- srt
+
+  gc()
+}
+```
+
+```{r cytotrace-umap-tabs}
+#| results: asis
+#| fig-width: 10
+#| fig-height: 5
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, " — UMAP\n\n")
+
+  srt <- cytotrace_results[[nm]]
+
+  umap_emb <- Seurat::Embeddings(srt, "umap.nn")[, 1:2] %>%
+    as.data.frame() %>%
+    setNames(c("UMAP1", "UMAP2")) %>%
+    tibble::rownames_to_column("cell.name") %>%
+    dplyr::mutate(cytotrace = srt$cytotrace)
+
+  # Order cells by expression if requested (high values plotted on top)
+  if (ORDER_CELLS) {
+    umap_emb <- umap_emb %>% dplyr::arrange(cytotrace)
+  }
+
+  # CytoTRACE UMAP
+  p_cytotrace <- ggplot(umap_emb, aes(x = UMAP1, y = UMAP2, colour = cytotrace)) +
+    geom_point(size = 0.7, alpha = 0.6) +
+    scale_colour_viridis_c(option = "magma") +
+    labs(title = paste0(nm, " — CytoTRACE score"),
+         colour = "CytoTRACE") +
+    theme_bw() +
+    theme(legend.position = "right")
+
+  print(p_cytotrace)
+  cat("\n\n")
+}
+```
+
+```{r cytotrace-violin-tabs}
+#| results: asis
+#| fig-width: 12
+#| fig-height: 6
+
+for (nm in SUBSET_NAMES) {
+  cat("\n\n### ", nm, " — Violin by cluster\n\n")
+
+  srt <- cytotrace_results[[nm]]
+
+  # Get cluster column
+  clust_col <- cluster_col_res(srt@meta.data, INSPECT_RES)
+
+  # Prepare data for violin plot
+  plot_df <- tibble::tibble(
+    cluster   = srt@meta.data[[clust_col]],
+    cytotrace = srt$cytotrace
+  )
+
+  # Order clusters by median CytoTRACE (highest → lowest)
+  cluster_order <- plot_df |>
+    dplyr::group_by(cluster) |>
+    dplyr::summarise(median_cytotrace = median(cytotrace, na.rm = TRUE), .groups = "drop") |>
+    dplyr::arrange(desc(median_cytotrace)) |>
+    dplyr::pull(cluster)
+
+  plot_df$cluster <- factor(plot_df$cluster, levels = cluster_order)
+
+  # CytoTRACE violin
+  p_cytotrace_violin <- ggplot(plot_df, aes(x = cluster, y = cytotrace, fill = cluster)) +
+    geom_violin(scale = "width", alpha = 0.7, show.legend = FALSE) +
+    geom_boxplot(width = 0.1, alpha = 0.5, outlier.size = 0.5, show.legend = FALSE) +
+    labs(title = paste0(nm, " — CytoTRACE by cluster (res ", INSPECT_RES, ")"),
+         x = "Cluster", y = "CytoTRACE score") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p_cytotrace_violin)
+
+  rm(srt); gc()
+  cat("\n\n")
+}
+```
+
+:::
+
+{{< include ../_session-info.qmd >}}

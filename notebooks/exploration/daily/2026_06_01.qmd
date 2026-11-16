@@ -1,0 +1,442 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+```{r}
+ys_wang <- readRDS("data/wang_2021_cell_stem_cell/seurat_obj/wang_ys_ref.rds")
+```
+
+```{r}
+DimPlot(ys_wang,group.by = "cluster",label = TRUE)
+DimPlot(ys_wang,group.by = "stage",label = TRUE)
+DimPlot(ys_wang,group.by = "age",label = TRUE)
+DimPlot(ys_wang,group.by = "site",label = TRUE)
+```
+
+```{r}
+fl_wang <- readRDS("data/wang_2021_cell_stem_cell/seurat_obj/wang_fl_ref.rds")
+```
+
+```{r}
+DimPlot(fl_wang,group.by = "cluster",label = TRUE)
+DimPlot(fl_wang,group.by = "stage",label = TRUE)
+DimPlot(fl_wang,group.by = "age",label = TRUE)
+DimPlot(fl_wang,group.by = "site",label = TRUE)
+```
+
+```{r}
+targets::tar_load(mpn_processed_hsc_fullcc)
+```
+
+```{r}
+proj_wang_fl <- project_mm_onto_hs_seurat(ref = fl_wang,
+                                query = mpn_processed_hsc_fullcc,
+                                ortho_table = mm_hs_ortho_long,
+                                assay = "RNA",
+                                tranfer_list = list(
+                                  cluster  = "cluster",
+                                  stage = "stage")
+      )
+```
+
+```{r}
+proj_wang_fl %>%
+  ggplot(aes(refUMAP_1,  refUMAP_2, color = sample.name))+
+  geom_point(size = 0.1)+
+  facet_wrap(~sample.name)
+```
+
+```{r}
+rownames(proj_wang_fl) <- proj_wang_fl$cell_id
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc, proj_wang_fl)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = F,
+            features = "mapping.score",
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo",limits = c(0,1))
+
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "sample.name", 
+        group.by = "predicted.cluster", label = TRUE)
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "sample.name", 
+        group.by = "predicted.stage", label = TRUE)
+```
+
+```{r}
+hesc6_wang <- readRDS("data/wang_2021_cell_stem_cell/seurat_obj/wang_hesc_d6_ref.rds")
+```
+
+```{r}
+DimPlot(hesc6_wang,group.by = "cluster",label = TRUE)
+
+```
+
+```{r}
+ys_fl_mk_wang <- readRDS("data/wang_2021_cell_stem_cell/seurat_obj/wang_ys_fl_mk_ref.rds")
+```
+
+```{r}
+DimPlot(ys_fl_mk_wang,group.by = "sub_cluster",label = TRUE)
+DimPlot(ys_fl_mk_wang,group.by = "site",label = TRUE)
+FeaturePlot(ys_fl_mk_wang,features = "primitive.MK.score")
+FeaturePlot(ys_fl_mk_wang,features = "definitive..MK.score")
+```
+
+```{r}
+ys_fl_mk_wang <- RunUMAP(ys_fl_mk_wang, dims = 2:10, reduction = "harmony",
+                    reduction.name = "umap", return.model = TRUE,
+                    verbose = FALSE); gc()
+```
+
+```{r}
+targets::tar_load(mpn_processed_hsc_fullcc)
+```
+
+```{r}
+proj_wang_mk <- project_mm_onto_hs_seurat(ref = ys_fl_mk_wang,
+                                query = mpn_processed_hsc_fullcc,
+                                ortho_table = mm_hs_ortho_long,
+                                assay = "RNA",
+                                tranfer_list = list(
+                                  site  = "site",
+                                  sub_cluster = "sub_cluster")
+      )
+```
+
+```{r}
+proj_wang_mk %>%
+  ggplot(aes(refUMAP_1,  refUMAP_2, color = sample.name))+
+  geom_point(size = 0.1)+
+  facet_wrap(~sample.name)
+```
+
+```{r}
+rownames(proj_wang_mk) <- proj_wang_mk$cell_id
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc, proj_wang_mk)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = F,
+            features = "mapping.score",
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo",limits = c(0,1))
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = F,
+            features = "mapping.score",
+            reduction = "umap.nn",
+            split.by = "Phase")&scale_color_viridis_c(option = "turbo",limits = c(0,1))
+
+
+```
+
+```{r}
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "sample.name", 
+        group.by = "predicted.sub_cluster", label = TRUE)
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "Phase", 
+        group.by = "predicted.sub_cluster", label = TRUE)
+```
+
+```{r}
+hesc_merged_wang <- readRDS("data/wang_2021_cell_stem_cell/seurat_obj/wang_hesc_merged_ref.rds")
+```
+
+```{r}
+DimPlot(hesc_merged_wang,group.by = "day",label = TRUE)
+DimPlot(hesc_merged_wang,group.by = "celltype",label = TRUE)
+
+```
+
+```{r}
+proj_wang_hesc <- project_mm_onto_hs_seurat(ref = hesc_merged_wang,
+                                query = mpn_processed_hsc_fullcc,
+                                ortho_table = mm_hs_ortho_long,
+                                assay = "RNA",
+                                tranfer_list = list(
+                                  day  = "day",
+                                  celltype = "celltype")
+      )
+```
+
+```{r}
+rownames(proj_wang_hesc) <- proj_wang_hesc$cell_id
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc, proj_wang_hesc)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = F,
+            features = "mapping.score",
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo",limits = c(0,1))
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = F,
+            features = "mapping.score",
+            reduction = "umap.nn",
+            split.by = "Phase")&scale_color_viridis_c(option = "turbo",limits = c(0,1))
+
+```
+
+```{r}
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "sample.name", 
+        group.by = "predicted.day", label = TRUE)
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "sample.name", 
+        group.by = "predicted.celltype", label = TRUE)
+```
+
+```{r}
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Hlf","Kit","Cd34"),
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo")
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Vcam1"),
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo")
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Icam1","Col1a2","Fn1","Vcam1", "Thy1", "Cdh11"),
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo")
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Pecam1","Ptprc","Icam1","Vcam1", "Epcam"),
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo")
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Gypa","Hba-a1", "Hba-a2", "Gata1", "Epor"),
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo")
+
+```
+
+```{r}
+VlnPlot(mpn_processed_hsc_fullcc, 
+        features = "Gata1",
+        group.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE)
+```
+
+```{r}
+VlnPlot(mpn_processed_hsc_fullcc, 
+        features = "Gfi1b",
+        group.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE)
+```
+
+```{r}
+bandyopadhyay_bm <- readRDS("data/bandyopadhyay_2024_cell/GSE253355_Normal_Bone_Marrow_Atlas_Seurat_SB_v2.rds")
+```
+
+```{r}
+proj_wang_hesc <- project_mm_onto_hs_seurat(ref = bandyopadhyay_bm,
+                                query = mpn_processed_hsc_fullcc,
+                                ortho_table = mm_hs_ortho_long,
+                                assay = "RNA",
+                                project_umap = FALSE,
+                                tranfer_list = list(
+                                  cluster_anno_l2  = "cluster_anno_l2")
+      )
+```
+
+```{r}
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc, proj_wang_hesc)
+```
+
+AEC: arterial endothelial cell
+
+SEC: sinusoidal endothelia
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = F,
+            features = c("mapping.score"),
+            reduction = "umap.nn",
+            split.by = "sample.name")&scale_color_viridis_c(option = "turbo")
+
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "sample.name", 
+        group.by = "predicted.cluster_anno_l2",
+        repel = TRUE,
+        label = TRUE)&NoLegend()
+```
+
+```{r}
+DimPlot(mpn_processed_hsc_fullcc,
+        split.by = "predicted.cluster_anno_l2", 
+        group.by = "sample.name",ncol = 6)&NoLegend()
+```
+
+```{r}
+DimPlot(subset(mpn_processed_hsc_fullcc, predicted.cluster_anno_l2 %in% c("Megakaryocyte")),
+        split.by = "sample.name", 
+        group.by = "predicted.cluster_anno_l2",ncol = 6)
+```
+
+```{r}
+stemness_11 <- read.csv("data/isobe_2023_cell_genom/preleukemic_stemness_geneset.csv")
+```
+
+```{r}
+targets::tar_load(mm_hs_ortho_long)
+stemness_11_ortho <- mm_hs_ortho_long %>%
+  inner_join(stemness_11, by = c("human_ortho" = "stem11"))
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = TRUE,
+            features = stemness_11_ortho$Mouse.gene.name[1:4],
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = TRUE,
+            features = stemness_11_ortho$Mouse.gene.name[5:7],
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = TRUE,
+            features = stemness_11_ortho$Mouse.gene.name[9:11],
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+LSC17 genes
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = TRUE,
+            features = c("Dnmt3b", "Zbtb46", "Nynrin", "Arhgap22"),
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.01)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = TRUE,
+            features = c("Laptm4b", "Mmrn1", "Dpysl3"),
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.01)&scale_color_viridis_c(option = "turbo")
+```
+
+<https://pmc.ncbi.nlm.nih.gov/articles/PMC7401791/>
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = TRUE,
+            features = c("Zbtb46"),
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.01)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = TRUE,
+            features = c("Cdk6", "Cpxm1", "Socs2", "Gm4419", "Emp1", "Ngfrap1", "Akr1c6", "Gpr56"),
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.01)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = F,
+            features = c("Zbtb46","Nfkbia", "Klf4"),
+            reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Igf1"),
+            reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Npnt"),
+            reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Nupr1"),
+            reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Mmp16", "Mmp19", "Mmp14", "Mmp28"),
+            reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Pdgfrb"),
+            reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            order = T,
+            features = c("Stat3"),
+            reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1)&scale_color_viridis_c(option = "turbo")
+```

@@ -1,0 +1,564 @@
+---
+title: "Mpig6b Expression — Raw vs Processed"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(targets)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(DT)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+theme_set(theme_cowplot(font_size = 11))
+
+GENE         <- "Mpig6b"
+MIN_CELLS    <- 20   # pipeline gene-filter threshold (metadata/project_config.yaml)
+cond_pal     <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+cond_order   <- c("WT", "mCh-", "mCh+")
+COMPARTMENTS <- c("HSC", "MNC", "Stroma")
+```
+
+```{r helpers}
+#| include: false
+
+# ── Extract raw counts for GENE from a Seurat RNA assay ──────────────────────
+extract_raw_counts <- function(srt) {
+  if (!GENE %in% rownames(srt)) return(NULL)
+  vals <- Seurat::GetAssayData(srt, assay = "RNA", layer = "counts")[GENE, ]
+  data.frame(cell_id = names(vals), raw_counts = as.numeric(vals))
+}
+
+# ── Extract SCT expression for GENE (returns NULL if gene absent) ─────────────
+extract_sct_expr <- function(srt) {
+  if (!GENE %in% rownames(srt)) return(NULL)
+  vals <- Seurat::GetAssayData(srt, assay = "SCT", layer = "data")[GENE, ]
+  data.frame(cell_id = names(vals), sct_expr = as.numeric(vals))
+}
+
+# ── Derive condition label from sample.name ───────────────────────────────────
+label_condition <- function(x) {
+  dplyr::case_when(
+    grepl("WT",      x) ~ "WT",
+    grepl("mCh-",    x) ~ "mCh-",
+    grepl("mCh\\+",  x) ~ "mCh+",
+    TRUE                 ~ x
+  )
+}
+
+# ── Detection-rate summary ────────────────────────────────────────────────────
+detection_table <- function(df, expr_col = "raw_counts") {
+  df %>%
+    dplyr::mutate(detected = .data[[expr_col]] > 0) %>%
+    dplyr::group_by(compartment, condition, pass_cell) %>%
+    dplyr::summarise(
+      n_cells    = dplyr::n(),
+      n_detected = sum(detected),
+      pct        = round(100 * n_detected / n_cells, 2),
+      .groups    = "drop"
+    ) %>%
+    dplyr::arrange(compartment, condition, pass_cell)
+}
+
+# ── UMAP scatter coloured by expression ──────────────────────────────────────
+umap_expr <- function(df, expr_col, title, pt_size = 0.4, alpha = 0.6) {
+  df_ord <- df[order(df[[expr_col]]), ]
+  zero   <- df_ord[[expr_col]] == 0
+  ggplot() +
+    geom_point(data = df_ord[zero,  ],
+               aes(UMAP1, UMAP2), colour = "grey85",
+               size = pt_size, alpha = alpha) +
+    geom_point(data = df_ord[!zero, ],
+               aes(UMAP1, UMAP2, colour = .data[[expr_col]]),
+               size = pt_size, alpha = alpha) +
+    scale_colour_viridis_c(option = "magma", name = expr_col) +
+    ggtitle(title) +
+    theme(axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          axis.text = element_blank(),
+          axis.title = element_blank(),
+          legend.position = "right")
+}
+
+# ── Violin + jitter by condition (singlets only) ──────────────────────────────
+violin_condition <- function(df, expr_col, title) {
+  sing <- df %>%
+    dplyr::filter(!dm2_class %in% c("negative", "multiplet")) %>%
+    { if ("pass_cell" %in% colnames(.)) dplyr::filter(., pass_cell == TRUE) else . } %>%
+    dplyr::mutate(condition = factor(condition, levels = cond_order))
+  ggplot(sing, aes(condition, .data[[expr_col]], fill = condition)) +
+    geom_violin(scale = "width", trim = TRUE) +
+    geom_jitter(width = 0.2, size = 0.3, alpha = 0.3) +
+    scale_fill_manual(values = cond_pal, guide = "none") +
+    labs(title = title, x = NULL,
+         y = if (expr_col == "raw_counts") "Raw UMI counts" else "SCT log-normalised") +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1))
+}
+
+# ── Violin by cluster (singlets, pass_cell only) ──────────────────────────────
+violin_cluster <- function(df, expr_col, title) {
+  clust_df <- df %>%
+    dplyr::filter(!dm2_class %in% c("negative", "multiplet")) %>%
+    { if ("pass_cell" %in% colnames(.)) dplyr::filter(., pass_cell == TRUE) else . } %>%
+    dplyr::mutate(cluster = factor(cluster))
+  ggplot(clust_df, aes(cluster, .data[[expr_col]], fill = cluster)) +
+    geom_violin(scale = "width", trim = TRUE) +
+    geom_jitter(width = 0.2, size = 0.3, alpha = 0.3) +
+    labs(title = title, x = "Cluster",
+         y = if (expr_col == "raw_counts") "Raw UMI counts" else "SCT log-normalised") +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 25, hjust = 1))
+}
+```
+
+# Overview
+
+**Gene:** *Mpig6b* (CLEC1B / CLEC-2 receptor; platelet ITAM signalling)
+
+This notebook asks whether *Mpig6b* is detectable in bone-marrow compartments
+(HSC, MNC, Stroma) and, if so, whether its expression differs by genotype
+condition (WT / Het mCh− / Het mCh+).
+
+Because *Mpig6b* is low-abundance, it may fail the pipeline's `min_cells_per_gene`
+filter (threshold = `r MIN_CELLS` cells) and therefore be absent from the
+SCTransform-processed objects. We therefore inspect:
+
+1. **Raw counts** (`RNA` assay, pre-QC, pre-gene-filter) — maximum sensitivity.
+2. **SCT expression** (processed `DietSeurat`) — confirms presence/absence after
+   the gene-filter step and normalisation.
+
+The **pre-QC UMAP** (`mpn_raw_processed_*`) provides a layout for all raw cells;
+the **post-QC UMAP** (`mpn_processed_data_*`) is used when SCT expression is
+available.
+
+---
+
+# Detection summary — all compartments
+
+```{r detection-summary}
+# Load raw objects and anno_raw_meta to build a pooled detection table.
+# Each block: load → extract → merge → rm → gc.
+
+build_raw_df <- function(raw_target, raw_meta_target) {
+  targets::tar_load_raw(raw_target)
+  srt    <- get(raw_target)
+  counts <- extract_raw_counts(srt)
+  rm(list = raw_target); gc()
+
+  targets::tar_load_raw(raw_meta_target)
+  meta <- get(raw_meta_target)
+  rm(list = raw_meta_target); gc()
+
+  if (is.null(counts)) return(NULL)
+  meta %>%
+    dplyr::left_join(counts, by = "cell_id")
+}
+
+hsc_raw    <- build_raw_df("mpn_raw_hsc",    "anno_raw_meta_hsc")
+mnc_raw    <- build_raw_df("mpn_raw_mnc",    "anno_raw_meta_mnc")
+stroma_raw <- build_raw_df("mpn_raw_stroma", "anno_raw_meta_stroma")
+
+# Attach compartment label and cluster + condition columns
+prep_df <- function(df, comp) {
+  if (is.null(df)) return(NULL)
+  clust_col <- grep("sNN_pca.*_res\\.0\\.1$", colnames(df), value = TRUE)[1]
+  df %>%
+    dplyr::mutate(
+      compartment = comp,
+      condition   = label_condition(sample.name),
+      raw_counts  = if ("raw_counts" %in% colnames(.)) raw_counts else 0L,
+      cluster     = if (!is.na(clust_col)) .data[[clust_col]] else NA_character_
+    )
+}
+
+hsc_raw    <- prep_df(hsc_raw,    "HSC")
+mnc_raw    <- prep_df(mnc_raw,    "MNC")
+stroma_raw <- prep_df(stroma_raw, "Stroma")
+
+all_raw <- dplyr::bind_rows(hsc_raw, mnc_raw, stroma_raw)
+```
+
+```{r detection-table}
+detection_table(all_raw) %>%
+  DT::datatable(
+    caption   = paste0(GENE, " detection rate per compartment × condition × QC pass"),
+    rownames  = FALSE,
+    filter    = "top",
+    options   = list(pageLength = 20, scrollY = "360px", scrollCollapse = TRUE)
+  )
+```
+
+```{r gene-filter-check}
+#| results: asis
+# Report how many cells (pass_cell == TRUE, singlets) express Mpig6b per compartment
+# vs the min_cells_per_gene threshold.
+cat("\n**Gene-filter check** (`min_cells_per_gene =", MIN_CELLS, "`):\n\n")
+all_raw %>%
+  dplyr::filter(pass_cell == TRUE,
+                !dm2_class %in% c("negative", "multiplet")) %>%
+  dplyr::group_by(compartment) %>%
+  dplyr::summarise(
+    n_singlets  = dplyr::n(),
+    n_expressed = sum(raw_counts > 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    passes_filter = dplyr::if_else(n_expressed >= MIN_CELLS, "YES", "NO"),
+    label = glue::glue("**{compartment}**: {n_expressed} / {n_singlets} singlets",
+                       " express {GENE} → filter: {passes_filter}")
+  ) %>%
+  dplyr::pull(label) %>%
+  paste(collapse = "\n\n") %>%
+  cat()
+```
+
+---
+
+# HSC
+
+```{r hsc-load-proc}
+#| include: false
+# Check if Mpig6b survived into the processed object
+targets::tar_load(mpn_processed_data_hsc)
+hsc_sct <- extract_sct_expr(mpn_processed_data_hsc)
+hsc_in_proc <- !is.null(hsc_sct)
+
+# Post-QC metadata (UMAP + cluster)
+hsc_anno <- targets::tar_read(anno_meta_hsc)
+rm(mpn_processed_data_hsc); gc()
+
+if (hsc_in_proc) {
+  clust_col_proc <- grep("sNN_pca.*_res\\.0\\.1$", colnames(hsc_anno), value = TRUE)[1]
+  hsc_proc_df <- hsc_anno %>%
+    dplyr::left_join(hsc_sct, by = "cell_id") %>%
+    dplyr::mutate(
+      condition = label_condition(sample.name),
+      cluster   = if (!is.na(clust_col_proc)) .data[[clust_col_proc]] else NA_character_
+    )
+}
+```
+
+## Raw counts (pre-QC)
+
+```{r hsc-raw-umap}
+#| fig-width: 10
+#| fig-height: 4
+
+clust_col_raw <- grep("sNN_pca.*_res\\.0\\.1$", colnames(hsc_raw), value = TRUE)[1]
+
+p1 <- umap_expr(hsc_raw, "raw_counts",
+                paste0(GENE, " — HSC raw counts (all cells)"))
+p2 <- ggplot(hsc_raw, aes(UMAP1, UMAP2, colour = pass_cell)) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  scale_colour_manual(values = c(`TRUE` = "#2a9d8f", `FALSE` = "grey85"),
+                      name = "pass_cell") +
+  ggtitle("QC pass overlay") +
+  theme(axis.line = element_blank(), axis.ticks = element_blank(),
+        axis.text = element_blank(), axis.title = element_blank())
+p1 | p2
+```
+
+```{r hsc-raw-violin-cond}
+#| fig-width: 6
+#| fig-height: 4
+violin_condition(hsc_raw, "raw_counts",
+                 paste0(GENE, " by condition — HSC singlets (pass_cell)"))
+```
+
+```{r hsc-raw-violin-clust}
+#| fig-width: 7
+#| fig-height: 4
+if (!is.na(clust_col_raw))
+  print(violin_cluster(hsc_raw, "raw_counts",
+                       paste0(GENE, " by cluster — HSC singlets (pass_cell)")))
+```
+
+## Processed (SCT)
+
+```{r hsc-proc-section}
+#| results: asis
+if (!hsc_in_proc) {
+  cat(glue::glue(
+    "\n> **{GENE} is absent from the HSC processed object.**  \n",
+    "> It did not pass the `min_cells_per_gene = {MIN_CELLS}` gene filter ",
+    "applied to QC-passing singlets, or was excluded by SCTransform's variance ",
+    "filter. All analyses below are based on raw counts only.\n"
+  ))
+}
+```
+
+```{r hsc-proc-umap, eval=hsc_in_proc}
+#| fig-width: 10
+#| fig-height: 4
+p1 <- umap_expr(hsc_proc_df, "sct_expr",
+                paste0(GENE, " — HSC SCT expression (post-QC)"))
+p2 <- ggplot(hsc_proc_df,
+             aes(UMAP1, UMAP2, colour = factor(condition, cond_order))) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  scale_colour_manual(values = cond_pal, name = "condition") +
+  ggtitle("Condition overlay") +
+  theme(axis.line = element_blank(), axis.ticks = element_blank(),
+        axis.text = element_blank(), axis.title = element_blank())
+p1 | p2
+```
+
+```{r hsc-proc-violin-cond, eval=hsc_in_proc}
+#| fig-width: 6
+#| fig-height: 4
+violin_condition(
+  hsc_proc_df %>% dplyr::rename(pass_cell = pass_cell),
+  "sct_expr",
+  paste0(GENE, " SCT by condition — HSC singlets (pass_cell)")
+)
+```
+
+```{r hsc-proc-violin-clust, eval=hsc_in_proc}
+#| fig-width: 7
+#| fig-height: 4
+violin_cluster(hsc_proc_df, "sct_expr",
+               paste0(GENE, " SCT by cluster — HSC singlets (pass_cell)"))
+```
+
+---
+
+# MNC
+
+```{r mnc-load-proc}
+#| include: false
+targets::tar_load(mpn_processed_data_mnc)
+mnc_sct <- extract_sct_expr(mpn_processed_data_mnc)
+mnc_in_proc <- !is.null(mnc_sct)
+
+mnc_anno <- targets::tar_read(anno_meta_mnc)
+rm(mpn_processed_data_mnc); gc()
+
+if (mnc_in_proc) {
+  clust_col_proc_mnc <- grep("sNN_pca.*_res\\.0\\.1$", colnames(mnc_anno), value = TRUE)[1]
+  mnc_proc_df <- mnc_anno %>%
+    dplyr::left_join(mnc_sct, by = "cell_id") %>%
+    dplyr::mutate(
+      condition = label_condition(sample.name),
+      cluster   = if (!is.na(clust_col_proc_mnc)) .data[[clust_col_proc_mnc]] else NA_character_
+    )
+}
+```
+
+## Raw counts (pre-QC)
+
+```{r mnc-raw-umap}
+#| fig-width: 10
+#| fig-height: 4
+clust_col_raw_mnc <- grep("sNN_pca.*_res\\.0\\.1$", colnames(mnc_raw), value = TRUE)[1]
+
+p1 <- umap_expr(mnc_raw, "raw_counts",
+                paste0(GENE, " — MNC raw counts (all cells)"))
+p2 <- ggplot(mnc_raw, aes(UMAP1, UMAP2, colour = pass_cell)) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  scale_colour_manual(values = c(`TRUE` = "#2a9d8f", `FALSE` = "grey85"),
+                      name = "pass_cell") +
+  ggtitle("QC pass overlay") +
+  theme(axis.line = element_blank(), axis.ticks = element_blank(),
+        axis.text = element_blank(), axis.title = element_blank())
+p1 | p2
+```
+
+```{r mnc-raw-violin-cond}
+#| fig-width: 6
+#| fig-height: 4
+violin_condition(mnc_raw, "raw_counts",
+                 paste0(GENE, " by condition — MNC singlets (pass_cell)"))
+```
+
+```{r mnc-raw-violin-clust}
+#| fig-width: 7
+#| fig-height: 4
+if (!is.na(clust_col_raw_mnc))
+  print(violin_cluster(mnc_raw, "raw_counts",
+                       paste0(GENE, " by cluster — MNC singlets (pass_cell)")))
+```
+
+## Processed (SCT)
+
+```{r mnc-proc-section}
+#| results: asis
+if (!mnc_in_proc) {
+  cat(glue::glue(
+    "\n> **{GENE} is absent from the MNC processed object.**  \n",
+    "> It did not pass the `min_cells_per_gene = {MIN_CELLS}` gene filter ",
+    "applied to QC-passing singlets, or was excluded by SCTransform's variance ",
+    "filter. All analyses below are based on raw counts only.\n"
+  ))
+}
+```
+
+```{r mnc-proc-umap, eval=mnc_in_proc}
+#| fig-width: 10
+#| fig-height: 4
+p1 <- umap_expr(mnc_proc_df, "sct_expr",
+                paste0(GENE, " — MNC SCT expression (post-QC)"))
+p2 <- ggplot(mnc_proc_df,
+             aes(UMAP1, UMAP2, colour = factor(condition, cond_order))) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  scale_colour_manual(values = cond_pal, name = "condition") +
+  ggtitle("Condition overlay") +
+  theme(axis.line = element_blank(), axis.ticks = element_blank(),
+        axis.text = element_blank(), axis.title = element_blank())
+p1 | p2
+```
+
+```{r mnc-proc-violin-cond, eval=mnc_in_proc}
+#| fig-width: 6
+#| fig-height: 4
+violin_condition(mnc_proc_df, "sct_expr",
+                 paste0(GENE, " SCT by condition — MNC singlets (pass_cell)"))
+```
+
+```{r mnc-proc-violin-clust, eval=mnc_in_proc}
+#| fig-width: 7
+#| fig-height: 4
+violin_cluster(mnc_proc_df, "sct_expr",
+               paste0(GENE, " SCT by cluster — MNC singlets (pass_cell)"))
+```
+
+---
+
+# Stroma
+
+```{r stroma-load-proc}
+#| include: false
+targets::tar_load(mpn_processed_data_stroma)
+stroma_sct <- extract_sct_expr(mpn_processed_data_stroma)
+stroma_in_proc <- !is.null(stroma_sct)
+
+stroma_anno <- targets::tar_read(anno_meta_stroma)
+rm(mpn_processed_data_stroma); gc()
+
+if (stroma_in_proc) {
+  clust_col_proc_str <- grep("sNN_pca.*_res\\.0\\.1$", colnames(stroma_anno), value = TRUE)[1]
+  stroma_proc_df <- stroma_anno %>%
+    dplyr::left_join(stroma_sct, by = "cell_id") %>%
+    dplyr::mutate(
+      condition = label_condition(sample.name),
+      cluster   = if (!is.na(clust_col_proc_str)) .data[[clust_col_proc_str]] else NA_character_
+    )
+}
+```
+
+## Raw counts (pre-QC)
+
+```{r stroma-raw-umap}
+#| fig-width: 10
+#| fig-height: 4
+clust_col_raw_str <- grep("sNN_pca.*_res\\.0\\.1$", colnames(stroma_raw), value = TRUE)[1]
+
+p1 <- umap_expr(stroma_raw, "raw_counts",
+                paste0(GENE, " — Stroma raw counts (all cells)"))
+p2 <- ggplot(stroma_raw, aes(UMAP1, UMAP2, colour = pass_cell)) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  scale_colour_manual(values = c(`TRUE` = "#2a9d8f", `FALSE` = "grey85"),
+                      name = "pass_cell") +
+  ggtitle("QC pass overlay") +
+  theme(axis.line = element_blank(), axis.ticks = element_blank(),
+        axis.text = element_blank(), axis.title = element_blank())
+p1 | p2
+```
+
+```{r stroma-raw-violin-cond}
+#| fig-width: 6
+#| fig-height: 4
+violin_condition(stroma_raw, "raw_counts",
+                 paste0(GENE, " by condition — Stroma singlets (pass_cell)"))
+```
+
+```{r stroma-raw-violin-clust}
+#| fig-width: 7
+#| fig-height: 4
+if (!is.na(clust_col_raw_str))
+  print(violin_cluster(stroma_raw, "raw_counts",
+                       paste0(GENE, " by cluster — Stroma singlets (pass_cell)")))
+```
+
+## Processed (SCT)
+
+```{r stroma-proc-section}
+#| results: asis
+if (!stroma_in_proc) {
+  cat(glue::glue(
+    "\n> **{GENE} is absent from the Stroma processed object.**  \n",
+    "> It did not pass the `min_cells_per_gene = {MIN_CELLS}` gene filter ",
+    "applied to QC-passing singlets, or was excluded by SCTransform's variance ",
+    "filter. All analyses below are based on raw counts only.\n"
+  ))
+}
+```
+
+```{r stroma-proc-umap, eval=stroma_in_proc}
+#| fig-width: 10
+#| fig-height: 4
+p1 <- umap_expr(stroma_proc_df, "sct_expr",
+                paste0(GENE, " — Stroma SCT expression (post-QC)"))
+p2 <- ggplot(stroma_proc_df,
+             aes(UMAP1, UMAP2, colour = factor(condition, cond_order))) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  scale_colour_manual(values = cond_pal, name = "condition") +
+  ggtitle("Condition overlay") +
+  theme(axis.line = element_blank(), axis.ticks = element_blank(),
+        axis.text = element_blank(), axis.title = element_blank())
+p1 | p2
+```
+
+```{r stroma-proc-violin-cond, eval=stroma_in_proc}
+#| fig-width: 6
+#| fig-height: 4
+violin_condition(stroma_proc_df, "sct_expr",
+                 paste0(GENE, " SCT by condition — Stroma singlets (pass_cell)"))
+```
+
+```{r stroma-proc-violin-clust, eval=stroma_in_proc}
+#| fig-width: 7
+#| fig-height: 4
+violin_cluster(stroma_proc_df, "sct_expr",
+               paste0(GENE, " SCT by cluster — Stroma singlets (pass_cell)"))
+```
+
+---
+
+# Methods
+
+Raw counts were extracted from the `RNA` assay (unfiltered, pre-QC-cell-filter)
+of each compartment Seurat object (`mpn_raw_hsc/mnc/stroma`). UMAP coordinates
+used for raw visualisations are those from the pre-filter dim-reduction objects
+(`mpn_raw_processed_*`), which apply the same PCA → NN-graph → UMAP pipeline as
+the final processed objects but without removing low-quality cells.
+
+For SCT expression, the `DietSeurat` objects (`mpn_processed_data_*`) containing
+only QC-passing, singlet cells were queried. Any compartment where *Mpig6b* is
+absent from the `SCT` assay confirms that the gene was removed by the
+`min_cells_per_gene = `r MIN_CELLS`` threshold applied in `pass_gene_*` targets,
+or excluded by SCTransform's internal variance filter.
+
+Violin plots are restricted to singlet cells (`dm2_class` ∉ {negative, multiplet})
+that pass the cell QC filter (`pass_cell == TRUE`). Cells plotted in grey on UMAP
+panels carry zero counts.
+
+{{< include ../_session-info.qmd >}}

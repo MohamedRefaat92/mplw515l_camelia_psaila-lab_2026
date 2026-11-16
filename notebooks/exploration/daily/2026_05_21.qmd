@@ -1,0 +1,77 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Spata1", "Impa2", "Litaf"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Ece1", "Gcnt2", "Chd3", "Cdc42ep3"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Rsad1", "Mpo", "Ctsg", "Hba-a2"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Gpatch8", "Trim2", "Fcer1g", "Cdc42ep3"),split.by = "sample.name",order =T)&RestoreLegend()
+```
+
+```{r}
+stem_clusters <- c("7", "8")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters & Phase == "G1")
+gene_detection <- Matrix::rowSums(GetAssayData(srt_sub, "RNA", layer = "counts")>=1)
+srt_sub <- srt_sub[gene_detection>=10,]
+options(future.globals.maxSize = 8 * 1024^3)
+
+```
+
+
+```{r}
+srt_sub <- srt_sub %>% 
+  SCTransform(assay = "RNA",) %>% 
+  RunPCA(assay = "SCT") %>%
+   FindNeighbors(dims = 1:10) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:10,
+           min.dist = 0.05, 
+           n.neighbors = 15)
+
+```
+
+```{r}
+srt_sub <- srt_sub %>% 
+  SCTransform(assay = "RNA",
+              vars.to.regress = c("S.Score", "G2M.Score"),
+              residual.features = setdiff(srt_sub, unlist(proc_params$exclude_reporters))) %>% 
+  RunPCA(assay = "SCT") %>%
+   FindNeighbors(dims = 1:10) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:10,
+           min.dist = 0.05, 
+           n.neighbors = 15)
+
+```
+
+Binarize the data matrix
+
+```{r}
+
+stem_clusters <- c("7", "8")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters & Phase == "G1")
+gene_detection <- Matrix::rowSums(GetAssayData(srt_sub, "RNA", layer = "counts")>=1)
+rna_counts <- GetAssayData(srt_sub, "RNA", layer = "counts")[gene_detection>=10,]
+rna_counts[rna_counts>=1] <- 1
+srt_sub[["bin_RNA"]] <- CreateAssayObject(data = rna_counts)
+options(future.globals.maxSize = 8 * 1024^3)
+srt_sub <- srt_sub %>%
+  ScaleData(assay = "bin_RNA") %>% 
+  FindVariableFeatures(assay = "bin_RNA",selection.method = "disp") %>% 
+  RunPCA(assay = "bin_RNA") %>%
+   RunUMAP(dims = 1:10)
+```

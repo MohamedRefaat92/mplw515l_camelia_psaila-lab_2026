@@ -1,0 +1,414 @@
+---
+title: "Cluster Annotation"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(targets)
+library(mclust)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+config     <- yaml::read_yaml(file.path("metadata/project_config.yaml"))
+annotation <- config$annotation$cell_types
+
+SUBSETS     <- c("hsc", "mnc", "stroma")
+RESOLUTIONS <- c(0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9)
+
+# Flat named list: cell_type → character vector of markers
+marker_list <- list()
+for (ct in names(annotation)) {
+  m <- annotation[[ct]]$markers
+  marker_list[[ct]] <- if (is.list(m)) unlist(m) else as.character(m)
+}
+
+all_markers  <- unique(unlist(marker_list))
+stroma_types <- c("MSC", "Fibroblast", "Osteolineage", "Chondrocyte",
+                  "Pericyte", "Neuronal", "Endothelial_arteriolar",
+                  "Endothelial_sinusoidal")
+stroma_markers <- unique(unlist(marker_list[stroma_types]))
+
+# Reference IDs and display names.
+# Target name pattern: proj_<ref_id>_<subset>  (data.frame in targets cache)
+REFERENCES <- list(
+  tms_bm   = "TMS Marrow",
+  tms_sp   = "TMS Spleen (ctrl)",
+  tms_lu   = "TMS Lung (ctrl)",
+  tms_ki   = "TMS Kidney (ctrl)",
+  bm_atlas = "Marrow Atlas",
+  mca_pb   = "MCA Peripheral Blood",
+  mca_bm   = "MCA Bone Marrow",
+  mca_ckit = "MCA BM c-Kit",
+  mca_mes  = "MCA BM Mesenchyme"
+)
+REF_IDS     <- names(REFERENCES)
+COMPARTMENT <- c(hsc = "HSC", mnc = "MNC", stroma = "Stroma")
+```
+
+# Guide
+
+## Canonical markers
+
+```{r marker-table, echo=FALSE}
+ct_names    <- names(marker_list)
+marker_strs <- sapply(marker_list, paste, collapse = ", ")
+marker_df   <- data.frame(`Cell type` = ct_names,
+                           Markers     = marker_strs,
+                           check.names = FALSE)
+knitr::kable(marker_df, row.names = FALSE)
+```
+
+## Reference datasets
+
+```{r ref-table, echo=FALSE}
+ref_df_tbl <- data.frame(
+  Target         = paste0("proj_", REF_IDS, "_<compartment>"),
+  `Display name` = unlist(unname(REFERENCES)),
+  Method         = "RunAzimuth",
+  check.names    = FALSE)
+knitr::kable(ref_df_tbl, row.names = FALSE)
+```
+
+TMS Lung and Kidney references serve as negative controls: consistent labelling by lung or kidney cell types signals weak transfer rather than a true bone marrow identity.
+
+------------------------------------------------------------------------
+
+# Cross-compartment marker UMAPs
+
+Gene expression UMAPs for each cell-type marker group across all three compartments. Within each tab: rows = genes, columns = HSC \| MNC \| Stroma.
+
+```{r cross-load}
+tar_load(anno_meta_hsc)
+tar_load(anno_meta_mnc)
+tar_load(anno_meta_stroma)
+tar_load(anno_expr_hsc)
+tar_load(anno_expr_mnc)
+tar_load(anno_expr_stroma)
+```
+
+::: panel-tabset
+```{r cross-umap-plots, results='asis'}
+meta_list <- list(HSC = anno_meta_hsc, MNC = anno_meta_mnc, Stroma = anno_meta_stroma)
+expr_list <- list(HSC = anno_expr_hsc, MNC = anno_expr_mnc, Stroma = anno_expr_stroma)
+
+for (ct in names(marker_list)) {
+  genes   <- marker_list[[ct]]
+  n_genes <- length(genes)
+  cat("##", ct, "\n\n")
+
+  all_panels <- list()
+  for (gene in genes) {
+    for (comp in c("HSC", "MNC", "Stroma")) {
+      meta <- meta_list[[comp]]
+      expr <- expr_list[[comp]]
+      if (!gene %in% colnames(expr)) {
+        p <- ggplot() +
+          annotate("text", x = 0.5, y = 0.5, label = paste0(gene, "\n(absent)"), size = 3) +
+          theme_void() + labs(title = paste(comp, "—", gene))
+      } else {
+        coords <- merge(meta[, c("cell_id", "UMAP1", "UMAP2")],
+                        expr[, c("cell_id", gene)], by = "cell_id")
+        coords <- coords[order(coords[[gene]]), ]
+        p <- ggplot(coords, aes(UMAP1, UMAP2, colour = .data[[gene]])) +
+          geom_point(size = 0.25, alpha = 0.8) +
+          scale_colour_viridis_c(option = "mako", name = gene) +
+          labs(title = paste0(comp, " — ", gene)) +
+          theme_void(base_size = 9) +
+          theme(plot.title     = element_text(size = 9),
+                legend.key.size = unit(0.35, "cm"),
+                legend.text    = element_text(size = 7))
+      }
+      all_panels <- c(all_panels, list(p))
+    }
+  }
+
+  fig_h <- max(2.5, n_genes * 2.8)
+  knitr::opts_chunk$set(fig.height = fig_h, fig.width = 11)
+  print(wrap_plots(all_panels, ncol = 3, byrow = TRUE) +
+    plot_annotation(title = paste0(ct, " markers"),
+      theme = theme(plot.title = element_text(size = 11, face = "bold"))))
+  cat("\n\n")
+}
+```
+:::
+
+```{r cross-cleanup}
+rm(meta_list, expr_list,
+   anno_meta_hsc, anno_meta_mnc, anno_meta_stroma,
+   anno_expr_hsc, anno_expr_mnc, anno_expr_stroma)
+gc()
+```
+
+------------------------------------------------------------------------
+
+# Clustering resolutions
+
+UMAP coloured by cluster identity at each resolution. Use these panels alongside the ARI and heatmap summaries (in the Reference sections below) to select a final resolution per compartment.
+
+::: panel-tabset
+```{r recluster-load}
+tar_load(anno_meta_hsc);             tar_load(annotation_recluster_hsc)
+tar_load(anno_meta_mnc);             tar_load(annotation_recluster_mnc)
+tar_load(anno_meta_stroma);          tar_load(annotation_recluster_stroma)
+
+hsc_df    <- anno_merge_recluster(anno_meta_hsc,    annotation_recluster_hsc)
+mnc_df    <- anno_merge_recluster(anno_meta_mnc,    annotation_recluster_mnc)
+stroma_df <- anno_merge_recluster(anno_meta_stroma, annotation_recluster_stroma)
+rm(anno_meta_hsc, annotation_recluster_hsc,
+   anno_meta_mnc, annotation_recluster_mnc,
+   anno_meta_stroma, annotation_recluster_stroma)
+gc()
+```
+
+## HSC
+
+```{r recluster-hsc, fig.height=7, fig.width=13}
+plot_resolution_umap_grid(hsc_df, RESOLUTIONS, "HSC")
+```
+
+## MNC
+
+```{r recluster-mnc, fig.height=7, fig.width=13}
+plot_resolution_umap_grid(mnc_df, RESOLUTIONS, "MNC")
+```
+
+## Stroma
+
+```{r recluster-stroma, fig.height=7, fig.width=13}
+plot_resolution_umap_grid(stroma_df, RESOLUTIONS, "Stroma")
+```
+:::
+
+------------------------------------------------------------------------
+
+# Canonical markers
+
+Dot plots and individual gene UMAPs for all canonical cell-type markers. Stroma uses only stromal cell-type markers; HSC and MNC use the full set.
+
+:::::: panel-tabset
+## HSC
+
+```{r hsc-expr-load}
+tar_load(anno_expr_hsc)
+```
+
+::: panel-tabset
+### Dot plot
+
+```{r hsc-dot, results='asis', fig.height=5, fig.width=10}
+for (r in RESOLUTIONS) {
+  cat("####", paste("res", r), "\n\n")
+  p <- plot_dot_df(anno_expr_hsc, hsc_df, all_markers, r,
+                   title = paste0("HSC — res ", r))
+  if (!is.null(p)) print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r hsc-expr-cleanup}
+rm(anno_expr_hsc); gc()
+```
+
+## MNC
+
+```{r mnc-expr-load}
+tar_load(anno_expr_mnc)
+```
+
+::: panel-tabset
+### Dot plot
+
+```{r mnc-dot, results='asis', fig.height=5, fig.width=12}
+for (r in RESOLUTIONS) {
+  cat("####", paste("res", r), "\n\n")
+  p <- plot_dot_df(anno_expr_mnc, mnc_df, all_markers, r,
+                   title = paste0("MNC — res ", r))
+  if (!is.null(p)) print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r mnc-expr-cleanup}
+rm(anno_expr_mnc); gc()
+```
+
+## Stroma
+
+```{r stroma-expr-load}
+tar_load(anno_expr_stroma)
+```
+
+::: panel-tabset
+### Dot plot
+
+```{r stroma-dot, results='asis', fig.height=5, fig.width=8}
+for (r in RESOLUTIONS) {
+  cat("####", paste("res", r), "\n\n")
+  p <- plot_dot_df(anno_expr_stroma, stroma_df, stroma_markers, r,
+                   title = paste0("Stroma — res ", r))
+  if (!is.null(p)) print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r stroma-expr-cleanup}
+rm(anno_expr_stroma); gc()
+```
+::::::
+
+```{r recluster-cleanup}
+rm(hsc_df, mnc_df, stroma_df); gc()
+```
+
+------------------------------------------------------------------------
+
+# Reference-based annotation
+
+> See **`reference-annotation.qmd`** for the full reference-based annotation workflow (Azimuth label transfer across all 9 curated references).
+
+
+
+---
+
+# Mixing metric & group-correlated genes {#sec-mixing}
+
+`Seurat::MixingMetric()` scores each cell by how much its nearest neighbours come from a different condition (WT vs Het). Low values = well-mixed; high values = segregated.
+
+`Seurat::GroupCorrelation()` then correlates every gene's expression with that per-cell mixing score, surfacing genes whose expression tracks condition segregation in UMAP space.
+
+::: panel-tabset
+## HSC
+
+```{r hsc-mix-load}
+#| eval: false
+targets::tar_load(mpn_processed_data_hsc)
+```
+
+```{r hsc-mix-umap, fig.width=6, fig.height=5}
+#| eval: false
+mpn_processed_data_hsc$gps <- ifelse(
+  stringr::str_detect(mpn_processed_data_hsc$sample.name, "WT"), "WT", "Het")
+mpn_processed_data_hsc$mix <- Seurat::MixingMetric(
+  object       = mpn_processed_data_hsc,
+  grouping.var = "gps",
+  reduction    = "umap.nn")
+Seurat::FeaturePlot(mpn_processed_data_hsc, "mix", reduction = "umap.nn") &
+  scale_color_viridis_c(option = "turbo", name = "Mixing\nmetric") &
+  labs(title = "HSC — mixing metric (WT vs Het)")
+```
+
+```{r hsc-group-corr}
+#| eval: false
+mpn_processed_data_hsc <- Seurat::GroupCorrelation(
+  mpn_processed_data_hsc, var = "mix", assay = "SCT")
+hsc_corr <- mpn_processed_data_hsc[["SCT"]]@meta.features %>%
+  tibble::rownames_to_column("gene") %>%
+  dplyr::arrange(desc(abs(mix_r))) %>%
+  dplyr::mutate(across(where(is.numeric), \(x) round(x, 4)))
+DT::datatable(hsc_corr,
+              caption  = "HSC: genes correlated with mixing metric (|r| descending)",
+              rownames = FALSE,
+              options  = list(pageLength = 20, scrollX = TRUE))
+```
+
+```{r hsc-mix-cleanup}
+#| eval: false
+rm(mpn_processed_data_hsc, hsc_corr); gc()
+```
+
+## MNC
+
+```{r mnc-mix-load}
+#| eval: false
+targets::tar_load(mpn_processed_data_mnc)
+```
+
+```{r mnc-mix-umap, fig.width=6, fig.height=5}
+#| eval: false
+mpn_processed_data_mnc$gps <- ifelse(
+  stringr::str_detect(mpn_processed_data_mnc$sample.name, "WT"), "WT", "Het")
+mpn_processed_data_mnc$mix <- Seurat::MixingMetric(
+  object       = mpn_processed_data_mnc,
+  grouping.var = "gps",
+  reduction    = "umap.nn")
+Seurat::FeaturePlot(mpn_processed_data_mnc, "mix", reduction = "umap.nn") &
+  scale_color_viridis_c(option = "turbo", name = "Mixing\nmetric") &
+  labs(title = "MNC — mixing metric (WT vs Het)")
+```
+
+```{r mnc-group-corr}
+#| eval: false
+mpn_processed_data_mnc <- Seurat::GroupCorrelation(
+  mpn_processed_data_mnc, var = "mix", assay = "SCT")
+mnc_corr <- mpn_processed_data_mnc[["SCT"]]@meta.features %>%
+  tibble::rownames_to_column("gene") %>%
+  dplyr::arrange(desc(abs(mix_r))) %>%
+  dplyr::mutate(across(where(is.numeric), \(x) round(x, 4)))
+DT::datatable(mnc_corr,
+              caption  = "MNC: genes correlated with mixing metric (|r| descending)",
+              rownames = FALSE,
+              options  = list(pageLength = 20, scrollX = TRUE))
+```
+
+```{r mnc-mix-cleanup}
+#| eval: false
+rm(mpn_processed_data_mnc, mnc_corr); gc()
+```
+
+## Stroma
+
+```{r stroma-mix-load}
+#| eval: false
+targets::tar_load(mpn_processed_data_stroma)
+```
+
+```{r stroma-mix-umap, fig.width=6, fig.height=5}
+#| eval: false
+mpn_processed_data_stroma$gps <- ifelse(
+  stringr::str_detect(mpn_processed_data_stroma$sample.name, "WT"), "WT", "Het")
+mpn_processed_data_stroma$mix <- Seurat::MixingMetric(
+  object       = mpn_processed_data_stroma,
+  grouping.var = "gps",
+  reduction    = "umap.nn")
+Seurat::FeaturePlot(mpn_processed_data_stroma, "mix", reduction = "umap.nn") &
+  scale_color_viridis_c(option = "turbo", name = "Mixing\nmetric") &
+  labs(title = "Stroma — mixing metric (WT vs Het)")
+```
+
+```{r stroma-group-corr}
+#| eval: false
+mpn_processed_data_stroma <- Seurat::GroupCorrelation(
+  mpn_processed_data_stroma, var = "mix", assay = "SCT")
+stroma_corr <- mpn_processed_data_stroma[["SCT"]]@meta.features %>%
+  tibble::rownames_to_column("gene") %>%
+  dplyr::arrange(desc(abs(mix_r))) %>%
+  dplyr::mutate(across(where(is.numeric), \(x) round(x, 4)))
+DT::datatable(stroma_corr,
+              caption  = "Stroma: genes correlated with mixing metric (|r| descending)",
+              rownames = FALSE,
+              options  = list(pageLength = 20, scrollX = TRUE))
+```
+
+```{r stroma-mix-cleanup}
+#| eval: false
+rm(mpn_processed_data_stroma, stroma_corr); gc()
+```
+:::
+
+{{< include ../_session-info.qmd >}}

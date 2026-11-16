@@ -1,0 +1,202 @@
+---
+title: "Gene Biotypes"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+Characterise the gene biotype composition of the count matrix using
+`org.Mm.eg.db` (offline, via Ensembl IDs stored in the RNA assay metadata).
+A BioMart section is included for reference but is not run by default as it
+requires internet access.
+
+```{r setup}
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(DT)
+library(targets)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r load}
+targets::tar_load(mpn_raw_all)
+targets::tar_load(proc_params)
+
+genes       <- rownames(mpn_raw_all)
+ensembl_ids <- mpn_raw_all[["RNA"]][[]][genes, "ensembl_id"]
+cat("Genes in count matrix:", length(genes), "\n")
+```
+
+---
+
+## 1. org.Mm.eg.db annotation
+
+Annotation via Ensembl IDs stored in the RNA assay — more reliable than
+symbol mapping since it avoids alias ambiguity.
+
+```{r orgdb-fetch}
+gene_biotypes <- AnnotationDbi::mapIds(
+  org.Mm.eg.db,
+  keys      = ensembl_ids,
+  keytype   = "ENSEMBL",
+  column    = "GENETYPE",
+  multiVals = "first"
+)
+
+orgdb_df <- data.frame(
+  mgi_symbol  = genes,
+  ensembl_id  = ensembl_ids,
+  gene_biotype = ifelse(is.na(gene_biotypes), "not_found", unname(gene_biotypes)),
+  stringsAsFactors = FALSE
+)
+
+cat("Matched in org.Mm.eg.db:", sum(orgdb_df$gene_biotype != "not_found"), "\n")
+cat("Not found:              ", sum(orgdb_df$gene_biotype == "not_found"), "\n")
+```
+
+```{r orgdb-counts}
+orgdb_counts <- orgdb_df |>
+  dplyr::count(gene_biotype, name = "n_genes") |>
+  dplyr::arrange(desc(n_genes))
+
+DT::datatable(orgdb_counts, caption = "org.Mm.eg.db — gene counts per biotype",
+              rownames = FALSE, options = list(pageLength = 20, scrollX = TRUE))
+```
+
+```{r orgdb-bar, fig.height=7}
+ggplot(orgdb_counts, aes(x = reorder(gene_biotype, n_genes), y = n_genes)) +
+  geom_col(fill = "steelblue", alpha = 0.85) +
+  geom_text(aes(label = n_genes), hjust = -0.2, size = 3) +
+  coord_flip() +
+  labs(title = "Gene biotypes in count matrix (org.Mm.eg.db)",
+       x = NULL, y = "# genes") +
+  theme_bw()
+```
+
+---
+
+## 2. Informative genes (keep_biotypes filter)
+
+```{r informative-genes}
+keep_biotypes <- unlist(proc_params$keep_biotypes)
+
+informative_df <- orgdb_df |>
+  dplyr::mutate(informative = gene_biotype %in% keep_biotypes)
+
+cat("keep_biotypes:", paste(keep_biotypes, collapse = ", "), "\n")
+cat("Informative genes:", sum(informative_df$informative), "/", nrow(informative_df), "\n")
+
+informative_df |>
+  dplyr::count(gene_biotype, informative) |>
+  dplyr::arrange(desc(n)) |>
+  DT::datatable(caption = "Biotype counts — informative flag",
+                rownames = FALSE, options = list(pageLength = 20, scrollX = TRUE))
+```
+
+```{r informative-bar, fig.height=7}
+orgdb_df |>
+  dplyr::mutate(informative = gene_biotype %in% keep_biotypes) |>
+  dplyr::count(gene_biotype, informative) |>
+  ggplot(aes(x = reorder(gene_biotype, n), y = n, fill = informative)) +
+  geom_col(alpha = 0.85) +
+  scale_fill_manual(values = c("TRUE" = "#2166ac", "FALSE" = "#d6604d"),
+                    labels = c("TRUE" = "kept", "FALSE" = "excluded")) +
+  coord_flip() +
+  labs(title = "Biotype composition — kept vs excluded by keep_biotypes filter",
+       x = NULL, y = "# genes", fill = NULL) +
+  theme_bw()
+```
+
+---
+
+## 3. Expression-weighted view
+
+UMI contribution per biotype — which biotypes dominate the count matrix.
+
+```{r umi-by-biotype}
+counts_mat <- Seurat::GetAssayData(mpn_raw_all, assay = "RNA", layer = "counts")
+
+umi_biotype <- data.frame(
+  mgi_symbol = rownames(counts_mat),
+  total_umi  = Matrix::rowSums(counts_mat)
+) |>
+  dplyr::left_join(orgdb_df |> dplyr::select(mgi_symbol, gene_biotype),
+                   by = "mgi_symbol") |>
+  dplyr::group_by(gene_biotype) |>
+  dplyr::summarise(total_umi = sum(total_umi), n_genes = dplyr::n(), .groups = "drop") |>
+  dplyr::mutate(pct_umi = round(100 * total_umi / sum(total_umi), 2)) |>
+  dplyr::arrange(desc(total_umi))
+
+DT::datatable(umi_biotype, caption = "UMI contribution per biotype",
+              rownames = FALSE, options = list(pageLength = 20, scrollX = TRUE))
+```
+
+```{r umi-bar, fig.height=7}
+ggplot(umi_biotype |> dplyr::filter(pct_umi > 0.1),
+       aes(x = reorder(gene_biotype, pct_umi), y = pct_umi)) +
+  geom_col(fill = "darkorange", alpha = 0.85) +
+  geom_text(aes(label = paste0(pct_umi, "%")), hjust = -0.2, size = 3) +
+  coord_flip() +
+  labs(title = "UMI % per biotype (biotypes > 0.1% shown)",
+       x = NULL, y = "% of total UMIs") +
+  theme_bw()
+```
+
+---
+
+## 4. Genes not found in org.Mm.eg.db
+
+```{r not-found}
+not_found <- orgdb_df |> dplyr::filter(gene_biotype == "not_found")
+cat("Genes not annotated:", nrow(not_found), "\n")
+
+DT::datatable(not_found, caption = "Genes not found in org.Mm.eg.db",
+              rownames = FALSE, filter = "top",
+              options = list(pageLength = 20, scrollX = TRUE))
+```
+
+---
+
+## 5. BioMart annotation (reference — not run by default)
+
+BioMart requires internet access. Run interactively when needed;
+`freeze: auto` will cache the result.
+
+```{r biomart-fetch}
+#| eval: false
+bm_df <- fetch_gene_biotypes(mpn_raw_all)
+```
+
+```{r biomart-summary}
+#| eval: false
+bm_counts <- bm_df |>
+  dplyr::count(gene_biotype, name = "n_genes") |>
+  dplyr::arrange(desc(n_genes))
+
+DT::datatable(bm_counts, caption = "BioMart — gene counts per biotype",
+              rownames = FALSE, options = list(pageLength = 20, scrollX = TRUE))
+```
+
+---
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+{{< include ../_session-info.qmd >}}

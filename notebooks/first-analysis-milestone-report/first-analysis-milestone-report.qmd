@@ -1,0 +1,927 @@
+---
+title: "First analysis report"
+editor_options:
+  chunk_output_type: console
+execute:
+  echo: true
+  warning: false
+  message: false
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(DT)
+library(targets)
+library(tidyverse)
+options(future.globals.maxSize = 8 * 1024^3)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+targets::tar_load(qc_params)
+```
+
+```{r load}
+targets::tar_load(metadata_flagged_all)
+targets::tar_load(mt_genes)
+targets::tar_load(rp_genes)
+targets::tar_load(hb_genes)
+```
+
+
+# QC Exploration
+Exploring the quality of the cells from each compartment based on multiple parameters, it was clear that applying a single threshold over all cells would .. penalize. 
+
+```{r qc-meta}
+df         <- metadata_flagged_all
+df_margins <- df %>% mutate(sample.name = "All")
+df_plot    <- bind_rows(df, df_margins)
+
+# Pre-compute 5th/95th percentiles per sample for all QC metrics
+pct_bars <- function(feature) {
+  df_plot |>
+    dplyr::group_by(sample.name) |>
+    dplyr::summarise(p5  = quantile(.data[[feature]], 0.05),
+                     p95 = quantile(.data[[feature]], 0.95),
+                     .groups = "drop")
+}
+errorbar_layer <- function(pct_df) {
+  geom_errorbar(data = pct_df,
+                aes(x = sample.name, ymin = p5, ymax = p95),
+                inherit.aes = FALSE,
+                width = 0.3, colour = "black", linewidth = 0.8)
+}
+```
+
+::: {.panel-tabset}
+
+## Gene count (nFeature_RNA)
+
+The number of genes per cell across all samples shows a clear compartment-specific pattern.Stromal cells tend to have lower number of genes, while HSCs have higher numbers, and MNCs are somewhere in-between. That said, the stromal samples have unexpectedly high number of cells with low number of features that go below the range of commonly used cutoffs. I wandered if this could be a tissue characteristic or a dominating special sub-population of cells in this tissue that needs to be "handled with care".
+```{r feat-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, nFeature_RNA)) +
+    geom_jitter(size = 0.1, alpha = 0.05) +
+    geom_violin(alpha = 0.9) +
+    errorbar_layer(pct_bars("nFeature_RNA")) +
+    coord_flip() +
+    labs(title = 'Distribution of genes detected per cell',
+         subtitle = "Black bars: 5th–95th percentile",
+         y = "Number of features (n)",
+         x = "Sample") +
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x  = element_text(size = 15),
+        axis.title.y  = element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        legend.position = "none",
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x  = element_text(size = 8)
+    )
+```
+
+## Mitochondrial %
+
+The compartment-specific pattern can also be observed, although to a lesser magnitude, in the percentage of mitochondrial transcripts per cell. HSC samples show a consistent higher mitochondrial content compared to other samples, while large number of MNC cells show a strong pattern mitochondrial depletion. Nevertheless, mitochondrial content is generally low indicating the lack of low quality cells. 
+```{r mt-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.mt)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.mt")) +
+  coord_flip() +
+  labs(title = 'Distribution of mitochondrial content per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Mitochondrial content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+
+## Ribosomal %
+Genes identified (pattern `^Rp[sl]`): `r paste(rp_genes, collapse = ", ")`.
+
+The percentage of reads mapping to ribosomal proteins differs dramatically between the compartments. Compared to the expected range [reported by 10x](https://kb.10xgenomics.com/s/article/218169723-What-fraction-of-reads-map-to-ribosomal-proteins) MNCs and stromal samples are much lower than expected, while HCSs are within the range. It's difficult to interpret the effect of ribosomal content and its effect needs on the analysis needs to be observed.  
+```{r rp-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.rp)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.rp")) +
+  coord_flip() +
+  labs(title = 'Distribution of ribosomal protein content per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Ribosomal protein content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+## Hemoglobin %
+Genes identified (pattern `^Hb[^pes]`): `r paste(hb_genes, collapse = ", ")`.
+
+I also explored the fraction of hemoglobin-related reads to detect ambient RNA or any unexpected pattern of their enrichment. Surprisingly, stromal cells show relatively elevated percentage of hemoglobin content. Also, MNCs seems to have a few cells dominated by hemoglobin transcripts.
+```{r hb-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.hb)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.hb")) +
+  coord_flip() +
+  labs(title = 'Distribution of hemoglobin-related features per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Hemoglobin-related content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+## Stress %
+Genes used: `r paste(qc_params$stress_genes, collapse = ", ")`.
+
+Based on my discussion with Antonio, I expected that stromal cells are stressed by the process of tissue digestion. I explored the enrichment of stress signature across samples to quantify the effect of this stressful process on the quality of ceslls. Although stromal cells have relatively higher levels of enrichment, they're not terribely high and the majority are similar to other compartments.
+```{r stress-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.stress)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.stress")) +
+  coord_flip() +
+  labs(title = 'Distribution of stress-related features per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Stress-related content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+
+:::
+
+## Feature scatter
+
+Looking at the relationship between mitochondrial content and number of genes detected, HSC samples, and to some extent stromal, show the expected pattern where cells with low number of features seems to be low quality cells dominated by mitochondrial transcripts. However, MNCs lacks this pattern. This suggests that either these low quality cells are dominated by another process unrelated to mitochondrial transcripts, or they're just empty cells.
+```{r feat-mito-scatter, fig.height=8}
+ggplot(df_plot, aes(percent.mt,nFeature_RNA, group = sample.name)) +
+  ggpointdensity::geom_pointdensity(size = 0.1, 
+              alpha = 0.05)+
+  facet_wrap(~sample.name,nrow = 2)+
+    labs(
+       y = "Number genes (n)",
+       x = "Mitocondrial content (%)") +
+  viridis::scale_color_viridis()+
+  hrbrthemes::theme_ipsum() +
+    theme(
+      axis.title.x =  element_text(size = 15),
+      axis.title.y =  element_text(size = 15),
+      axis.text.x   = element_text(size = 15),
+      axis.text.y   = element_text(size = 15),
+      legend.position="none",
+      panel.spacing = unit(0.1, "lines"),
+      strip.text.x = element_text(size = 15)
+    )
+
+```
+
+The relationship between the number of genes and their count revealed an interesting pattern in MNCs. 
+```{r feat-count-scatter, fig.height=8}
+
+ggplot(df_plot, aes(nCount_RNA, nFeature_RNA, group = sample.name)) +
+  ggpointdensity::geom_pointdensity(size = 0.1, 
+              alpha = 0.05)+
+  facet_wrap(~sample.name,
+             nrow = 2,
+             scale = "free_x")+
+    labs(y = "Number genes (n)",
+       x = "Number of reads (n)")  +
+  viridis::scale_color_viridis()+
+  hrbrthemes::theme_ipsum() +
+    theme(
+      axis.title.x =  element_text(size = 15),
+      axis.title.y =  element_text(size = 15),
+      axis.text.x   = element_text(size = 15),
+      axis.text.y   = element_text(size = 15),
+      legend.position="none",
+      panel.spacing = unit(0.1, "lines"),
+      strip.text.x = element_text(size = 15)
+    )
+```
+
+The samples display a clear double-curve relationship that stands out from the rest of the samples.This means that that there're two distinct groups with different number of genes detected for the same number of reads. Another way to put it is that these two cell sub-population have different complexities. This reminds me of the [saturation curve](https://kb.10xgenomics.com/s/article/115005062366-What-is-sequencing-saturation) of sequencing libraries from different tissues.
+
+```{r feat-scatter-mnc, fig.height=4}
+df_plot_mnc <- df_plot %>% 
+  filter(str_detect(sample.name, "MNC")) 
+
+df_plot_mnc %>% 
+  ggplot(aes(nCount_RNA, nFeature_RNA, group = sample.name)) +
+  ggpointdensity::geom_pointdensity(size = 0.1, 
+              alpha = 0.05)+
+  facet_wrap(~sample.name,nrow = 1)+
+    labs(y = "Number genes (n)",
+       x = "Number of reads (n)")  +
+  viridis::scale_color_viridis()+
+  hrbrthemes::theme_ipsum() +
+    theme(
+      axis.title.x =  element_text(size = 15),
+      axis.title.y =  element_text(size = 15),
+      axis.text.x   = element_text(size = 15),
+      axis.text.y   = element_text(size = 15),
+      legend.position="none",
+      panel.spacing = unit(0.1, "lines"),
+      strip.text.x = element_text(size = 15)
+    )
+
+```
+
+The only thing that I found to explain this pattern is the fraction of ribosomal proteins. The bottom curve has much lower ribosomal protein content.
+```{r feat-rp-scatter-mnc, fig.height=4}
+df_plot_mnc %>% 
+    ggplot(aes(nCount_RNA, nFeature_RNA, color = percent.rp)) +
+    geom_point(size = 0.1, alpha = 0.05)+
+    facet_wrap(~sample.name,nrow = 1)+
+    labs(y = "Number genes (n)",
+         x = "Number of reads (n)")  +
+    viridis::scale_color_viridis()+
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x =  element_text(size = 15),
+        axis.title.y =  element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x = element_text(size = 15)
+    )+
+  scale_x_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K"))+
+  scale_y_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K"))
+```
+
+```{r feat-rp-scatter-mnc-k, fig.height=4}
+k <- 5
+df_plot_mnc$percent.rp_k <- df_plot_mnc$percent.rp<k
+df_plot_mnc %>% 
+    ggplot(aes(nCount_RNA, nFeature_RNA, color = percent.rp_k)) +
+    geom_point(size = 0.1, alpha = 0.05)+
+    facet_wrap(~sample.name,nrow = 1)+
+    labs(y = "Number genes (n)",
+         x = "Number of reads (n)",
+         color = glue::glue("< {k}"))+
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x =  element_text(size = 15),
+        axis.title.y =  element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x = element_text(size = 15)
+    )+
+  scale_x_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K"))+
+  scale_y_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K"))+
+  guides(colour = ggplot2::guide_legend(override.aes = list(size = 4, alpha = 1)))
+
+```
+
+Since it's not clear at this early stage of the analysis what's the relevance of this pattern and how it would affect downstream analysis, I defined clusters that capture the two curves so that they can visualized downstream.
+```{r}
+tar_load(anno_raw_meta_mnc)
+tar_load(mnc_qc_curves_clusters)
+anno_raw_meta_mnc$qc_cluster_meta <- dplyr::case_when(
+  mnc_qc_curves_clusters[anno_raw_meta_mnc$cell_id] %in% c("0","1","3") ~ "a",
+  mnc_qc_curves_clusters[anno_raw_meta_mnc$cell_id] %in% c("2","4")     ~ "b",
+  TRUE ~ "c")
+```
+
+```{r cluster-mnc-curves, fig.height=4}
+anno_raw_meta_mnc %>%
+  ggplot(aes(nCount_RNA, nFeature_RNA, color = qc_cluster_meta)) +
+  geom_point(size = 0.1, alpha = 0.5) +
+  facet_wrap(~ sample.name, nrow = 1) +
+  labs(y = "Number genes (n)", x = "Number of reads (n)") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 15)
+  ) +
+  scale_x_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K")) +
+  scale_y_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K")) +
+  guides(colour = ggplot2::guide_legend(override.aes = list(size = 4, alpha = 1)))
+```
+
+## Doublet / multiplet overlap
+
+The last QC I checked is that I compared the results of demulteplixing based HTO with doublet finding based on gene expression. There's a strong agreement between the cells assigned to a single sample and identified as singlets. However, the multiplet and transcriptional doublet don't strongly agree. 
+
+```{r doublet-table, fig.width=6, fig.height=4}
+#| eval: false
+tbl <- as.data.frame(table(scDblFinder = df_plot$scDblFinder.class,
+                            deMULTIplex2 = df_plot$dm2_class))
+ggplot(tbl, aes(x = deMULTIplex2, y = scDblFinder, fill = Freq)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = scales::comma(Freq)), size = 4) +
+  scale_fill_distiller(palette = "Blues", direction = 1, name = "Cells") +
+  labs(title = "Doublet / multiplet overlap",
+       x = "demulteplixing class", y = "scDblFinder class") +
+  hrbrthemes::theme_ipsum() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.x =  element_text(size = 15),
+        axis.title.y =  element_text(size = 15),)
+```
+
+***
+
+# Explore pre-qc datasets of each compartment
+
+Before applying the qc cutoffs and have a look at the clean dataset, I'll visualize the structure of the raw data so that the both the value and the effect of the cleaning step is more transparent. It should also make it clear what are quality issues that need to be addressed.
+
+
+::: {.panel-tabset}
+
+## Stroma
+
+In general, the structure of raw cells is strongly shaped by the cell cycle effect and gene count. Low quality cells with high mitocondrial content, as well as cycling cells in G2M phase form their own separate clusters.
+```{r load-raw-stroma}
+tar_load(anno_raw_meta_stroma)
+```
+
+```{r umap-raw-stroma, fig.height=5}
+phase_cols <- c("G1" = "#4daf4a", "S" = "#225ea8", "G2M" = "#e41a1c")
+print(plot_umap_df(anno_raw_meta_stroma, "seurat_clusters", label = TRUE,
+                   title = "Stroma (raw) — Cluster"))
+print(plot_umap_df(anno_raw_meta_stroma, "Phase", cols = phase_cols,
+                   title = "Stroma (raw) — Cell cycle phase"))
+print(plot_umap_df(anno_raw_meta_stroma, "nFeature_RNA",   title = "Stroma (raw) — nFeature_RNA"))
+print(plot_umap_df(anno_raw_meta_stroma, "percent.mt",     title = "Stroma (raw) — % mito"))
+print(plot_umap_df(anno_raw_meta_stroma, "percent.rp",     title = "Stroma (raw) — % ribo"))
+print(plot_umap_df(anno_raw_meta_stroma, "percent.stress", title = "Stroma (raw) — % stress"))
+print(plot_umap_df(anno_raw_meta_stroma, "PC1",            title = "Stroma (raw) — PC1"))
+print(plot_umap_df(anno_raw_meta_stroma, "sample.name",    title = "Stroma (raw) — Sample"))
+#print(plot_umap_df(anno_raw_meta_stroma, "scDblFinder.class", title = "Stroma (raw) — scDblFinder class"))
+#print(plot_umap_df(anno_raw_meta_stroma, "scDblFinder.score", title = "Stroma (raw) — scDblFinder score"))
+```
+
+```{r umap-grid-stroma, fig.height=9, fig.width=10}
+grids_stroma <- plot_umap_grid_sample_dm2_df(anno_raw_meta_stroma)
+grids_stroma$plain
+grids_stroma$highlight
+```
+
+```{r rm-raw-stroma}
+rm(anno_raw_meta_stroma, grids_stroma); gc()
+```
+
+
+## HSC
+The cell cycle influence seems to be weaker in HSC compared to stroma. Low quality cells with low number of features, low ribosomal proteins, and high mitochondrial content are co-clustered.
+```{r load-raw-hsc}
+tar_load(anno_raw_meta_hsc)
+```
+
+```{r umap-raw-hsc, fig.height=5}
+print(plot_umap_df(anno_raw_meta_hsc, "seurat_clusters", label = TRUE,
+                   title = "HSC (raw) — Cluster"))
+print(plot_umap_df(anno_raw_meta_hsc, "Phase", cols = phase_cols,
+                   title = "HSC (raw) — Cell cycle phase"))
+print(plot_umap_df(anno_raw_meta_hsc, "nFeature_RNA",   title = "HSC (raw) — nFeature_RNA"))
+print(plot_umap_df(anno_raw_meta_hsc, "percent.mt",     title = "HSC (raw) — % mito"))
+print(plot_umap_df(anno_raw_meta_hsc, "percent.rp",     title = "HSC (raw) — % ribo"))
+print(plot_umap_df(anno_raw_meta_hsc, "percent.stress", title = "HSC (raw) — % stress"))
+print(plot_umap_df(anno_raw_meta_hsc, "PC1",            title = "HSC (raw) — PC1"))
+print(plot_umap_df(anno_raw_meta_hsc, "sample.name",    title = "HSC (raw) — Sample"))
+#print(plot_umap_df(anno_raw_meta_hsc, "scDblFinder.class", title = "HSC (raw) — scDblFinder class"))
+#print(plot_umap_df(anno_raw_meta_hsc, "scDblFinder.score", title = "HSC (raw) — scDblFinder score"))
+```
+
+```{r umap-grid-hsc, fig.height=9, fig.width=10}
+grids_hsc <- plot_umap_grid_sample_dm2_df(anno_raw_meta_hsc)
+grids_hsc$plain
+grids_hsc$highlight
+```
+
+```{r rm-raw-hsc}
+rm(anno_raw_meta_hsc, grids_hsc); gc()
+```
+
+## MNC
+MNC show a clustering pattern driven by cell-cycle across multiple clusters. These cells are also characterized by low number of genes. Mitochondrial content doesn't influence the shape because they're at very low level. The three clusters that captures the double-curve pattern form the main structures of the embedding.
+```{r load-raw-mnc}
+tar_load(anno_raw_meta_mnc)
+tar_load(mnc_qc_curves_clusters)
+anno_raw_meta_mnc$qc_cluster_meta <- dplyr::case_when(
+  mnc_qc_curves_clusters[anno_raw_meta_mnc$cell_id] %in% c("0","1","3") ~ "a",
+  mnc_qc_curves_clusters[anno_raw_meta_mnc$cell_id] %in% c("2","4")     ~ "b",
+  TRUE ~ "c")
+```
+
+```{r umap-raw-mnc, fig.height=5}
+print(plot_umap_df(anno_raw_meta_mnc, "seurat_clusters", label = TRUE,
+                   title = "MNC (raw) — Cluster"))
+print(plot_umap_df(anno_raw_meta_mnc, "Phase", cols = phase_cols,
+                   title = "MNC (raw) — Cell cycle phase"))
+print(plot_umap_df(anno_raw_meta_mnc, "nFeature_RNA",     title = "MNC (raw) — nFeature_RNA"))
+print(plot_umap_df(anno_raw_meta_mnc, "percent.mt",       title = "MNC (raw) — % mito"))
+print(plot_umap_df(anno_raw_meta_mnc, "percent.rp",       title = "MNC (raw) — % ribo"))
+print(plot_umap_df(anno_raw_meta_mnc, "percent.stress",   title = "MNC (raw) — % stress"))
+print(plot_umap_df(anno_raw_meta_mnc, "PC1",              title = "MNC (raw) — PC1"))
+print(plot_umap_df(anno_raw_meta_mnc, "qc_cluster_meta",  title = "MNC (raw) — Curve clusters"))
+print(plot_umap_df(anno_raw_meta_mnc, "sample.name",      title = "MNC (raw) — Sample"))
+#print(plot_umap_df(anno_raw_meta_mnc, "scDblFinder.class", title = "MNC (raw) — scDblFinder class"))
+#print(plot_umap_df(anno_raw_meta_mnc, "scDblFinder.score", title = "MNC (raw) — scDblFinder score"))
+```
+
+```{r umap-grid-mnc, fig.height=9, fig.width=10}
+grids_mnc <- plot_umap_grid_sample_dm2_df(anno_raw_meta_mnc)
+grids_mnc$plain
+grids_mnc$highlight
+```
+
+```{r rm-raw-mnc}
+rm(anno_raw_meta_mnc, grids_mnc, mnc_qc_curves_clusters); gc()
+```
+
+:::
+
+***
+
+
+# QC cutoffs
+
+Global thresholds: mitochondrial % ≤ `r qc_params$mito_percent_max`%, haemoglobin % ≤ `r qc_params$hb_percent_max`%. Other cell QC cutoffs were defined per compartment and shown below. Only genes with counts > `r qc_params$min_counts_per_cell_per_gene` in at least `r qc_params$min_cells_per_gene` cells were retained.
+
+```{r before-after-barplot, fig.width=10, fig.height=5}
+df |>
+  dplyr::mutate(status = ifelse(pass_cell, "Clean", "Removed")) |>
+  dplyr::count(compartment, sample.name, status) |>
+  dplyr::mutate(status = factor(status, levels = c("Clean", "Removed"))) |>
+  ggplot(aes(x = sample.name, y = n, fill = status)) +
+  geom_col() +
+  scale_fill_manual(values = c("Clean" = "#2166ac", "Removed" = "#d6604d"),
+                    name = NULL) +
+  facet_wrap(~compartment, scales = "free_x", nrow = 1) +
+  labs(title = "Cells retained after QC filtering",
+       x = NULL, y = "Number of cells") +
+  hrbrthemes::theme_ipsum() +
+  theme(axis.text.x   = element_text(angle = 45, hjust = 1, size = 11),
+        axis.text.y   = element_text(size = 11),
+        axis.title.y  = element_text(size = 13),
+        strip.text    = element_text(size = 12),
+        legend.position = "top")
+```
+
+```{r cutoff-table}
+compartment_qc <- qc_params$compartment_qc
+
+rows <- list()
+for (comp in names(compartment_qc)) {
+  x <- compartment_qc[[comp]]
+  rows[[comp]] <- data.frame(
+    Compartment  = comp,
+    nFeature_min = x$nFeature_min,
+    nFeature_max = x$nFeature_max,
+    ribo_pct_min = x$ribo_percent_min,
+    ribo_pct_max = x$ribo_percent_max,
+    stringsAsFactors = FALSE
+  )
+}
+cutoff_df <- do.call(rbind, rows)
+
+knitr::kable(cutoff_df,
+             col.names = c("Compartment", "nFeature min", "nFeature max",
+                           "Ribo % min", "Ribo % max"),
+             align = "lrrrr",
+             caption = "Per-compartment QC thresholds")
+```
+
+```{r feat-hist-cutoffs, fig.height=8}
+# nFeature_min and nFeature_max per compartment from config
+nfeat_df <- df_plot |>
+  dplyr::distinct(sample.name, compartment) |>
+  dplyr::mutate(
+    nFeature_min = dplyr::case_when(
+      compartment == "Stroma" ~ compartment_qc$Stroma$nFeature_min,
+      compartment == "HSC"    ~ compartment_qc$HSC$nFeature_min,
+      compartment == "MNC"    ~ compartment_qc$MNC$nFeature_min,
+      TRUE                    ~ NA_integer_
+    ),
+    nFeature_max = dplyr::case_when(
+      compartment == "Stroma" ~ compartment_qc$Stroma$nFeature_max,
+      compartment == "HSC"    ~ compartment_qc$HSC$nFeature_max,
+      compartment == "MNC"    ~ compartment_qc$MNC$nFeature_max,
+      TRUE                    ~ NA_real_
+    )
+  ) |>
+  dplyr::filter(!is.na(nFeature_min))
+
+ggplot(df_plot, aes(sample.name, nFeature_RNA)) +
+    geom_jitter(size = 0.1, alpha = 0.05) +
+    geom_violin(alpha = 0.9) +
+    errorbar_layer(pct_bars("nFeature_RNA")) +
+    geom_point(data = nfeat_df,
+               aes(x = sample.name, y = nFeature_min),
+               colour = "firebrick", shape = 124, size = 8) +
+    geom_point(data = nfeat_df,
+               aes(x = sample.name, y = nFeature_max),
+               colour = "firebrick", shape = 124, size = 8) +
+    coord_flip() +
+    labs(title = 'Distribution of genes detected per cell',
+         subtitle = "Black bars: 5th–95th percentile | Red ticks: QC cutoffs",
+         y = "Number of features (n)",
+         x = "Sample") +
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x  = element_text(size = 15),
+        axis.title.y  = element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        legend.position = "none",
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x  = element_text(size = 8)
+    )
+```
+
+
+```{r mito-hist-cutoffs, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.mt)) +
+    geom_jitter(size = 0.1, alpha = 0.05) +
+    geom_violin(alpha = 0.9) +
+    errorbar_layer(pct_bars("percent.mt")) +
+    geom_hline(yintercept = qc_params$mito_percent_max,
+               colour = "firebrick", linetype = "dashed", linewidth = 0.8) +
+    coord_flip() +
+    labs(title = 'Distribution of mitochondrial % per cell',
+         subtitle = "Black bars: 5th–95th percentile | Red dashed: QC cutoff",
+         y = "% mitochondrial reads",
+         x = "Sample") +
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x  = element_text(size = 15),
+        axis.title.y  = element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        legend.position = "none",
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x  = element_text(size = 8)
+    )
+```
+
+```{r ribo-hist-cutoffs, fig.height=8}
+ribo_df <- df_plot |>
+  dplyr::distinct(sample.name, compartment) |>
+  dplyr::mutate(
+    ribo_percent_min = dplyr::case_when(
+      compartment == "Stroma" ~ compartment_qc$Stroma$ribo_percent_min,
+      compartment == "HSC"    ~ compartment_qc$HSC$ribo_percent_min,
+      compartment == "MNC"    ~ compartment_qc$MNC$ribo_percent_min,
+      TRUE                    ~ NA_real_
+    ),
+    ribo_percent_max = dplyr::case_when(
+      compartment == "Stroma" ~ compartment_qc$Stroma$ribo_percent_max,
+      compartment == "HSC"    ~ compartment_qc$HSC$ribo_percent_max,
+      compartment == "MNC"    ~ compartment_qc$MNC$ribo_percent_max,
+      TRUE                    ~ NA_real_
+    )
+  ) |>
+  dplyr::filter(!is.na(ribo_percent_min))
+
+ggplot(df_plot, aes(sample.name, percent.rp)) +
+    geom_jitter(size = 0.1, alpha = 0.05) +
+    geom_violin(alpha = 0.9) +
+    errorbar_layer(pct_bars("percent.rp")) +
+    geom_point(data = ribo_df,
+               aes(x = sample.name, y = ribo_percent_min),
+               colour = "firebrick", shape = 124, size = 8) +
+    geom_point(data = ribo_df,
+               aes(x = sample.name, y = ribo_percent_max),
+               colour = "firebrick", shape = 124, size = 8) +
+    coord_flip() +
+    labs(title = 'Distribution of ribosomal % per cell',
+         subtitle = "Black bars: 5th–95th percentile | Red ticks: QC cutoffs",
+         y = "% ribosomal reads",
+         x = "Sample") +
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x  = element_text(size = 15),
+        axis.title.y  = element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        legend.position = "none",
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x  = element_text(size = 8)
+    )
+```
+
+```{r hb-hist-cutoffs, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.hb)) +
+    geom_jitter(size = 0.1, alpha = 0.05) +
+    geom_violin(alpha = 0.9) +
+    errorbar_layer(pct_bars("percent.hb")) +
+    geom_hline(yintercept = qc_params$hb_percent_max,
+               colour = "firebrick", linetype = "dashed", linewidth = 0.8) +
+    coord_flip() +
+    labs(title = 'Distribution of haemoglobin % per cell',
+         subtitle = "Black bars: 5th–95th percentile | Red dashed: QC cutoff",
+         y = "% haemoglobin reads",
+         x = "Sample") +
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x  = element_text(size = 15),
+        axis.title.y  = element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        legend.position = "none",
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x  = element_text(size = 8)
+    )
+```
+
+```{r qc-cooccurrence-heatmap}
+#| fig-width: 14
+#| fig-height: 5
+#| eval: false
+qc_flags   <- c("pass_mt", "pass_nFeature", "pass_rp", "pass_hb", "pass_hto", "pass_dbl")
+nice_names <- c(pass_mt = "Mito %", pass_nFeature = "nFeature",
+                pass_rp = "Ribo %",  pass_hb = "Hb %",
+                pass_hto = "HTO",    pass_dbl = "Doublet")
+
+cooc_per_compartment <- function(md) {
+  flag_mat <- as.matrix(md[, qc_flags])
+  n        <- length(qc_flags)
+  cooc     <- matrix(0L, n, n, dimnames = list(qc_flags, qc_flags))
+  for (i in seq_len(n))
+    for (j in seq_len(n))
+      cooc[i, j] <- sum(!flag_mat[, i] & !flag_mat[, j])
+  long <- reshape2::melt(cooc, varnames = c("metric_x", "metric_y"), value.name = "n_cells")
+  long$metric_x <- factor(nice_names[as.character(long$metric_x)], levels = nice_names)
+  long$metric_y <- factor(nice_names[as.character(long$metric_y)], levels = rev(nice_names))
+  long
+}
+
+cooc_long <- dplyr::bind_rows(
+  lapply(split(df, df$compartment), cooc_per_compartment),
+  .id = "compartment"
+)
+
+ggplot(cooc_long, aes(metric_x, metric_y, fill = n_cells)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = n_cells,
+                colour = n_cells > max(n_cells) * 0.5), size = 3) +
+  scale_colour_manual(values = c("TRUE" = "white", "FALSE" = "grey20"), guide = "none") +
+  scale_fill_gradient(low = "#f7fbff", high = "#08519c",
+                      name = "Cells failing\nboth metrics") +
+  facet_wrap(~compartment, nrow = 1) +
+  labs(title    = "Co-occurrence of QC filter failures per compartment",
+       subtitle = "Number of cells failing each pair of QC metrics",
+       x = NULL, y = NULL) +
+  hrbrthemes::theme_ipsum() +
+  theme(axis.text.x    = element_text(angle = 45, hjust = 1, size = 10),
+        axis.text.y    = element_text(size = 10),
+        strip.text     = element_text(size = 12),
+        legend.position = "right")
+```
+
+***
+
+## Dimensionality reduction
+
+The UMAPs of the retained cells after QC filtration are shown below split by WT,Het+, and Het-. It briefly shows cells labelled by clusters, cell cycle phase, and the demultiplexing assignment. 
+It's worth mentioning that the data didn't show the slightest sign of a batch effect. Running Harmony integration generated plots identical to PCA. As result, I stuck with PCA for the rest of the analysis. 
+```{r umap-overview-setup}
+clust_col <- "sNN_pca.SCT_30_res.0.5"
+
+# Canonical marker → cell type label lookup (shared by all bubble plots)
+tar_load(annotation_config)
+ct <- annotation_config$cell_types
+# ensure markers is always a character vector (single markers come as scalar strings)
+ct_markers <- lapply(ct, \(x) as.character(x$markers))
+cell_type_labels <- setNames(
+  rep(names(ct_markers), lengths(ct_markers)),
+  unlist(ct_markers)
+)
+```
+
+::: {.panel-tabset}
+
+## HSC
+
+You can already notice differential abundance of some minor cell states like clusters 6, 5, 9, 0.
+```{r umap-overview-hsc, fig.height=5}
+tar_load(anno_meta_hsc)
+print(plot_umap_df(anno_meta_hsc, clust_col, label = TRUE, facet_by = "sample.name",
+                   title = "HSC — Cluster (split by sample)"))
+print(plot_umap_df(anno_meta_hsc, "Phase", label = TRUE, facet_by = "sample.name",
+                   title = "HSC — Cell cycle phase (split by sample)"))
+print(plot_umap_df(anno_meta_hsc, "dm2_class", label = TRUE, facet_by = "sample.name",
+                   title = "HSC — HTO class (split by sample)"))
+print(plot_umap_df(anno_meta_hsc, "sample.name", title = "HSC — Sample"))
+#print(plot_umap_df(anno_meta_hsc, "scDblFinder.class", title = "HSC — scDblFinder class"))
+#print(plot_umap_df(anno_meta_hsc, "scDblFinder.score", title = "HSC — scDblFinder score"))
+```
+
+```{r umap-grid-hsc-clean, fig.height=9, fig.width=10}
+grids_hsc_clean <- plot_umap_grid_sample_dm2_df(anno_meta_hsc)
+grids_hsc_clean$plain
+grids_hsc_clean$highlight
+rm(anno_meta_hsc, grids_hsc_clean); gc()
+```
+
+## MNC
+
+The embedding of the clean cells is still influenced to some degree by cell cycle. Additionally, cells are clustered based on the double-curve pattern. Some clusters are differentially abundant between the samples like 6, 10, and 3.
+```{r umap-overview-mnc, fig.height=5}
+tar_load(anno_meta_mnc)
+tar_load(mnc_qc_curves_clusters)
+# Annotate QC double-curve clusters
+anno_meta_mnc$qc_cluster_meta <- dplyr::case_when(
+  mnc_qc_curves_clusters[anno_meta_mnc$cell_id] %in% c("0","1","3") ~ "a",
+  mnc_qc_curves_clusters[anno_meta_mnc$cell_id] %in% c("2","4")     ~ "b",
+  TRUE ~ "c")
+print(plot_umap_df(anno_meta_mnc, clust_col, label = TRUE, facet_by = "sample.name",
+                   title = "MNC — Cluster (split by sample)"))
+print(plot_umap_df(anno_meta_mnc, "Phase", label = TRUE, facet_by = "sample.name",
+                   title = "MNC — Cell cycle phase (split by sample)"))
+print(plot_umap_df(anno_meta_mnc, "dm2_class", label = TRUE, facet_by = "sample.name",
+                   title = "MNC — HTO class (split by sample)"))
+print(plot_umap_df(anno_meta_mnc, "qc_cluster_meta", label = TRUE, facet_by = "sample.name",
+                   title = "MNC — Curve clusters (split by sample)"))
+print(plot_umap_df(anno_meta_mnc, "sample.name", title = "MNC — Sample"))
+#print(plot_umap_df(anno_meta_mnc, "scDblFinder.class", title = "MNC — scDblFinder class"))
+#print(plot_umap_df(anno_meta_mnc, "scDblFinder.score", title = "MNC — scDblFinder score"))
+```
+
+```{r umap-grid-mnc-clean, fig.height=9, fig.width=10}
+grids_mnc_clean <- plot_umap_grid_sample_dm2_df(anno_meta_mnc)
+grids_mnc_clean$plain
+grids_mnc_clean$highlight
+rm(anno_meta_mnc, grids_mnc_clean, mnc_qc_curves_clusters); gc()
+```
+
+## Stroma
+
+Stromal cells form 3 main clusters, and one of them, 2, is of questionable quality because they're all G2M cells and couldn't be demultiplexed to a single sample. It also look a bit hyper-fragmented with many very small clusters
+```{r umap-overview-stroma, fig.height=5}
+tar_load(anno_meta_stroma)
+print(plot_umap_df(anno_meta_stroma, clust_col, label = TRUE, facet_by = "sample.name",
+                   title = "Stroma — Cluster (split by sample)"))
+print(plot_umap_df(anno_meta_stroma, "Phase", label = TRUE, facet_by = "sample.name",
+                   title = "Stroma — Cell cycle phase (split by sample)"))
+print(plot_umap_df(anno_meta_stroma, "dm2_class", label = TRUE, facet_by = "sample.name",
+                   title = "Stroma — HTO class (split by sample)"))
+print(plot_umap_df(anno_meta_stroma, "sample.name", title = "Stroma — Sample"))
+#print(plot_umap_df(anno_meta_stroma, "scDblFinder.class", title = "Stroma — scDblFinder class"))
+#print(plot_umap_df(anno_meta_stroma, "scDblFinder.score", title = "Stroma — scDblFinder score"))
+```
+
+```{r umap-grid-stroma-clean, fig.height=9, fig.width=10}
+grids_stroma_clean <- plot_umap_grid_sample_dm2_df(anno_meta_stroma)
+grids_stroma_clean$plain
+grids_stroma_clean$highlight
+rm(anno_meta_stroma, grids_stroma_clean); gc()
+```
+
+:::
+
+## Canonical markers
+
+::: {.panel-tabset}
+
+## HSC
+
+```{r bubble-hsc, fig.height=5.5, fig.width=14}
+tar_load(anno_meta_hsc); tar_load(anno_expr_hsc)
+marker_genes_all <- unlist(ct_markers)
+p <- plot_dot_df(anno_expr_hsc, anno_meta_hsc, marker_genes_all, res = 0.1,
+                 title = "Canonical markers — HSC")
+if (!is.null(p)) print(p)
+rm(anno_meta_hsc, anno_expr_hsc); gc()
+```
+
+## MNC
+
+```{r bubble-mnc, fig.height=5.5, fig.width=14}
+tar_load(anno_meta_mnc); tar_load(anno_expr_mnc)
+p <- plot_dot_df(anno_expr_mnc, anno_meta_mnc, marker_genes_all, res = 0.1,
+                 title = "Canonical markers — MNC")
+if (!is.null(p)) print(p)
+rm(anno_meta_mnc, anno_expr_mnc); gc()
+```
+
+## Stroma
+
+```{r bubble-stroma, fig.height=5.5, fig.width=14}
+tar_load(anno_meta_stroma); tar_load(anno_expr_stroma)
+p <- plot_dot_df(anno_expr_stroma, anno_meta_stroma, marker_genes_all, res = 0.1,
+                 title = "Canonical markers — Stroma")
+if (!is.null(p)) print(p)
+rm(anno_meta_stroma, anno_expr_stroma); gc()
+```
+
+:::
+
+## QC features on UMAP
+
+::: {.panel-tabset}
+
+## HSC
+
+```{r umap-qc-hsc, fig.height=10}
+tar_load(anno_meta_hsc)
+qc_feats <- intersect(c("percent.mt","percent.hb","percent.stress",
+                         "scDblFinder.score","nCount_RNA","nFeature_RNA"),
+                      colnames(anno_meta_hsc))
+plots_hsc <- list()
+for (f in qc_feats) plots_hsc[[f]] <- plot_umap_df(anno_meta_hsc, f, title = paste("HSC —", f))
+print(patchwork::wrap_plots(plots_hsc, ncol = 2))
+rm(anno_meta_hsc); gc()
+```
+
+## MNC
+
+```{r umap-qc-mnc, fig.height=10}
+tar_load(anno_meta_mnc)
+qc_feats <- intersect(c("percent.mt","percent.hb","percent.stress",
+                         "scDblFinder.score","nCount_RNA","nFeature_RNA"),
+                      colnames(anno_meta_mnc))
+plots_mnc <- list()
+for (f in qc_feats) plots_mnc[[f]] <- plot_umap_df(anno_meta_mnc, f, title = paste("MNC —", f))
+print(patchwork::wrap_plots(plots_mnc, ncol = 2))
+rm(anno_meta_mnc); gc()
+```
+
+## Stroma
+
+```{r umap-qc-stroma, fig.height=10}
+tar_load(anno_meta_stroma)
+qc_feats <- intersect(c("percent.mt","percent.hb","percent.stress",
+                         "scDblFinder.score","nCount_RNA","nFeature_RNA"),
+                      colnames(anno_meta_stroma))
+plots_stroma <- list()
+for (f in qc_feats) plots_stroma[[f]] <- plot_umap_df(anno_meta_stroma, f, title = paste("Stroma —", f))
+print(patchwork::wrap_plots(plots_stroma, ncol = 2))
+rm(anno_meta_stroma); gc()
+```
+
+:::
+
+***
+
+
+# Summary
+
+In this report, I have carried an exploratory data analysis per each compartment (HSC, MNC, Stroma) to select the subset of high quality cells that can be used reliably for downstream analysis. Generally, this included per-compartment QC, dimensionality reduction, and finding markers between WT, HET-, and HET+ across different clusters. Although I believe that merging HSC and MNC into one dataset could reveal interesting links between the two compartments, I thought it's more clear and manageable when the analysis is done first separately.
+
+# Conclusion
+- WT and Het share the same structure with cells co-clustering across defined cell states.
+- Differentially abundant cell states is observed across samples.
+- The expression differences between WT and Het samples is mainly driven by sex-related genes.
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+{{< include ../_session-info.qmd >}}

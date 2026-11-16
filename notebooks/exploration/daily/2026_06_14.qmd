@@ -1,0 +1,70 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+mpn_processed_hsc_fullcc <- Seurat::FindClusters(mpn_processed_hsc_fullcc,
+                               resolution       = c(2,2.5,3),
+                               group.singletons = FALSE,
+                               graph.name       = paste0("sNN_", "pca.SCT", "_", 30))
+
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.3"
+x <- FindMarkers(object = mpn_processed_hsc_fullcc, "18", "7")
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc, c("Ar")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_fullcc, c("Tpbg")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo", limits = c(0,2))&RestoreLegend()
+
+FeaturePlot(mpn_processed_hsc_fullcc, c("Mir22hg")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+FeaturePlot(mpn_processed_hsc_fullcc, c("Lef1")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.3"
+
+x <- FindMarkers(object = mpn_processed_hsc_fullcc, "2", "18")
+
+FeaturePlot(mpn_processed_hsc_fullcc, c("Csf", "Csf3r")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.3"
+
+x <- FindMarkers(object = mpn_processed_hsc_fullcc, 
+                 c("32"))
+
+FeaturePlot(mpn_processed_hsc_fullcc, c("Map2")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+mpn_processed_hsc_fullcc$clust_x <- paste0(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.3,
+                                           "_",
+                                           mpn_processed_hsc_fullcc$sample.name)
+Idents(mpn_processed_hsc_fullcc) <- "clust_x"
+
+x <- FindMarkers(object = mpn_processed_hsc_fullcc, "14_HSC_Het_CD41+mCh+", "14_HSC_Het_CD41+mCh-" )
+
+FeaturePlot(mpn_processed_hsc_fullcc, c("Gm57459")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.3"
+
+x <- FindMarkers(object = mpn_processed_hsc_fullcc, "32", c("4", "25", "14", "2" ) )
+
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Ptn_data <-  mpn_processed_hsc_fullcc[["SCT"]]@data["Ptn",]
+mpn_processed_hsc_fullcc <- Seurat::GroupCorrelation(mpn_processed_hsc_fullcc,
+                                                     assay = "SCT",
+                                                     slot = "data",
+                                                     var = "Ptn_data",
+                                                     do.plot = FALSE)
+
+```

@@ -1,0 +1,1557 @@
+---
+title: "Differential Expression — HSC"
+author:
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+This notebook explores the output of cluster-based differential expression analysis to achieve the following goals:
+
+-   Identify and order a set of unique genes that mark each cluster.
+
+-   Find condition-specific gene activity in each cluster.
+
+The notebook is organized into three sections:
+
+1.  Data preview: since the notebook explores a cluster-based analysis, I start by showing the clusters on the UMAP embedding of the data and provide context based on the conditions and expression of canonical markers.
+
+2.  Cluster markers: prioritize and identify a set of unique genes for each cluster by looking at the number of potential markers and their statistics, then look at their expression pattern across clusters.
+
+3.  Condition markers: identify genes that are differentially expressed in one of the conditions with respect to the control in each cluster.
+
+Notes:
+-   The notebook is shipped with the data that can be downloaded.
+-   The tool I used for differential expression analysis is [DElegate](https://github.com/cancerbits/DElegate) from my previous lab to make use of pseudo-bulk and pseudo-replicate testing.
+-   Visualizing gene expression on a UMAP with large number of cells can be obscured or biased by overplotting or cluster order. To mitigate this effect, I randomly shuffle the order of cells in the expression plot. Additionally, I add another version of the plots with cells ordered by expression to make low expressed genes more visible.
+-   Each plot has the source data that can be downloaded and explored outside the notebook.
+-   Click on the figures to zoom in for better readability of the labels.
+
+```{r setup, cache=FALSE}
+library(Seurat)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(htmltools)
+library(dplyr)
+library(tidyr)
+library(DT)
+library(targets)
+library(tidyverse)
+library(patchwork)
+library(stringr)
+library(dendsort)
+library(ggwordcloud)
+
+ggplot2::theme_set(cowplot::theme_cowplot())
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r helpers}
+tar_load(gradientn_pals)
+
+dl_btn <- function(df, filename = "data.csv", label = "⬇ Source data") {
+  invisible(NULL)
+}
+```
+
+# Data preview
+
+To aid interpretation of the downstream results, I start by giving a quick preview of HSCs UMAP colored and labelled at the clustering resolution used in differential expression testing throughout the notebook.
+
+```{r}
+#load data
+clust_marker_res <- "sNN_pca.SCT_30_res.0.9"
+clust_marker_0.9 <- targets::tar_read(cluster_markers_res_lst_hsc)[[clust_marker_res]]
+targets::tar_load(mpn_processed_hsc_fullcc)
+#set cluster order
+clust_0.9_order <- c("8",
+                 "6",
+                 "5",
+                 "1",
+                 "4",
+                 "3",
+                 "9",
+                 "7",
+                 "2",
+                 "13",
+                 "19",
+                 "18",
+                 "10",
+                 "14",
+                 "12",
+                 "15",
+                 "11",
+                 "17",
+                 "0",
+                 "20",
+                 "16"
+                 )
+mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.0.9 <- factor(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.0.9,
+                                                          levels = rev(clust_0.9_order))
+#define color vector
+clust_n   <- sort(unique(mpn_processed_hsc_fullcc@meta.data[[clust_marker_res]]))
+pal_n     <- scales::hue_pal()(length(clust_n))
+clust_cols <- setNames(pal_n, clust_n)
+```
+
+```{r, fig.width=9, fig.height=8}
+plot_umap_groups_ext(mpn_processed_hsc_fullcc,
+                     clust_marker_res,
+                     label = TRUE,
+                     label_size = 6)&
+  NoLegend()
+```
+
+The UMAP makes it clear that clusters come at varying sizes, and that the results associated with considerably small clusters should be taken with a spoonfull of salt.
+
+And also how the cells of the different conditions are distributed across the clusters.
+
+```{r, fig.width=20, fig.height=8}
+plot_umap_groups_ext(mpn_processed_hsc_fullcc,
+                     clust_marker_res,
+                     split.by = "sample.name",
+                     label = TRUE,
+                     label_size = 5,
+                     bg.size = 0)&
+  NoLegend()
+```
+
+A take away from the plots is that cluster 6 is enriched for mCh+ cells and cluster 8 is enriched for mCh- cells.
+
+Finally, let's also visualize the expression of a short list of canonical markers to guide our understanding of what each cluster might represent.
+
+```{r, fig.width=14, fig.height=14}
+markers_canonical_long <- c("Cd74", "Cd79a", "Cd14",# B-cells,
+       "Prss34", "Mcpt8",#Baso_E late
+       "Gypa","Tfrc","Hba−a1",#Baso_E late
+       "Prg2", "Epx", #Eosino
+       "Irf8","Batf3",#cDC1
+       "Irf4",#cDC2
+       "Csf1r","Cd68",#cDC2
+       "Cpa3", "Fcer1a", #Mast,
+       "Vwf", "Clu", "Mpl", #Mk Biased
+       "Pf4", #Mk
+       "Lyz2", "Ccr2", #Monocyte
+       "Ifit1", "Isg15",
+       "Klrk1", #NK
+       "S100a8", "S100a9", "Lcn2", "Csf3r", "Pglyrp1",#Neut
+       "Vwf", "Itga2b", "Mpl", "Procr",#MPP2_MkE
+       "Slamf1", "Ly6a","Cd34",#ST_HSC_MPP1
+       "Mecom",
+       "Trbc1", "Trbc2", "Lck", "Tcf7", #T-cell
+       "Klf1","Itga4" # ProE
+       )
+
+markers_canonical_short <- c("Slamf1",
+             "Mecom",
+             "Cd34",
+             "Klf1",
+             "Pf4",
+             "Irf8",
+             "Elane",
+             "Trbc1",
+             "Ccr2",
+             "Prss34",
+             "Prg2")
+
+plot_srt_ctr_stacked_vln(mpn_processed_hsc_fullcc,
+                         clust_id = clust_marker_res,
+                         feats    = markers_canonical_short,
+                         cols     = clust_cols)
+```
+
+UMAP plots of the normalized expression of the set of canonical markers ...
+
+```{r, fig.width=14, fig.height=11}
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = markers_canonical_short,
+                      cell_order = "shuffle",
+                      outline = FALSE,
+                      ncol = 4)&
+    scale_color_viridis_c(option = "turbo")
+```
+
+...and another version of the same set of plots with cells ordered by expression.
+
+```{r, fig.width=14, fig.height=11}
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = markers_canonical_short,
+                      cell_order = "expression",
+                      outline = FALSE,
+                      ncol = 4)&
+  scale_color_viridis_c(option = "turbo")
+```
+
+# Cluster markers
+
+The idea is instead of identifying markers by comparing the cells of each cluster to the rest (each vs rest), we do it by running comparisons against each other cluster individually. Thus, a good marker of a cluster is expected to come out as differentially up-regulated compared to the majority of other clusters. The rational for this approach is that comparing individual clusters is more meaningful because they represent homogeneous group of cells and are of comparable sizes.
+
+Start by setting the significance cutoffs for cluster markers comparisons based on the log2 fold change , p-adjusted value, and the number of cells in which the gene is expressed in the reference cluster.
+
+```{r}
+marker_logfc <- 1
+marker_padj <- 1e-5
+marker_n_expr <- 20
+```
+
+Let's load the raw output of differential expression analysis and apply the significance thresholding...
+```{r}
+clust_sizes <- table(mpn_processed_hsc_fullcc@meta.data[[clust_marker_res]]) |>
+  as.integer() |>
+  setNames(names(table(mpn_processed_hsc_fullcc@meta.data[[clust_marker_res]])))
+
+clust_marker_0.9 <- clust_marker_0.9 %>%
+  mutate(group1 = factor(group1, levels = clust_0.9_order),
+         n_cells = clust_sizes[as.character(group1)], #cluster size
+         n_expr  = round(rate1 * n_cells), #estimated expressing cells
+         n_cells = NULL,
+         sig = log_fc >= marker_logfc & padj <= marker_padj & n_expr >= marker_n_expr) #select markers only (i.e. upregulated) hence log_fc >= and NOT abs(log_fc))
+```
+
+then summarize the comparisons per gene in each reference cluster.
+```{r}
+marker_delegate_summary <- clust_marker_0.9 %>%
+  group_by(feature, group1) %>%
+  summarize(rate1 = unique(rate1), #detection rate in the reference cluster
+            rate2_median = median(rate2), #median detection rate across compared cluster
+            rate2_max = max(rate2), #maximum detection rate across compared cluster
+            group1_is_max = rate1 > rate2_max, #is the feature detected at the highest rate in the reference cluster?
+            n = dplyr::n(), #number of comparisons carried out (i.e. number compared clusters)
+            n_sig = sum(sig), #number of significant comparisons
+            sig_groups = paste0(unique(group2[sig]),collapse = ","), #clusters in which the feature came out as significantly different
+            notsig_groups = paste0(unique(group2[!sig]),collapse = ","), #clusters in which the feature came out as NOT significantly different
+            prop_sig = n_sig/n, #proportion of significant tests
+            median_padj = median(padj), #median padj value across all tests
+            median_logfc = median(log_fc), #median logfc value across all tests
+            min_padj = min(padj), #minimum (best) padj value across all tests
+            max_logfc = max(log_fc), #maximum (best) logfc value across all tests
+            rel_rate = rate1/rate2_median) %>% #relative detection rate
+  ungroup() %>%
+  group_by(feature) %>% 
+  mutate(n_sig_other = sum(n_sig) - n_sig,
+         n_sig_rel   = n_sig / (1 + n_sig_other))%>% #relative specificity
+  ungroup()%>%
+  #arrange(n_sig_rel)%>%
+  arrange(-(median_logfc * n_sig)) #arrange features weighted by the average logfc and number of significant comparisons
+```
+
+Significant markers across all clusters — filterable and downloadable as CSV.
+
+```{r marker-clust-sig-dt, echo=FALSE}
+DT::datatable(
+  marker_delegate_summary %>%
+    filter(n_sig >= 3, median_logfc > 0) %>%
+    select(cluster = group1, gene = feature, n_sig, prop_sig,
+           median_logfc, median_padj, rate_ref = rate1, sig_vs = sig_groups) %>%
+    mutate(across(c(prop_sig, median_logfc, median_padj, rate_ref), ~round(.x, 3))) %>%
+    arrange(cluster, desc(n_sig)),
+  rownames = FALSE, filter = "top", extensions = "Buttons",
+  options = list(pageLength = 20, scrollX = TRUE, dom = "Bfrtip",
+                 buttons = list(list(extend = "csv", filename = "cluster_markers_sig_hsc")))
+)
+```
+
+## Marker numbers
+
+We first start by generally exploring the number of hits resulting from the different comparisons.
+
+To start with, we can have a gene-wise view by looking at the gene × cluster table of the number of significant pairwise comparisons (`n_sig`). This summaries how specifically a gene marks each cluster. Blank = gene not tested in that cluster.
+
+```{r marker-clust-nsig-wide-table}
+nsig_wide <- marker_delegate_summary %>%
+  dplyr::select(feature, group1, n_sig) %>%
+  mutate(group1 = factor(group1, levels = clust_0.9_order)) %>%
+  arrange(group1, -n_sig)%>%
+  pivot_wider(names_from = group1, values_from = n_sig)
+
+DT::datatable(
+  nsig_wide,
+  rownames   = FALSE,
+  filter     = "top",
+  extensions = "Buttons",
+  options    = list(
+    pageLength = 20,
+    scrollX    = TRUE,
+    dom        = "Bfrtip",
+    buttons    = list(list(extend = "csv", filename = "marker_nsig_wide"))
+  )
+)
+```
+
+```{r, echo=FALSE}
+dl_btn(nsig_wide, "nsig_wide.csv")
+```
+
+For each reference cluster, the heatmap below shows how many genes are significantly upregulated against exactly N compared clusters. Fill is scaled within each reference cluster (column) so that the distribution of marker specificity is comparable across clusters regardless of total gene count. Numbers show the raw gene count per cell.
+
+```{r clust-markers-nsig-heatmap, fig.width=11, fig.height=7}
+nsig_hm_base <- marker_delegate_summary %>%
+  filter(median_logfc > 0) %>%
+  count(group1, n_sig, name = "n_genes") %>%
+  complete(group1, n_sig = 0:max(n_sig), fill = list(n_genes = 0L)) %>%
+  group_by(group1) %>%
+  mutate(pct = n_genes / sum(n_genes)) %>%
+  ungroup()
+
+make_nsig_hm <- function(df) {
+  df %>%
+    mutate(n_sig = factor(n_sig, levels = sort(unique(n_sig), decreasing = TRUE))) %>%
+    ggplot(aes(x = group1, y = n_sig, fill = pct)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = n_genes), size = 2.8, colour = "black") +
+    scale_fill_viridis_c(option = "mako", direction = -1,
+                         name = "Fraction\nwithin\ncluster",
+                         labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Reference cluster", y = "Significant in N compared clusters") +
+    theme_bw(base_size = 11) +
+    theme(panel.grid = element_blank(), axis.text.x = element_text(hjust = 0.5))
+}
+
+make_nsig_hm(filter(nsig_hm_base, n_sig > 0))
+```
+
+```{r, echo=FALSE}
+dl_btn(nsig_hm_base, "nsig_heatmap.csv")
+```
+
+It's interesting to see how based on the heatmap above we can identify  intermediate states (e.g. clusters 5, 1, 2) and terminal/starting states (e.g. clusters 4, 8, 6 7, 14)  as the former lacks marker genes that sets it apart from the majority of the rest of the clusters (i.e. low or zero number of genes compared to 20 clusters).
+
+Pairwise overlap of up-regulated marker genes significant in ≥ 10 comparisons — each cell shows how many genes are shared markers between two clusters.
+
+```{r clust-markers-overlap-heatmap, fig.width=11, fig.height=9}
+sig_10 <- marker_delegate_summary %>%
+  filter(n_sig >= 10, median_logfc > 0) %>%
+  select(feature, group1)
+
+overlap_mat <- sig_10 %>%
+  inner_join(sig_10, by = "feature", suffix = c("_A", "_B"), relationship = "many-to-many") %>%
+  count(group1_A, group1_B, name = "n_overlap") %>%
+  tidyr::complete(group1_A = clust_0.9_order, group1_B = clust_0.9_order,
+                  fill = list(n_overlap = 0L)) %>%
+  tidyr::pivot_wider(names_from = group1_B, values_from = n_overlap, values_fill = 0L) %>%
+  tibble::column_to_rownames("group1_A") %>%
+  as.matrix()
+overlap_mat <- overlap_mat[clust_0.9_order, clust_0.9_order]
+
+as.data.frame(as.table(overlap_mat)) %>%
+  dplyr::rename(clust_A = Var1, clust_B = Var2, n = Freq) %>%
+  dplyr::mutate(clust_A = factor(clust_A, levels = rev(clust_0.9_order)),
+                clust_B = factor(clust_B, levels = clust_0.9_order)) %>%
+  ggplot(aes(x = clust_B, y = clust_A, fill = n)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = n), size = 2.5, colour = "black") +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "Shared\ngenes") +
+  labs(x = "Cluster", y = "Cluster",
+       caption = "Upregulated marker genes with n_sig ≥ 10") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(hjust = 0.5))
+```
+
+```{r, echo=FALSE}
+dl_btn(as.data.frame(as.table(overlap_mat)), "overlap_nsig10.csv")
+```
+
+Pairwise overlap of upregulated marker genes significant in ≥ 15 comparisons.
+
+```{r clust-markers-overlap-heatmap-15, fig.width=11, fig.height=9}
+sig_15 <- marker_delegate_summary %>%
+  filter(n_sig >= 15, median_logfc > 0) %>%
+  select(feature, group1)
+
+overlap_mat_15 <- sig_15 %>%
+  inner_join(sig_15, by = "feature", suffix = c("_A", "_B"), relationship = "many-to-many") %>%
+  count(group1_A, group1_B, name = "n_overlap") %>%
+  tidyr::complete(group1_A = clust_0.9_order, group1_B = clust_0.9_order,
+                  fill = list(n_overlap = 0L)) %>%
+  tidyr::pivot_wider(names_from = group1_B, values_from = n_overlap, values_fill = 0L) %>%
+  tibble::column_to_rownames("group1_A") %>%
+  as.matrix()
+overlap_mat_15 <- overlap_mat_15[clust_0.9_order, clust_0.9_order]
+
+as.data.frame(as.table(overlap_mat_15)) %>%
+  dplyr::rename(clust_A = Var1, clust_B = Var2, n = Freq) %>%
+  dplyr::mutate(clust_A = factor(clust_A, levels = rev(clust_0.9_order)),
+                clust_B = factor(clust_B, levels = clust_0.9_order)) %>%
+  ggplot(aes(x = clust_B, y = clust_A, fill = n)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = n), size = 2.5, colour = "black") +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "Shared\ngenes") +
+  labs(x = "Cluster", y = "Cluster",
+       caption = "Upregulated marker genes with n_sig ≥ 15") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(hjust = 0.5))
+```
+
+```{r, echo=FALSE}
+dl_btn(as.data.frame(as.table(overlap_mat_15)), "overlap_nsig15.csv")
+```
+
+This view not only reveals the clusters relationship, but it also hints at an interesting observation in clusters 8 and ,especially, 6. Compared to other terminal/starting clusters like 4 and 7, these clusters have higher number of overlapping genes with the rest of the clusters. This could point out a high expression entropy or transcriptional noise.
+
+## Marker statistics
+
+After looking at the number of markers passing hard cutoffs, we can now move on to explore their statistics. Let's start by a general exploration of the magnitude of differential expression per cluster. For each reference cluster, the y axis shows the median logfc when this gene is compared to other clusters. The color is used to indicate the proportion of comparisons where the gene came out as significant, and the size indicate rank of the median padj.
+
+Select genes that are significantly up regulated in at least one comparison (1/20) and rank them per cluster based on their median padj.
+
+```{r}
+marker_prop <- 0.05
+marker_median_logfc <- 0
+
+marker_clust_sig <- marker_delegate_summary %>%
+  filter(prop_sig >= marker_prop & median_logfc >= marker_median_logfc) %>% #select markers significant in at least marker_prop of the comparisons and median logfc across clusters of at least marker_median_logfc
+  group_by(group1) %>%
+  mutate(padj_r = rank(-median_padj), #rank markers based on the median padj value
+         padj_r_scaled = (padj_r/max(padj_r))^2) %>% #scale the marker between 0 and 1 and square it to penalize low ranks
+  ungroup()
+```
+
+
+```{r}
+marker_top_lfc <- 4
+p_jitter <- marker_clust_sig %>%
+  arrange(prop_sig) %>% 
+  ggplot(aes(group1, median_logfc,
+             label = feature))+
+  geom_jitter(aes(size = padj_r_scaled,
+                  color  = prop_sig),
+              width = 0.3,
+              alpha = 0.5)+
+  scale_color_viridis_c(option = "turbo",
+                        name = "Proportion\nof significant\ntests")+
+  scale_size(range = c(0.1, 1),
+             name = "Scaled rank\nof median\npadj value")+
+  ggrepel::geom_text_repel(data = . %>% filter(median_logfc > marker_top_lfc),
+                         size = 3,
+                         segment.color = scales::alpha("grey40",0.5),
+                         min.segment.length = 0,
+                         max.overlaps = 20,
+                         point.size = NA,
+                         force = 0.3)+
+  xlab("Reference cluster")+
+  ylab("Gene median logFC")
+```
+
+```{r, fig.width=30, fig.height=10}
+p_jitter
+```
+
+```{r, echo=FALSE}
+dl_btn(marker_clust_sig, "cluster_markers_jitter.csv")
+```
+
+Again, as we saw in the heatmap of marker numbers, the plot shows that the clusters with least number of unique gene (i.e. low proportion of significant test) are transitional and intermediate clusters like 1, 2, and 5.
+
+For a more detailed, and familiar, look on the gene statistics, a per-cluster volcano plots of the summarized statistics — each gene's median logFC vs median -log₁₀(padj) across all pairwise comparisons. Dashed lines mark the significance thresholds; significant markers are highlighted in red.
+
+::: panel-tabset
+```{r clust-markers-volcano-prep}
+vol_marker_df <- marker_delegate_summary %>%
+  mutate(sig       = median_logfc >= marker_logfc & median_padj <= marker_padj,
+         neg_log_p = pmin(-log10(median_padj), 50))
+label_n <- 100
+```
+
+```{r clust-markers-volcano-tabs, results="asis", fig.height=8, fig.width=12}
+for (cl in clust_0.9_order) {
+  cat("##", cl, "\n\n")
+  df_cl <- filter(vol_marker_df, group1 == cl, median_logfc >= 0)
+  p <- ggplot(df_cl, aes(x = median_logfc, y = neg_log_p)) +
+    geom_vline(xintercept = marker_logfc, colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    geom_hline(yintercept = -log10(marker_padj), colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    geom_point(data = ~filter(.x, !sig),
+               aes(size = rate1),
+               fill = "grey80", colour = "white", shape = 21, alpha = 0.5) +
+    geom_point(data = ~filter(.x, sig),
+               aes(size = rate1),
+               fill = "#D73027", colour = "white", shape = 21, alpha = 0.5) +
+    ggrepel::geom_text_repel(
+      data         = ~.x %>% filter(sig) %>% slice_max(median_logfc, n = label_n),
+      aes(label    = feature),
+      size         = 2.5, max.overlaps = label_n, show.legend = FALSE,
+      segment.size = 0.3, segment.colour = "grey60",
+      xlim         = c(marker_logfc, Inf),
+      ylim         = c(-log10(marker_padj), Inf)
+    ) +
+    scale_x_continuous(expand = expansion(mult = 0.05)) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_size_continuous(name = "Detection\nrate (cluster)", range = c(0.3, 2)) +
+    labs(x = "Median log FC", y = "-log₁₀(median padj)", title = paste("Cluster", cl),
+         caption = paste0("Dashed: log FC = ", marker_logfc, ", padj = ", marker_padj,
+                          "  |  Labels: top",label_n,"sig by log FC")) +
+    theme_bw(base_size = 11) + theme(legend.position = "right")
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r, echo=FALSE}
+dl_btn(filter(vol_marker_df, sig), "cluster_markers_volcano_sig.csv")
+```
+
+The worldcloud below further emphasis the top hits out of the labelled genes in the volcano plots above.
+
+::: panel-tabset
+```{r clust-markers-wordcloud, results="asis", fig.width=10, fig.height=7}
+wc_df <- vol_marker_df %>%
+  filter(sig, median_logfc >= 0) %>%
+  group_by(group1) %>%
+  mutate(padj_r = rank(-median_padj), #rank markers based on the median padj value
+        padj_r_scaled = (padj_r/max(padj_r))^2) %>% #scale the marker between 0 and 1 and square it to penalize low ranks
+  slice_max(median_logfc, n = label_n/2) %>%
+  ungroup()
+
+for (cl in clust_0.9_order) {
+  cat("##", cl, "\n\n")
+  df_cl <- filter(wc_df, group1 == cl)
+  if (nrow(df_cl) == 0) { cat("*No genes passed the significance threshold.*\n\n"); next }
+  set.seed(42)
+  p <- ggplot(df_cl, aes(label = feature, size = padj_r_scaled, color = prop_sig)) +
+    geom_text_wordcloud(rm_outside = TRUE) +
+    scale_size(range = c(5, 13)) +
+    scale_color_viridis_c(option = "mako", name = "Proportion\nsignificant") +
+    labs(title = paste("Cluster", cl)) +
+    theme_minimal(base_size = 11)
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r, echo=FALSE}
+dl_btn(wc_df, "cluster_markers_wordcloud.csv")
+```
+
+## Marker expression
+
+After looking at the number and statistics of genes, we can focus on a smaller set of the top hits, and look beyond the test statistics to explore their actual expression pattern across clusters.
+
+```{r}
+mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.0.9 <- factor(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.0.9,
+                                                          levels = rev(clust_0.9_order))
+```
+
+Pick top candidate cluster marker per group based on the number of significant comparisons and average logfc, then plot a stacked cluster markers expression violin plot
+
+```{r clust-markers-stacked-vln, fig.width=33, fig.height=22}
+n_marker <- 3
+min_rate <- 0.05
+gene_clust_df <- marker_delegate_summary %>%
+  filter(group1_is_max, rate1 >= min_rate) %>%
+  arrange(group1) %>%
+  group_by(group1) %>%
+  slice_head(n = n_marker) %>%
+  ungroup()%>%
+  select(feature, group1) %>%
+  distinct(feature, .keep_all = TRUE)
+marker_cluster_top <- gene_clust_df$feature
+
+clust_n   <- sort(unique(mpn_processed_hsc_fullcc@meta.data[[clust_marker_res]]))
+pal_n     <- scales::hue_pal()(length(clust_n))
+clust_cols <- setNames(pal_n, clust_n)
+
+plot_srt_ctr_stacked_vln(mpn_processed_hsc_fullcc,
+                         clust_id = clust_marker_res,
+                         feats    = marker_cluster_top,
+                         cols     = clust_cols)
+```
+
+```{r, echo=FALSE}
+dl_btn(
+  marker_delegate_summary %>%
+    arrange(group1) %>%
+    group_by(group1) %>%
+    slice_head(n = n_marker) %>%
+    ungroup() %>%
+    filter(feature %in% marker_cluster_top),
+  "top_marker_stats.csv"
+)
+```
+
+```{r clust-markers-pseudobulk-heatmap, fig.width=10, fig.height=8}
+#| include: false
+# Average expression per cluster (mean of log-normalised SCT data per cell)
+avg_mat <- Seurat::AverageExpression(
+  mpn_processed_hsc_fullcc,
+  assays   = "SCT",
+  features = marker_cluster_top,
+  group.by = clust_marker_res,
+  layer    = "data"
+)$SCT
+
+# Map column names to cluster IDs (AverageExpression prepends "g" to numeric names)
+col_ids <- gsub("^g", "", colnames(avg_mat))
+col_use <- clust_0.9_order[clust_0.9_order %in% col_ids]
+avg_mat <- avg_mat[, match(col_use, col_ids), drop = FALSE]
+colnames(avg_mat) <- col_use
+
+# Row z-score, clamp to ±2
+mat_pb <- t(scale(t(as.matrix(avg_mat))))
+mat_pb[!is.finite(mat_pb)] <- 0
+mat_pb <- pmin(pmax(mat_pb, -2), 2)
+
+gene_clust_df <- filter(gene_clust_df, feature %in% rownames(mat_pb))
+
+# Seriate rows within each source cluster (same approach as hub-heatmap-cell)
+ser_method <- "PCA"
+o_genes <- gene_clust_df %>%
+  group_by(group1) %>%
+  group_map(function(df, key) {
+    gns <- intersect(df$feature, rownames(mat_pb))
+    if (length(gns) <= 2L) return(gns)
+    sub <- mat_pb[gns, , drop = FALSE]
+    tryCatch(
+      {
+        o <- seriation::seriate(sub, method = ser_method) %>% seriation::get_order(1L)
+        gns[o]
+      },
+      error = function(e) gns
+    )
+  }) %>%
+  unlist(use.names = FALSE)
+
+row_split <- factor(
+  setNames(as.character(gene_clust_df$group1), gene_clust_df$feature)[o_genes],
+  levels = col_use
+)
+
+ComplexHeatmap::draw(
+  ComplexHeatmap::Heatmap(
+    mat_pb[o_genes, ],
+    name              = "z-score",
+    col               = circlize::colorRamp2(c(-2, 0, 2), c("#2166ac", "white", "#b2182b")),
+    cluster_rows      = FALSE,
+    cluster_columns   = FALSE,
+    row_split         = row_split,
+    row_title_gp      = grid::gpar(fontsize = 0),
+    show_row_names    = TRUE,
+    show_column_names = TRUE,
+    row_names_gp      = grid::gpar(fontsize = 9),
+    column_names_gp   = grid::gpar(fontsize = 9),
+    column_names_rot  = 45,
+    use_raster        = FALSE
+  )
+)
+```
+
+```{r, echo=FALSE}
+dl_btn(as.data.frame(mat_pb[o_genes, ], check.names = FALSE), "pseudobulk_heatmap.csv")
+```
+
+```{r clust-markers-pseudobulk-bubble, fig.height=10, fig.width=7}
+# Detection rate per gene × cluster via DotPlot
+dp_data <- Seurat::DotPlot(
+  mpn_processed_hsc_fullcc,
+  features = marker_cluster_top,
+  group.by = clust_marker_res,
+  assay    = "SCT"
+)$data %>%
+  dplyr::rename(feature = features.plot, cluster = id) %>%
+  dplyr::select(feature, cluster, pct.exp) %>%
+  dplyr::mutate(cluster = gsub("^g", "", as.character(cluster)))
+
+bubble_df <- mat_pb[o_genes, ] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("feature") %>%
+  tidyr::pivot_longer(-feature, names_to = "cluster", values_to = "z_score") %>%
+  dplyr::left_join(dp_data, by = c("feature", "cluster")) %>%
+  dplyr::mutate(
+    feature = factor(feature, levels = rev(o_genes)),
+    cluster = factor(cluster, levels = col_use)
+  )
+
+ggplot(bubble_df, aes(x = cluster, y = feature, size = pct.exp, fill = z_score)) +
+  geom_point(shape = 21, colour = "white", stroke = 0.3) +
+  scale_fill_gradientn(
+    colours = c("#2166ac", "white", "#b2182b"),
+    limits  = c(-2, 2), oob = scales::squish,
+    name    = "z-score"
+  ) +
+  scale_size_continuous(name = "Detection\nrate (%)", range = c(0, 6)) +
+  labs(x = "Cluster", y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    axis.text.y     = element_text(size = 8),
+    panel.grid      = element_line(colour = "grey92"),
+    legend.position = "right"
+  )
+```
+
+```{r, echo=FALSE}
+dl_btn(bubble_df %>% mutate(across(where(is.factor), as.character)), "pseudobulk_bubble.csv")
+```
+
+For the set of top markers selected, we can also look at the UMAP plots of their normalized expression ...
+
+```{r, fig.width=14, fig.height=36}
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = marker_cluster_top,
+                      cell_order = "shuffle",
+                      outline = FALSE,
+                      ncol = 4)&
+    scale_color_viridis_c(option = "turbo")
+```
+
+...and another version of the same set of plots with cells ordered by expression.
+
+```{r, fig.width=14, fig.height=36}
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = marker_cluster_top,
+                      cell_order = "expression",
+                      outline = FALSE,
+                      ncol = 4)&
+  scale_color_viridis_c(option = "turbo")
+```
+
+
+# Condition markers
+
+Now I'll shift gears from identifying potential markers, by comparing clusters to each other and selecting top up-regulated genes, to finding differentially expressed genes between the different conditions within each cluster and looking at both up- and down-regulated genes. We'll first explore the results of each condition separately in Volcano plots, then compare them to one another in a scatter plot.
+
+Set the significance cutoffs
+
+```{r}
+padj_allvsall <- 0.001
+logfc_allvsall <- 1
+logfc_allvsall_high <- 3
+rate_cutoff <- 0.2
+```
+
+Load data and exclude sex-related genes
+```{r allvsall-hsc}
+# Clustering level used throughout this section — change here to switch all plots
+hsc_clust_level <- "res_0.9"
+
+tar_load(delegate_pairwise_markers_hsc)
+tar_load(sex_degs)
+sex_degs <- c(targets::tar_read(sex_degs), "ENSMUSG00000121395") #exclude sex genes and  ENSMUSG00000121395 
+hsc_raw <- delegate_pairwise_markers_hsc[[hsc_clust_level]]
+rm(delegate_pairwise_markers_hsc)
+```
+
+Prepare data for volcano plot. - cap the padj values at 1e-30 - define significant genes based on padj, log_fc, and their detection rate
+
+```{r allvsall-hsc-volcano-prep}
+make_volcano <- function(df, comparison_label) {
+  df |>
+    dplyr::mutate(
+      neg_log_p  = -log10(pmax(padj, 1e-30)),
+      sig        = (padj <= padj_allvsall & log_fc >=  logfc_allvsall & rate1 >= rate_cutoff) |
+                   (padj <= padj_allvsall & log_fc <= -logfc_allvsall & rate2 >= rate_cutoff),
+      max_rate   = pmax(rate1, rate2),
+      comparison = comparison_label
+    ) |>
+    dplyr::filter(!feature %in% sex_degs)
+}
+
+volcano_neg <- make_volcano(hsc_raw$mch_neg_vs_wt, "Het mCh− vs WT")
+volcano_pos <- make_volcano(hsc_raw$mch_pos_vs_wt, "Het mCh⁺ vs WT")
+
+volcano_df       <- bind_rows(volcano_neg, volcano_pos)
+volcano_clusters <- sort(unique(volcano_df$cluster))
+
+n_cl           <- length(volcano_clusters)
+cl_cols        <- setNames(scales::hue_pal()(n_cl), volcano_clusters)
+cluster_levels <- volcano_clusters
+comp_cols      <- c("Het mCh− vs WT" = "#E69F00", "Het mCh⁺ vs WT" = "#56B4E9")
+comps          <- unique(volcano_df$comparison)
+```
+
+Define helper functions for plotting the volcano plot
+
+```{r allvsall-hsc-helpers}
+# Top N significant genes per cluster×comparison for volcano labels,
+# ranked by a combined score: rank(abs(log_fc)) + rank(neg_log_p).
+top_n_volcano_sig <- function(df, n = 40) {
+  df %>%
+    filter(sig) %>%
+    mutate(score = rank(abs(log_fc)) + rank(neg_log_p)) %>%
+    group_by(comparison) %>%
+    slice_max(score, n = n) %>%
+    ungroup()
+}
+
+top_n_volcano_notsig <- function(df, n = 40) {
+  df %>%
+    filter(!sig & (abs(log_fc) > logfc_allvsall_high & neg_log_p > 3)) %>%
+    mutate(score = rank(abs(log_fc)) + rank(neg_log_p)) %>%
+    group_by(comparison) %>%
+    slice_max(score, n = n) %>%
+    ungroup()
+}
+
+# Union of top-N-from-origin and top-N-from-diagonal per quadrant.
+top_n_combined <- function(df, n_origin = 20, n_diag = 20) {
+  df <- df %>%
+    mutate(
+      quadrant  = paste0(if_else(log_fc_neg >= 0, "R", "L"),
+                         if_else(log_fc_pos >= 0, "U", "D")),
+      dist      = sqrt(log_fc_neg^2 + log_fc_pos^2),
+      diag_dist = abs(log_fc_pos - log_fc_neg) / sqrt(2)
+    )
+  by_origin <- df %>% group_by(quadrant) %>% slice_max(dist,      n = n_origin) %>% ungroup()
+  by_diag   <- df %>% group_by(quadrant) %>% slice_max(diag_dist, n = n_diag)   %>% ungroup()
+  bind_rows(by_origin, by_diag) %>% distinct(feature, cluster, quadrant, .keep_all = TRUE)
+}
+
+# Repel labels confined to their quadrant, coloured by cluster.
+repel_combined <- function(df_label, inf = 30) {
+  quad_limits <- list(
+    RU = list(xlim = c(0,    inf), ylim = c(0,   inf)),
+    RD = list(xlim = c(0,    inf), ylim = c(-inf, 0)),
+    LU = list(xlim = c(-inf, 0),   ylim = c(0,   inf)),
+    LD = list(xlim = c(-inf, 0),   ylim = c(-inf, 0))
+  )
+  lapply(names(quad_limits), function(q) {
+    d <- filter(df_label, quadrant == q)
+    if (nrow(d) == 0) return(NULL)
+    lims <- quad_limits[[q]]
+    ggrepel::geom_text_repel(
+      data         = d,
+      aes(label = feature, colour = cluster),
+      size         = 2.3, max.overlaps = 30, show.legend = FALSE,
+      #segment.size = logfc_allvsall,
+      segment.size = 0.2,
+      segment.colour = scales::alpha("grey",alpha = 0.6),
+      xlim         = lims$xlim,
+      ylim         = lims$ylim
+    )
+  })
+}
+
+
+# Shared theme + guide overrides for all scatter plots.
+scatter_theme <- theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "right",
+    panel.grid.major = element_line(colour = "grey90", linewidth = 0.2),
+    panel.grid.minor = element_blank()
+  )
+
+scatter_guides <- guides(
+  fill = guide_legend(
+    override.aes = list(alpha = 1, size = 4, shape = 21, colour = "white")
+  ),
+  size = guide_legend(
+    override.aes = list(alpha = 1, fill = "grey50", colour = "white", shape = 21),
+    range        = c(2, 8)
+  )
+)
+```
+
+```{r, echo=FALSE}
+dl_btn(filter(volcano_df, sig), "allvsall_volcano_sig.csv")
+```
+
+### Static volcano — all clusters {.unnumbered}
+
+```{r allvsall-hsc-volcano-all, fig.height=8, fig.width=12}
+top_n_volcano_all <- function(df, n_per_group = 15) {
+  df %>%
+    filter(sig) %>%
+    mutate(
+      score     = rank(abs(log_fc)) + rank(neg_log_p),
+      direction = if_else(log_fc > 0, "up", "down")
+    ) %>%
+    group_by(comparison, direction) %>%
+    slice_max(score, n = n_per_group) %>%
+    ungroup()
+}
+
+vol_lfc_cap <- 8
+volcano_df_capped <- volcano_df %>%
+  mutate(log_fc = if_else(abs(log_fc) > vol_lfc_cap, sign(log_fc) * vol_lfc_cap, log_fc))
+
+n_group_label <- 30
+df_label_vol_all <- top_n_volcano_all(volcano_df_capped, n_group_label) %>%
+  mutate(feature = glue::glue("{feature}({cluster})"))
+
+y_max <- max(volcano_df_capped$neg_log_p, na.rm = TRUE) * 1.05
+
+ggplot(volcano_df_capped, aes(x = log_fc, y = neg_log_p)) +
+  geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = c(-logfc_allvsall, logfc_allvsall),
+             colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+  geom_hline(yintercept = -log10(padj_allvsall),
+             colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+  geom_point(data = ~filter(.x, !sig),
+             aes(size = max_rate),
+             fill = "grey80", colour = "white", shape = 21, alpha = 0.3) +
+  geom_point(data = ~filter(.x, sig),
+             aes(fill = cluster, size = max_rate),
+             colour = "white", shape = 21, alpha = 0.5) +
+  ggrepel::geom_text_repel(
+    data         = filter(df_label_vol_all, direction == "up"),
+    aes(label = feature, colour = cluster),
+    size         = 2.3, max.overlaps = 30, show.legend = FALSE,
+    segment.size = 0.2, segment.colour = "grey60",
+    xlim         = c(logfc_allvsall, vol_lfc_cap),
+    ylim         = c(0, y_max)
+  ) +
+  ggrepel::geom_text_repel(
+    data         = filter(df_label_vol_all, direction == "down"),
+    aes(label = feature, colour = cluster),
+    size         = 2.3, max.overlaps = 30, show.legend = FALSE,
+    segment.size = 0.2, segment.colour = "grey60",
+    xlim         = c(-vol_lfc_cap, -logfc_allvsall),
+    ylim         = c(0, y_max)
+  ) +
+  scale_fill_manual(values = cl_cols, breaks = cluster_levels, name = "Cluster") +
+  scale_colour_manual(values = cl_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = 0.05)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_size_continuous(name = "Max expression\nrate", range = c(0.3, 2)) +
+  facet_wrap(~comparison, ncol = 1) +
+  labs(x = "log FC", y = "-log₁₀ (padj)",
+       title = "HSC — all clusters",
+       caption = paste0("log FC capped at ±", vol_lfc_cap, "  |  Colour = cluster  |  Size = max(rate1, rate2)  |  Labels: top 15 up/down per comparison by |log FC| + -log₁₀(padj)")) +
+  theme_bw(base_size = 11) + theme(legend.position = "right")
+```
+
+### Interactive volcano — all clusters {.unnumbered}
+
+```{r allvsall-hsc-volcano-all-interactive, fig.height=5, fig.width=12}
+set.seed(42)
+vol_plt_df <- bind_rows(
+  filter(volcano_df_capped,  sig),
+  filter(volcano_df_capped, !sig) %>% slice_sample(n = min(8000, sum(!volcano_df_capped$sig)))
+) %>%
+  dplyr::select(log_fc, neg_log_p, sig, cluster, comparison, max_rate, feature) %>%
+  mutate(
+    point_col  = if_else(sig, cl_cols[cluster], "grey80"),
+    hover_text = if_else(sig, paste0(feature, "(", cluster, ")"), ""),
+    point_size = scales::rescale(max_rate, to = c(3, 10))
+  )
+
+make_vol_plotly <- function(df, comp_label) {
+  df_comp <- filter(df, comparison == comp_label)
+  df_ns   <- filter(df_comp, !sig)
+  df_sig  <- filter(df_comp,  sig)
+
+  plot_ly() |>
+    add_trace(
+      data      = df_ns,
+      x = ~log_fc, y = ~neg_log_p,
+      type      = "scattergl", mode = "markers",
+      marker    = list(color = "rgba(200,200,200,0.3)", size = 3),
+      hoverinfo = "none",
+      showlegend = FALSE
+    ) |>
+    add_trace(
+      data          = df_sig,
+      x = ~log_fc, y = ~neg_log_p,
+      type          = "scattergl", mode = "markers",
+      marker        = list(color = ~point_col, size = ~point_size,
+                           line = list(color = "white", width = 0.5),
+                           opacity = 0.7),
+      text          = ~hover_text,
+      hovertemplate = "<b>%{text}</b><br>log FC: %{x:.2f}<br>-log₁₀(p): %{y:.2f}<extra></extra>",
+      showlegend    = FALSE
+    ) |>
+    layout(
+      title  = list(text = comp_label, font = list(size = 12)),
+      xaxis  = list(title = "log FC", range = c(-vol_lfc_cap, vol_lfc_cap) * 1.05,
+                    zeroline = TRUE, zerolinecolor = "grey70", zerolinewidth = 1,
+                    showgrid = FALSE),
+      yaxis  = list(title = "-log₁₀ (padj)", showgrid = FALSE),
+      shapes = list(
+        list(type = "line", x0 = -logfc_allvsall, x1 = -logfc_allvsall,
+             y0 = 0, y1 = 1, yref = "paper",
+             line = list(color = "grey50", dash = "dash", width = 1)),
+        list(type = "line", x0 =  logfc_allvsall, x1 =  logfc_allvsall,
+             y0 = 0, y1 = 1, yref = "paper",
+             line = list(color = "grey50", dash = "dash", width = 1)),
+        list(type = "line", x0 = -vol_lfc_cap, x1 = vol_lfc_cap,
+             y0 = -log10(padj_allvsall), y1 = -log10(padj_allvsall),
+             line = list(color = "grey50", dash = "dash", width = 1))
+      ),
+      plot_bgcolor  = "white",
+      paper_bgcolor = "white"
+    )
+}
+```
+
+```{r allvsall-hsc-volcano-interactive-neg, fig.height=5, fig.width=7}
+make_vol_plotly(vol_plt_df, comps[1])
+```
+
+```{r allvsall-hsc-volcano-interactive-pos, fig.height=5, fig.width=7}
+make_vol_plotly(vol_plt_df, comps[2])
+```
+
+### Static volcano — by cluster {.unnumbered}
+
+::: panel-tabset
+```{r allvsall-hsc-volcano-tabs, results="asis", fig.height=8, fig.width=11}
+for (cl in clust_0.9_order[clust_0.9_order %in% volcano_clusters]) {
+  cat("##", cl, "\n\n")
+  df_cl <- filter(volcano_df_capped, cluster == cl)
+  p <- ggplot(df_cl, aes(x = log_fc, y = neg_log_p)) +
+    geom_vline(xintercept = 0,                    colour = "grey70", linewidth = 0.3) +
+    geom_vline(xintercept = c(-logfc_allvsall, logfc_allvsall), colour = "grey50", linewidth = 0.3,
+               linetype = "dashed") +
+    geom_hline(yintercept = -log10(padj_allvsall),        colour = "grey50", linewidth = 0.3,
+               linetype = "dashed") +
+    geom_point(data = ~filter(.x, !sig),
+               aes(size = max_rate),
+               fill = "grey80", colour = "white", shape = 21, alpha = 0.5) +
+    geom_point(data = ~filter(.x, sig),
+               aes(fill = comparison, size = max_rate),
+               colour = "white", shape = 21, alpha = 0.5) +
+    ggrepel::geom_text_repel(
+      data         = ~top_n_volcano_sig(.x, n = 100) %>% filter(log_fc > 0),
+      aes(label    = feature, colour = comparison),
+      size         = 2.5, max.overlaps = 30, show.legend = FALSE,
+      segment.size = 0.3, segment.colour = "grey60",
+      xlim         = c(logfc_allvsall,  Inf),
+      ylim         = c(-log10(padj_allvsall), Inf)
+    ) +
+    ggrepel::geom_text_repel(
+      data         = ~top_n_volcano_sig(.x, n = 100) %>% filter(log_fc < 0),
+      aes(label    = feature, colour = comparison),
+      size         = 2.5, max.overlaps = 30, show.legend = FALSE,
+      segment.size = 0.3, segment.colour = "grey60",
+      xlim         = c(-Inf, -logfc_allvsall),
+      ylim         = c(-log10(padj_allvsall), Inf)
+    ) +
+    ggrepel::geom_text_repel(
+      data         = ~top_n_volcano_notsig(.x, n = 100),
+      aes(label    = feature),
+      color = "grey60",
+      size         = 2.5, max.overlaps = 30, show.legend = FALSE,
+      segment.size = 0.3, segment.colour = "grey60"
+    ) +
+
+    scale_fill_manual(values   = comp_cols, name = "Comparison") +
+    scale_colour_manual(values = comp_cols, guide = "none") +
+    scale_x_continuous(expand = expansion(mult = 0.05)) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_size_continuous(name = "Max expression\nrate", range = c(0.3, 2)) +
+    facet_wrap(~comparison, ncol = 1) +
+    labs(x = "log FC", y = "-log₁₀ (padj)", title = paste("Cluster", cl),
+         caption = "Dashed: |log FC| = logfc_allvsall, padj = padj_allvsall  |  Labels: top 20 significant genes ranked by |log FC| + -log₁₀(padj)") +
+    theme_bw(base_size = 11) + theme(legend.position = "right")
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r allvsall-hsc-scatter-prep}
+tar_load(scatter_df_hsc)
+scatter_df <- scatter_df_hsc[[hsc_clust_level]]
+rm(scatter_df_hsc)
+```
+
+### Static scatter — all clusters {.unnumbered}
+
+```{r allvsall-hsc-scatter-all, fig.height=5, fig.width=7}
+scatter_df_sig <- scatter_df %>%
+  filter(sig_neg|sig_pos) %>%
+  dplyr::filter(!feature %in% sex_degs) %>% 
+  mutate(feature = glue::glue("{feature}({cluster})"))
+
+df_label_hsc <- scatter_df_sig %>%
+  top_n_combined()
+axes_range <- range(c(df_label_hsc$log_fc_neg, df_label_hsc$log_fc_pos))
+
+scatter_df_sig %>%
+  ggplot(aes(x = log_fc_neg, y = log_fc_pos)) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.6) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.6) +
+  geom_abline(slope = 1, intercept =  0, colour = "grey50", linewidth = 0.55,
+              linetype = "solid") +
+  geom_abline(slope = 1, intercept =  1, colour = "grey50", linewidth = 0.4,
+              linetype = "22") +
+  geom_abline(slope = 1, intercept = -1, colour = "grey50", linewidth = 0.4,
+              linetype = "22") +
+  geom_point(aes(fill = cluster, size = max_rate),
+             colour = "white", shape = 21, alpha = 0.5) +
+  repel_combined(df_label_hsc) +
+  scale_fill_manual(values = cl_cols, breaks = cluster_levels, name = "Cluster") +
+  scale_colour_manual(values = cl_cols, guide = "none") +
+    scale_x_continuous(limits = axes_range, expand = expansion(mult = 0.1)) +
+    scale_y_continuous(limits = axes_range, expand = expansion(mult = 0.1)) +
+  scale_size_continuous(name = "Max expression\nrate", range = c(0.5, 4)) +
+  labs(x = "log FC  (Het mCh− vs WT)", y = "log FC  (Het mCh⁺ vs WT)",
+       title = "CD41⁺ HSC — all clusters",
+       caption = paste(
+         "Significant genes only (padj ≤ padj_allvsall & |log FC| ≥ logfc_allvsall)",
+         "Labels: union of top 15 by distance from origin + top 10 by distance from diagonal  |  Size = max(rate1, rate2)",
+         "Grey solid: shared Het effect (y = x)  |  Grey dashed: ±1 log FC band",
+         sep = "\n"
+       )) +
+  scatter_theme + scatter_guides
+```
+
+```{r, echo=FALSE}
+dl_btn(scatter_df_sig %>% mutate(across(where(is.factor), as.character)), "allvsall_scatter.csv")
+```
+
+### Interactive scatter — all clusters {.unnumbered}
+
+```{r allvsall-hsc-scatter-interactive, fig.height=6, fig.width=7}
+scatter_plt_df <- scatter_df_sig %>%
+  mutate(
+    point_col  = cl_cols[cluster],
+    point_size = scales::rescale(max_rate, to = c(3, 10)),
+    hover_text = paste0(feature, "<br>cluster: ", cluster,
+                        "<br>log FC (mCh−): ", round(log_fc_neg, 2),
+                        "<br>log FC (mCh+): ", round(log_fc_pos, 2))
+  )
+
+ax_range <- range(c(scatter_plt_df$log_fc_neg, scatter_plt_df$log_fc_pos)) * 1.05
+
+diag_lines <- list(
+  list(type = "line", x0 = ax_range[1], x1 = ax_range[2],
+       y0 = ax_range[1], y1 = ax_range[2],
+       line = list(color = "grey50", width = 1)),
+  list(type = "line", x0 = ax_range[1], x1 = ax_range[2],
+       y0 = ax_range[1] + 1, y1 = ax_range[2] + 1,
+       line = list(color = "grey50", dash = "dot", width = 0.8)),
+  list(type = "line", x0 = ax_range[1], x1 = ax_range[2],
+       y0 = ax_range[1] - 1, y1 = ax_range[2] - 1,
+       line = list(color = "grey50", dash = "dot", width = 0.8))
+)
+
+plot_ly(scatter_plt_df,
+        x = ~log_fc_neg, y = ~log_fc_pos,
+        type = "scattergl", mode = "markers",
+        marker = list(color = ~point_col, size = ~point_size,
+                      line = list(color = "white", width = 0.5),
+                      opacity = 0.7),
+        text  = ~hover_text,
+        hovertemplate = "<b>%{text}</b><extra></extra>",
+        showlegend = FALSE) |>
+  layout(
+    title  = list(text = "CD41⁺ HSC — all clusters", font = list(size = 12)),
+    xaxis  = list(title = "log FC  (Het mCh− vs WT)", range = ax_range,
+                  zeroline = TRUE, zerolinecolor = "grey70", zerolinewidth = 1,
+                  showgrid = FALSE),
+    yaxis  = list(title = "log FC  (Het mCh⁺ vs WT)", range = ax_range,
+                  zeroline = TRUE, zerolinecolor = "grey70", zerolinewidth = 1,
+                  showgrid = FALSE),
+    shapes = diag_lines,
+    plot_bgcolor  = "white",
+    paper_bgcolor = "white"
+  )
+```
+
+### Static scatter — by cluster {.unnumbered}
+
+::: panel-tabset
+```{r allvsall-hsc-scatter-tabs, results="asis", fig.height=5, fig.width=6}
+for (cl in clust_0.9_order[clust_0.9_order %in% volcano_clusters]) {
+  cat("##", cl, "\n\n")
+  df_cl    <- filter(scatter_df_sig, cluster == cl) %>%
+    mutate(log_fc_neg = pmin(pmax(log_fc_neg, -vol_lfc_cap), vol_lfc_cap),
+           log_fc_pos = pmin(pmax(log_fc_pos, -vol_lfc_cap), vol_lfc_cap))
+  df_label <- top_n_combined(df_cl)
+  p <- ggplot(df_cl, aes(x = log_fc_neg, y = log_fc_pos)) +
+    geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.6) +
+    geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.6) +
+    geom_abline(slope = 1, intercept =  0, colour = "grey50", linewidth = 0.55,
+                linetype = "solid") +
+    geom_abline(slope = 1, intercept =  1, colour = "grey50", linewidth = 0.4,
+                linetype = "22") +
+    geom_abline(slope = 1, intercept = -1, colour = "grey50", linewidth = 0.4,
+                linetype = "22") +
+    geom_point(aes(fill = cluster, size = max_rate),
+               colour = "white", shape = 21, alpha = 0.5) +
+    repel_combined(df_label) +
+    scale_fill_manual(values = cl_cols, breaks = cluster_levels, name = "Cluster") +
+    scale_colour_manual(values = cl_cols, guide = "none") +
+    scale_x_continuous(limits = axes_range, expand = expansion(mult = 0.1)) +
+    scale_y_continuous(limits = axes_range, expand = expansion(mult = 0.1)) +
+    scale_size_continuous(name = "Max expression\nrate", range = c(0.5, 4)) +
+    labs(x = "log FC  (Het mCh− vs WT)", y = "log FC  (Het mCh⁺ vs WT)",
+         title = paste("Cluster", cl),
+         caption = "Significant genes only (padj ≤ padj_allvsall & |log FC| ≥ logfc_allvsall)\nLabels: top 20 per quadrant by distance from origin  |  Size = max(rate1, rate2)") +
+    scatter_theme + scatter_guides
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+This exploration highlights genes that are equally upregualted in mCh+ and mCh- like Mmrn1, more upregulated in mCh+ like Mies2, or more upregulated in mCh- like Cdkn2a.
+
+```{r het-vs-wt-genes-summary}
+#| include: false
+lfc_clust_genes <- volcano_df %>%
+    filter(group1 == "HSC_Het_CD41+mCh+") %>%
+    group_by(feature) %>%
+    mutate(n = sum(sig)) %>%
+    dplyr::select(feature, log_fc, cluster, n) %>%
+    pivot_wider(names_from = cluster, values_from = log_fc)
+
+padj_clust_genes <- volcano_df %>%
+    filter(group1 == "HSC_Het_CD41+mCh+") %>%
+    group_by(feature) %>%
+    mutate(n = sum(sig),
+           sig_sym = ifelse(sig, "*", " ")) %>%
+    dplyr::select(feature, sig_sym, cluster, n) %>%
+    pivot_wider(names_from = cluster, values_from = sig_sym)
+
+sig_clust_dir_n <- volcano_df %>%
+  filter(group1 == "HSC_Het_CD41+mCh+") %>%
+  mutate(dir = ifelse(log_fc>0, "up", "down")) %>%
+  filter(sig) %>%
+  dplyr::count(cluster, dir)
+
+sig_clust_total_n <- sig_clust_dir_n %>%
+  group_by(cluster) %>%
+  summarise(n_tota = sum(n))
+
+clust_size <- mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.0.9 %>%
+  table %>%
+  enframe(name = "cluster", value = "n")
+```
+
+```{r het-vs-wt-genes-hm}
+#| include: false
+hm_clusters <- setdiff(colnames(padj_clust_genes), c("feature", "n"))
+
+# Restrict to genes significant in ≥1 cluster, sorted by breadth
+hm_genes <- padj_clust_genes %>%
+  filter(n > 0) %>%
+  arrange(desc(n)) %>%
+  pull(feature)
+
+# Numeric log-FC matrix (colour fill)
+lfc_mat <- lfc_clust_genes %>%
+  filter(feature %in% hm_genes) %>%
+  dplyr::select(feature, all_of(hm_clusters)) %>%
+  tibble::column_to_rownames("feature") %>%
+  as.matrix()
+lfc_mat <- lfc_mat[hm_genes, , drop = FALSE]   # enforce gene order
+lfc_cap <- 4
+#lfc_mat <- lfc_mat %>% apply(2, function(x) scales::squish(x,range = c(lfc_cap * -1, lfc_cap)))
+# Significance overlay matrix (same dimensions)
+sig_mat <- padj_clust_genes %>%
+  filter(feature %in% hm_genes) %>%
+  dplyr::select(feature, all_of(hm_clusters)) %>%
+  tibble::column_to_rownames("feature") %>%
+  as.matrix()
+sig_mat <- sig_mat[hm_genes, , drop = FALSE]
+
+# Order clusters by total significant DEGs (descending)
+hm_clusters <- sig_clust_total_n %>%
+  filter(cluster %in% hm_clusters) %>%
+  arrange(desc(n_tota)) %>%
+  pull(cluster)
+
+# Re-enforce column order in matrices
+lfc_mat <- lfc_mat[, hm_clusters, drop = FALSE]
+sig_mat <- sig_mat[, hm_clusters, drop = FALSE]
+
+# Up / down barplot annotation per cluster
+bar_mat <- sig_clust_dir_n %>%
+  tidyr::pivot_wider(names_from = dir, values_from = n, values_fill = 0L) %>%
+  dplyr::select(cluster, any_of(c("up", "down"))) %>%
+  tibble::column_to_rownames("cluster")
+for (d in c("up", "down")) {
+  if (!d %in% colnames(bar_mat)) bar_mat[[d]] <- 0L
+}
+bar_mat <- bar_mat[hm_clusters, c("up", "down"), drop = FALSE]
+
+# Cluster size annotation
+size_vec <- clust_size %>%
+  filter(cluster %in% hm_clusters) %>%
+  tibble::column_to_rownames("cluster") %>%
+  .[hm_clusters, "n", drop = TRUE]
+
+col_anno <- ComplexHeatmap::HeatmapAnnotation(
+  DEGs = ComplexHeatmap::anno_barplot(
+    bar_mat,
+    gp        = grid::gpar(fill = c(up = "#D73027", down = "#4575B4")),
+    bar_width = 0.8,
+    height    = grid::unit(2, "cm"),
+    axis_param = list(side = "left", at = pretty(c(0, max(rowSums(bar_mat))))),
+    beside = TRUE,
+    attach = TRUE
+  ),
+
+    `Cluster size` = ComplexHeatmap::anno_barplot(
+    as.numeric(size_vec),
+    gp        = grid::gpar(fill = "white"),
+    bar_width = 0.8,
+    height    = grid::unit(1, "cm"),
+    axis_param = list(side = "left", at = pretty(c(0, max(size_vec))))
+  ),
+  annotation_name_side = "left"
+)
+
+# Diverging colour scale centred on 0
+hm_col   <- circlize::colorRamp2(
+  c(-lfc_cap,-0.5, 0, 0.5,lfc_cap),
+  c("#4575B4", "white", "white", "white", "#D73027")
+)
+
+# Order the rows of the gene matrix
+ o <- seriation::seriate(lfc_mat, method = "PCA") %>% seriation::get_order(1) %>% rev()
+ o_genes <- rownames(lfc_mat)[o]
+ sig_mat <- sig_mat[o_genes, ]
+ lfc_mat <- lfc_mat[o_genes,]
+
+# Overlay "*" on significant cells; grey-out non-significant (NA → 0)
+lfc_mat[is.na(lfc_mat)] <- 0
+
+cell_fn <- function(j, i, x, y, width, height, fill) {
+  if (!is.na(sig_mat[i, j]) && sig_mat[i, j] == "*") {
+    grid::grid.text("*", x, y, gp = grid::gpar(fontsize = 5, col = "black", fontface = "bold"))
+  }
+}
+
+ComplexHeatmap::Heatmap(
+  lfc_mat,
+  name              = "log FC",
+  col               = hm_col,
+  top_annotation    = col_anno,
+  cell_fun          = cell_fn,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  show_row_names    = TRUE,
+  row_names_gp      = grid::gpar(fontsize = 5),
+  column_names_gp   = grid::gpar(fontsize = 9),
+  column_title      = "Het mCh+ vs WT — log FC (HSC clusters)",
+  border            = TRUE,
+  na_col            = "#EEEEEE"
+)
+```
+
+```{r, echo=FALSE}
+#| include: false
+dl_btn(as.data.frame(lfc_mat, check.names = FALSE), "het_mchpos_vs_wt_lfc.csv")
+```
+
+```{r allvsall-hsc-cleanup, eval=FALSE}
+rm(scatter_df,
+   volcano_neg,
+   volcano_pos,
+   volcano_df); gc()
+```
+
+# Limitations
+
+# Conclusion
+
+# Extra
+
+## Marker specificity across distantly related clusters {.unnumbered}
+
+For each gene, quantify how specifically it marks a group of clusters relative to the overlap those clusters share with each other — a proxy for how "exclusive" the marker is to that cell-state combination.
+
+```{r extra-cross-clust-prep}
+feat_grp2_n <- clust_marker_0.9 %>%
+  filter(sig & rate1 >= 0.05,
+         !group1 %in% c("16", "20", "18")) %>%
+  group_by(feature, group2) %>%
+  summarize(n = dplyr::n(),
+            groups = paste0(unique(group1[sig]) %>% stringr::str_sort(numeric = TRUE), collapse = ","),
+            avg_lfc = mean(log_fc),
+            .groups = "drop") %>%
+  group_by(feature, n, groups) %>%
+  dplyr::summarise(nn = dplyr::n(),
+                   avg_lfc = mean(avg_lfc),
+                   .groups = "drop") %>%
+  filter(n > 1,
+         nn > n) %>%
+  slice_max(order_by = nn, n = 1, by = "feature") %>%
+  rowwise() %>%
+  mutate(
+    y = {
+      labs <- str_split(groups, ",")[[1]]
+      sub  <- overlap_mat[labs, labs]
+      min(diag(sub))
+    },
+    z = {
+      labs <- str_split(groups, ",")[[1]]
+      sub  <- overlap_mat[labs, labs]
+      min(sub[upper.tri(sub)])
+    },
+    x = 1 - (z / y)
+  )%>%
+  ungroup()
+```
+
+```{r extra-cross-clust-table}
+DT::datatable(
+  feat_grp2_n %>% ungroup() %>% mutate(across(where(is.numeric), ~round(.x, 3))),
+  rownames   = FALSE,
+  filter     = "top",
+  extensions = "Buttons",
+  options    = list(
+    pageLength = 20,
+    scrollX    = TRUE,
+    dom        = "Bfrtip",
+    buttons    = list(list(extend = "csv", filename = "marker_exclusivity"))
+  )
+)
+```
+
+```{r extra-cross-clust-table-dl, echo=FALSE}
+dl_btn(feat_grp2_n %>% ungroup(), "marker_exclusivity.csv")
+```
+
+```{r extra-cross-clust-plot, fig.width=8, fig.height=6, eval=FALSE}
+feat_grp2_n %>%
+  filter(str_detect(groups, "6|8"),
+         x > 0.6) %>%
+  ggplot(aes(avg_lfc, x, label = feature, color = nn)) +
+  geom_point(alpha = 0.5) +
+  ggrepel::geom_text_repel() +
+  scale_color_viridis_c(option = "turbo") +
+  labs(x = "Average log FC", y = "Marker exclusivity (x)",
+       color = "N compared\nclusters") +
+  theme_bw(base_size = 11)
+```
+
+```{r extra-cross-clust-umap-net, fig.width=10, fig.height=9}
+# UMAP silhouette — all cells as grey background
+umap_sil <- data.frame(
+  UMAP1 = Embeddings(mpn_processed_hsc_fullcc, "umap.nn")[, 1],
+  UMAP2 = Embeddings(mpn_processed_hsc_fullcc, "umap.nn")[, 2]
+)
+
+# Cluster centroids (UMAP mean per cluster)
+net_cents <- data.frame(
+  cluster = as.character(mpn_processed_hsc_fullcc@meta.data[[clust_marker_res]]),
+  UMAP1   = Embeddings(mpn_processed_hsc_fullcc, "umap.nn")[, 1],
+  UMAP2   = Embeddings(mpn_processed_hsc_fullcc, "umap.nn")[, 2]
+) %>%
+  group_by(cluster) %>%
+  summarise(cx = mean(UMAP1), cy = mean(UMAP2), .groups = "drop")
+
+# Top 10 genes by nn
+top_net <- feat_grp2_n %>%
+  filter(str_detect(groups, "6") & str_detect(groups, "0"),
+         avg_lfc > 1)%>%
+  slice_max(nn/n, n = 5, with_ties = FALSE)
+
+# Expand each gene's groups to all pairwise cluster combinations
+edge_raw <- do.call(rbind, unlist(lapply(seq_len(nrow(top_net)), function(i) {
+  clsts <- stringr::str_split(top_net$groups[i], ",")[[1]]
+  if (length(clsts) < 2) return(NULL)
+  combn(clsts, 2,
+        FUN      = function(p) data.frame(
+          feature = top_net$feature[i], nn = top_net$nn[i],
+          from = p[1], to = p[2], stringsAsFactors = FALSE),
+        simplify = FALSE)
+}), recursive = FALSE)) %>%
+  # Normalise edge direction so smaller cluster ID is always 'from'
+  mutate(
+    fi   = as.integer(from), ti = as.integer(to),
+    from = as.character(pmin(fi, ti)),
+    to   = as.character(pmax(fi, ti))
+  ) %>%
+  select(-fi, -ti)
+
+# Fan parallel edges on the same cluster pair across different genes
+edge_df <- edge_raw %>%
+  group_by(from, to) %>%
+  arrange(feature, .by_group = TRUE) %>%
+  mutate(
+    n_par     = n(),
+    curvature = if (n() == 1L) 0.25
+                else seq(-0.35, 0.35, length.out = n())[row_number()]
+  ) %>%
+  ungroup() %>%
+  left_join(net_cents, by = c("from" = "cluster")) %>%
+  rename(x = cx, y = cy) %>%
+  left_join(net_cents, by = c("to" = "cluster")) %>%
+  rename(xend = cx, yend = cy)
+
+# Gene label positions: centroid of all clusters in the gene's group
+gene_lbl <- top_net %>%
+  mutate(clust_list = stringr::str_split(groups, ",")) %>%
+  tidyr::unnest(clust_list) %>%
+  left_join(net_cents, by = c("clust_list" = "cluster")) %>%
+  group_by(feature, nn) %>%
+  summarise(lx = mean(cx), ly = mean(cy), .groups = "drop")
+
+# Silhouette base
+p <- ggplot() +
+  geom_point(data = umap_sil, aes(UMAP1, UMAP2),
+             colour = "grey87", size = 0.1, alpha = 0.35)
+
+# Add one geom_curve layer per unique curvature value (fan parallel edges)
+for (cv in unique(edge_df$curvature)) {
+  df_cv <- dplyr::filter(edge_df, abs(curvature - cv) < 1e-9)
+  p <- p + ggplot2::geom_curve(
+    data      = df_cv,
+    mapping   = aes(x = x, y = y, xend = xend, yend = yend, colour = nn),
+    curvature = cv, linewidth = 0.85, alpha = 0.75
+  )
+}
+
+p +
+  # Cluster circles at centroids
+  geom_point(data = net_cents, aes(cx, cy, fill = cluster),
+             shape = 21, size = 9, colour = "white", stroke = 0.6) +
+  geom_text(data = net_cents, aes(cx, cy, label = cluster),
+            size = 2.8, fontface = "bold", colour = "white") +
+  # Gene labels
+  ggrepel::geom_label_repel(
+    data          = gene_lbl,
+    aes(lx, ly, label = feature, colour = nn),
+    size          = 2.7, fontface = "italic",
+    label.size    = 0.15, label.padding = unit(0.1, "lines"),
+    fill          = alpha("white", 0.82),
+    max.overlaps  = Inf, show.legend = FALSE, seed = 42
+  ) +
+  scale_colour_viridis_c(option = "turbo", name = "N shared\ncomparisons") +
+  scale_fill_manual(values = clust_cols, guide = "none") +
+  labs(
+    title   = "Marker genes connecting distantly related clusters — top 10 by nn",
+    caption = "Nodes at cluster UMAP centroids  |  Edges = cluster pairs co-marked by the same gene  |  Colour = nn"
+  ) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right",
+        plot.title   = element_text(size = 11, hjust = 0.5),
+        plot.caption = element_text(size = 8,  hjust = 0.5, colour = "grey50"))
+```

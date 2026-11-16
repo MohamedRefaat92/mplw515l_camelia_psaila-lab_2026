@@ -1,0 +1,913 @@
+---
+title: "HSC Cluster Transition Matrices"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(igraph)
+library(Matrix)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(ComplexHeatmap)
+library(circlize)
+library(dendsort)
+library(reticulate)
+
+
+theme_set(theme_cowplot(font_size = 11))
+
+OUTPUT_DIR   <- file.path("output", "objects")
+SCENIC_DIR   <- file.path(OUTPUT_DIR, "scenic")
+CELLRANK_DIR <- file.path(OUTPUT_DIR, "cellrank", "cytotrace")
+```
+
+# Overview
+
+Six cluster × cluster similarity / distance / transition matrices for HSC,
+computed for the full cohort and each condition (WT, mCh−, mCh+).
+Each heatmap is clustered independently (Ward.D2 on Euclidean distance of rows).
+
+| Matrix | Type | Interpretation |
+|---|---|---|
+| Variable gene expression | Similarity (Pearson r) | Transcriptional relatedness |
+| SCENIC TF regulon activity | Similarity (Pearson r) | Regulatory state relatedness |
+| CellRank fate probability | Similarity (Pearson r) | Shared differentiation fate |
+| CellRank cluster transition | Probability (row-stochastic) | One-step Markov transition flux |
+| SNN connectivity (PAGA) | Connectivity (normalised) | Physical graph adjacency |
+| PCA centroid distance | Distance (Euclidean) | Low-dim transcriptional distance |
+| Graph shortest-path distance | Distance (hops) | Topological separation |
+
+---
+
+# 1  Load data & compute full-cohort matrices
+
+```{r load}
+mpn_full <- targets::tar_read(mpn_processed_hsc_fullcc)
+
+# Try annotation target; fall back to the base cluster column
+anno <- tryCatch(targets::tar_read(annotation_recluster_hsc), error = function(e) NULL)
+if (!is.null(anno)) {
+  mpn_full <- Seurat::AddMetaData(mpn_full, anno)
+  clus_col <- grep("0.9", colnames(mpn_full@meta.data), value = TRUE)[1]
+} else {
+  clus_col <- grep("sNN_pca.*_res\\.0\\.9$", colnames(mpn_full@meta.data),
+                   value = TRUE)[1]
+}
+
+clus     <- as.factor(mpn_full@meta.data[[clus_col]])
+clusters <- levels(clus)
+n_cl     <- length(clusters)
+
+# Named vector used to transfer labels to condition objects
+clus_all <- setNames(as.character(clus), colnames(mpn_full))
+
+# Full-cohort SNN (kept for PAGA computation)
+snn_name <- grep("sNN", names(mpn_full@graphs), value = TRUE)[1]
+snn      <- mpn_full@graphs[[snn_name]]
+n_cells  <- ncol(mpn_full)
+
+# ── SCENIC ─────────────────────────────────────────────────────────────────────
+auc_path <- file.path(SCENIC_DIR, "auc_mtx_raw_full.csv")   # all cells (scripts/slurm/analysis/scenic.sh)
+auc_raw  <- NULL
+if (file.exists(auc_path)) {
+  auc_raw <- readr::read_csv(auc_path, show_col_types = FALSE) |>
+    tibble::column_to_rownames(
+      colnames(readr::read_csv(auc_path, n_max = 0, show_col_types = FALSE))[1])
+  cat("SCENIC: loaded", nrow(auc_raw), "cells ×", ncol(auc_raw), "regulons\n")
+}
+
+# ── CellRank ───────────────────────────────────────────────────────────────────
+# Per-cell fate probabilities (for per-condition Pearson-r similarity)
+fate_path <- file.path(CELLRANK_DIR, "tables", "fate_probabilities.csv")
+fate_raw  <- NULL
+if (file.exists(fate_path)) {
+  fate_raw <- readr::read_csv(fate_path, show_col_types = FALSE) |>
+    tibble::column_to_rownames(
+      colnames(readr::read_csv(fate_path, n_max = 0, show_col_types = FALSE))[1]) |>
+    dplyr::select(-dplyr::any_of(c("sNN_pca.SCT_30_res.0.9", "sample.name",
+                                    "dm2_class", "condition")))
+  cat("CellRank: loaded", nrow(fate_raw), "cells ×", ncol(fate_raw), "states\n")
+}
+
+# Direct cluster × cluster transition matrix (Markov step probabilities)
+cl_trans_path <- file.path(CELLRANK_DIR, "tables", "cluster_transition_matrix.csv")
+mat_cl_trans  <- NULL
+if (file.exists(cl_trans_path)) {
+  mat_cl_trans_raw <- readr::read_csv(cl_trans_path, show_col_types = FALSE) |>
+    tibble::column_to_rownames("cluster")
+  # Align to common clusters (cluster labels are character; strip any whitespace)
+  common_cl <- intersect(clusters, colnames(mat_cl_trans_raw))
+  mat_cl_trans <- as.matrix(mat_cl_trans_raw[common_cl, common_cl])
+  cat("CellRank cluster transition matrix:", nrow(mat_cl_trans),
+      "×", ncol(mat_cl_trans), "clusters\n")
+}
+
+cat("Full cohort | Clusters:", n_cl, "| Cells:", n_cells, "\n")
+
+# ── hdWGCNA metacells — build igraph + cluster/condition metadata ───────────────
+targets::tar_load(hdwgcna_hsc_modules)
+mc_obj_tmp <- hdWGCNA::GetMetacellObject(hdwgcna_hsc_modules, wgcna_name = "hsc_modules")
+rm(hdwgcna_hsc_modules); invisible(gc())
+
+mc_cells_split <- stringr::str_split(mc_obj_tmp$cells_merged, ",")
+names(mc_cells_split) <- colnames(mc_obj_tmp)
+
+# Majority cluster per metacell (from full-cohort clus_all)
+mc_clus <- vapply(mc_cells_split, function(cells) {
+  v <- clus_all[intersect(cells, names(clus_all))]
+  if (!length(v)) return(NA_character_)
+  names(sort(table(v), decreasing = TRUE))[1L]
+}, character(1L))
+
+# Majority condition per metacell
+cond_all <- dplyr::case_when(
+  grepl("WT",     mpn_full$sample.name) ~ "WT",
+  grepl("mCh-",   mpn_full$sample.name) ~ "mCh-",
+  grepl("mCh\\+", mpn_full$sample.name) ~ "mCh+",
+  TRUE ~ mpn_full$sample.name
+) |> setNames(colnames(mpn_full))
+
+mc_cond <- vapply(mc_cells_split, function(cells) {
+  v <- cond_all[intersect(cells, names(cond_all))]
+  if (!length(v)) return(NA_character_)
+  names(sort(table(v), decreasing = TRUE))[1L]
+}, character(1L))
+
+# Median PCA coordinates per metacell (from full-cohort PCA)
+pca_all    <- mpn_full@reductions$pca@cell.embeddings
+mc_pca_med <- do.call(rbind, lapply(mc_cells_split, function(cells) {
+  ok <- intersect(cells, rownames(pca_all))
+  if (!length(ok)) return(rep(NA_real_, ncol(pca_all)))
+  colMeans(pca_all[ok, , drop = FALSE])
+}))
+rownames(mc_pca_med) <- colnames(mc_obj_tmp)
+
+# Build k-NN graph from median PCA coordinates of metacells
+mc_pca_ok  <- mc_pca_med[complete.cases(mc_pca_med), , drop = FALSE]
+nn_res     <- Seurat::FindNeighbors(mc_pca_ok, verbose = FALSE)
+mc_snn     <- nn_res$snn                               # dgCMatrix (metacell × metacell)
+g_mc       <- igraph::graph_from_adjacency_matrix(
+  as(mc_snn, "CsparseMatrix"), weighted = TRUE, mode = "undirected", diag = FALSE)
+igraph::E(g_mc)$inv_weight <- 1 / (igraph::E(g_mc)$weight + 1e-6)
+
+# All-pairs shortest paths on full metacell graph (tractable: hundreds of nodes)
+cat("Metacell graph:", igraph::vcount(g_mc), "nodes,",
+    igraph::ecount(g_mc), "edges — computing all-pairs shortest paths ...\n")
+all_mc_dists <- igraph::distances(g_mc, weights = igraph::E(g_mc)$inv_weight)
+cat("Done.\n")
+
+rm(mc_obj_tmp, mc_cells_split, mc_snn, mc_pca_ok, mc_pca_med,
+   nn_res, pca_all, cond_all, g_mc)
+invisible(gc())
+
+# ── Helper: cluster × cluster mean shortest-path via metacells ─────────────────
+# all_mc_dists: metacell × metacell distance matrix (pre-computed Dijkstra)
+# mc_clus_filt: named character (metacell → cluster), filtered to desired condition
+graph_mc_dist <- function(clusters_use, all_mc_dists, mc_clus_filt) {
+  vnames <- rownames(all_mc_dists)
+  cl_mat <- matrix(NA_real_, length(clusters_use), length(clusters_use),
+                   dimnames = list(clusters_use, clusters_use))
+  for (i in clusters_use) {
+    mc_i <- intersect(names(mc_clus_filt)[mc_clus_filt == i], vnames)
+    for (j in clusters_use) {
+      mc_j <- intersect(names(mc_clus_filt)[mc_clus_filt == j], vnames)
+      if (!length(mc_i) || !length(mc_j)) next
+      cl_mat[i, j] <- mean(all_mc_dists[mc_i, mc_j, drop = FALSE], na.rm = TRUE)
+    }
+  }
+  cl_mat
+}
+```
+
+```{r mat-full}
+# ── 1. Expression ──────────────────────────────────────────────────────────────
+hvg <- Seurat::VariableFeatures(mpn_full)
+expr_mat <- Seurat::AverageExpression(
+  mpn_full, features = hvg, assays = "SCT", layer = "data",
+  group.by = clus_col, return.seurat = FALSE)$SCT
+expr_mat@Dimnames[[2]] <- str_remove(expr_mat@Dimnames[[2]], "g")
+mat_expr_full <- cor(as.matrix(expr_mat), method = "pearson")[clusters, clusters]
+
+# ── 2. SCENIC ──────────────────────────────────────────────────────────────────
+mat_scenic_full <- NULL
+if (!is.null(auc_raw)) {
+  common_cells <- intersect(rownames(auc_raw), colnames(mpn_full))
+  auc_aligned  <- as.matrix(auc_raw[common_cells, ])
+  cl_aligned   <- as.character(clus)[match(common_cells, colnames(mpn_full))]
+  auc_avg <- do.call(cbind, lapply(clusters, function(cl) {
+    colMeans(auc_aligned[cl_aligned == cl, , drop = FALSE])
+  }))
+  colnames(auc_avg) <- clusters
+  mat_scenic_full <- cor(auc_avg, method = "pearson")
+}
+
+# ── 3. CellRank ────────────────────────────────────────────────────────────────
+mat_cellrank_full <- NULL
+if (!is.null(fate_raw)) {
+  common_cells <- intersect(rownames(fate_raw), colnames(mpn_full))
+  fate_aligned <- as.matrix(fate_raw[common_cells, ])
+  cl_fate      <- as.character(clus)[match(common_cells, colnames(mpn_full))]
+  fate_avg <- do.call(rbind, lapply(clusters, function(cl) {
+    colMeans(fate_aligned[cl_fate == cl, , drop = FALSE])
+  }))
+  rownames(fate_avg) <- clusters
+  mat_cellrank_full <- cor(t(fate_avg), method = "pearson")
+}
+
+# ── 4. PAGA ────────────────────────────────────────────────────────────────────
+paga_mat <- matrix(0, n_cl, n_cl, dimnames = list(clusters, clusters))
+for (i in clusters) {
+  for (j in clusters) {
+    ci <- which(clus == i); cj <- which(clus == j)
+    paga_mat[i, j] <- sum(snn[ci, cj]) / ((length(ci) * length(cj)) / n_cells + 1e-6)
+  }
+}
+mat_paga_full <- paga_mat
+
+# ── 5. PCA centroid distance ───────────────────────────────────────────────────
+pca_emb <- as.data.frame(mpn_full@reductions$pca@cell.embeddings)
+pca_emb$cluster <- as.character(clus)
+pca_centroids <- pca_emb |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarise(dplyr::across(starts_with("PC_"), mean), .groups = "drop") |>
+  tibble::column_to_rownames("cluster")
+mat_pca_full <- as.matrix(dist(pca_centroids[clusters, ], method = "euclidean"))
+
+# ── 6. Graph shortest-path (mean metacell Dijkstra distance per cluster pair) ──
+mat_graph_full <- graph_mc_dist(clusters, all_mc_dists, mc_clus)
+
+rm(mpn_full, pca_emb, pca_centroids, paga_mat, expr_mat); invisible(gc())
+cat("Full-cohort matrices computed.\n")
+```
+
+---
+
+# 2  Per-condition matrices
+
+```{r cond-fn}
+#' Compute all six transition matrices for a condition-specific Seurat object.
+#'
+#' @param srt         Loaded Seurat object.
+#' @param clus_all    Named character vector: cell_id → cluster label.
+#' @param clus_col    Name of the metadata column to add.
+#' @param cond_label    One of "WT", "mCh-", "mCh+" — used to filter metacells.
+#' @param mc_clus       Named character (metacell → cluster), full cohort.
+#' @param mc_cond       Named character (metacell → condition), full cohort.
+#' @param all_mc_dists  Pre-computed all-pairs shortest-path matrix on metacell graph.
+#' @param auc_raw       SCENIC AUC data.frame (or NULL).
+#' @param fate_raw      CellRank fate data.frame (or NULL).
+compute_matrices <- function(srt, clus_all, clus_col, cond_label,
+                              mc_clus, mc_cond, all_mc_dists,
+                              auc_raw = NULL, fate_raw = NULL) {
+  # Transfer cluster labels from full cohort
+  cond_cells <- intersect(colnames(srt), names(clus_all))
+  clus_vec   <- clus_all[cond_cells]
+  cl         <- sort(unique(clus_vec))
+  n          <- length(cond_cells)
+
+  # Add to metadata so AverageExpression can use it
+  meta_add <- data.frame(row.names = cond_cells, tmp_ = clus_vec)
+  colnames(meta_add) <- clus_col
+  srt <- Seurat::AddMetaData(srt, meta_add)
+
+  # 1. Expression
+  hvg      <- Seurat::VariableFeatures(srt)
+  expr_mat <- Seurat::AverageExpression(
+    srt, features = hvg, assays = "SCT", layer = "data",
+    group.by = clus_col, return.seurat = FALSE)$SCT
+  expr_mat@Dimnames[[2]] <- str_remove(expr_mat@Dimnames[[2]], "g")
+  mat_expr <- cor(as.matrix(expr_mat), method = "pearson")[cl, cl]
+
+  # 2. SCENIC
+  mat_scenic <- NULL
+  if (!is.null(auc_raw)) {
+    common <- intersect(rownames(auc_raw), cond_cells)
+    if (length(common) > 0) {
+      auc_a  <- as.matrix(auc_raw[common, ])
+      cl_a   <- clus_vec[common]
+      auc_avg <- do.call(cbind, lapply(cl, function(c) {
+        colMeans(auc_a[cl_a == c, , drop = FALSE])
+      }))
+      colnames(auc_avg) <- cl
+      mat_scenic <- cor(auc_avg, method = "pearson")
+    }
+  }
+
+  # 3. CellRank
+  mat_cellrank <- NULL
+  if (!is.null(fate_raw)) {
+    common <- intersect(rownames(fate_raw), cond_cells)
+    if (length(common) > 0) {
+      fate_a   <- as.matrix(fate_raw[common, ])
+      cl_f     <- clus_vec[common]
+      fate_avg <- do.call(rbind, lapply(cl, function(c) {
+        colMeans(fate_a[cl_f == c, , drop = FALSE])
+      }))
+      rownames(fate_avg) <- cl
+      mat_cellrank <- cor(t(fate_avg), method = "pearson")
+    }
+  }
+
+  # 4. PAGA (condition-specific SNN)
+  snn_nm  <- grep("sNN", names(srt@graphs), value = TRUE)[1]
+  snn_c   <- srt@graphs[[snn_nm]][cond_cells, cond_cells]
+  clus_f  <- factor(clus_vec, levels = cl)
+  paga_c  <- matrix(0, length(cl), length(cl), dimnames = list(cl, cl))
+  for (i in cl) {
+    for (j in cl) {
+      ci <- which(clus_f == i); cj <- which(clus_f == j)
+      paga_c[i, j] <- sum(snn_c[ci, cj]) /
+        ((length(ci) * length(cj)) / n + 1e-6)
+    }
+  }
+  mat_paga <- paga_c
+
+  # 5. PCA centroid distance
+  pca_e <- as.data.frame(Seurat::Embeddings(srt, "pca.SCT")[cond_cells, ])
+  pca_e$cluster <- clus_vec
+  pca_cen <- pca_e |>
+    dplyr::group_by(cluster) |>
+    dplyr::summarise(dplyr::across(starts_with("PC_"), mean), .groups = "drop") |>
+    tibble::column_to_rownames("cluster")
+  mat_pca <- as.matrix(dist(pca_cen[cl, ], method = "euclidean"))
+
+  # 6. Graph shortest-path (mean metacell Dijkstra, condition-filtered metacells)
+  mc_clus_cond <- mc_clus[!is.na(mc_clus) & mc_clus %in% cl &
+                             !is.na(mc_cond) & mc_cond == cond_label]
+  mat_graph <- graph_mc_dist(cl, all_mc_dists, mc_clus_cond)
+
+  list(clusters = cl, expr = mat_expr, scenic = mat_scenic,
+       cellrank = mat_cellrank, paga = mat_paga, pca = mat_pca, graph = mat_graph)
+}
+```
+
+```{r cond-wt}
+cat("Loading WT ...\n")
+srt_wt <- targets::tar_read(mpn_processed_hsc_wt_fullcc)
+mats_wt <- compute_matrices(srt_wt, clus_all, clus_col, "WT",
+                            mc_clus, mc_cond, all_mc_dists,
+                            auc_raw, fate_raw)
+rm(srt_wt); invisible(gc())
+cat("WT:", length(mats_wt$clusters), "clusters\n")
+```
+
+```{r cond-neg}
+cat("Loading mCh− ...\n")
+srt_neg <- targets::tar_read(mpn_processed_hsc_mchneg_fullcc)
+mats_neg <- compute_matrices(srt_neg, clus_all, clus_col, "mCh-",
+                            mc_clus, mc_cond, all_mc_dists,
+                            auc_raw, fate_raw)
+rm(srt_neg); invisible(gc())
+cat("mCh−:", length(mats_neg$clusters), "clusters\n")
+```
+
+```{r cond-pos}
+cat("Loading mCh+ ...\n")
+srt_pos <- targets::tar_read(mpn_processed_hsc_mchpos_fullcc)
+mats_pos <- compute_matrices(srt_pos, clus_all, clus_col, "mCh+",
+                            mc_clus, mc_cond, all_mc_dists,
+                            auc_raw, fate_raw)
+rm(srt_pos); invisible(gc())
+cat("mCh+:", length(mats_pos$clusters), "clusters\n")
+```
+
+---
+
+# 3  Shared cluster ordering (full cohort)
+
+```{r cluster-order}
+row_dend <- hclust(as.dist(1 - mat_expr_full), method = "ward.D2")
+cl_order <- clusters[row_dend$order]
+cat("Full-cohort cluster order:", paste(cl_order, collapse = " → "), "\n")
+```
+
+---
+
+# 4  Visualisation helpers
+
+```{r plot-fn}
+# cluster_order: character vector of cluster labels defining the fixed row/col order.
+# Clusters absent from `mat` are silently dropped; no internal dendrogram is drawn.
+# When NULL, Ward.D2 on Euclidean distance is used (full-cohort default path).
+plot_heatmap <- function(mat, col_fun, title, legend = "", cluster_order = NULL) {
+  if (!is.null(cluster_order)) {
+    ord <- cluster_order[cluster_order %in% rownames(mat)]
+    mat <- mat[ord, ord]
+    cr <- FALSE; cc <- FALSE
+    srd <- FALSE; scd <- FALSE
+  } else {
+    dend <- as.dendrogram(
+      dendsort::dendsort(
+        hclust(dist(mat, method = "euclidean"), method = "ward.D2")))
+    cr <- dend; cc <- dend
+    srd <- TRUE; scd <- TRUE
+  }
+
+  ComplexHeatmap::Heatmap(
+    mat,
+    col                  = col_fun,
+    name                 = legend,
+    cluster_rows         = cr,
+    cluster_columns      = cc,
+    show_row_dend        = srd,
+    show_column_dend     = scd,
+    row_dend_width       = unit(1.5, "cm"),
+    column_dend_height   = unit(1.5, "cm"),
+    row_names_side       = "left",
+    column_names_rot     = 45,
+    row_names_gp         = grid::gpar(fontsize = 8),
+    column_names_gp      = grid::gpar(fontsize = 8),
+    column_title         = title,
+    column_title_gp      = grid::gpar(fontsize = 10, fontface = "bold"),
+    rect_gp              = grid::gpar(col = "white", lwd = 0.5),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      grid::grid.text(round(mat[i, j], 2), x, y,
+                      gp = grid::gpar(fontsize = 5, col = "grey30"))
+    },
+    heatmap_legend_param = list(title = legend, title_gp = grid::gpar(fontsize = 8))
+  )
+}
+
+# Colour functions
+cf_corr <- circlize::colorRamp2(c(-1, 0, 1), c("#2166ac", "white", "#d73027"))
+
+max_paga <- max(
+  max(mat_paga_full, na.rm = TRUE),
+  max(mats_wt$paga,  na.rm = TRUE),
+  max(mats_neg$paga, na.rm = TRUE),
+  max(mats_pos$paga, na.rm = TRUE))
+cf_conn <- circlize::colorRamp2(c(0, max_paga), c("white", "#1b7837"))
+
+max_pca <- max(
+  max(mat_pca_full,  na.rm = TRUE),
+  max(mats_wt$pca,   na.rm = TRUE),
+  max(mats_neg$pca,  na.rm = TRUE),
+  max(mats_pos$pca,  na.rm = TRUE))
+cf_dist_pca <- circlize::colorRamp2(c(0, max_pca), c("white", "#762a83"))
+
+graph_vals <- c(
+  mat_graph_full[lower.tri(mat_graph_full)],
+  mats_wt$graph[lower.tri(mats_wt$graph)],
+  mats_neg$graph[lower.tri(mats_neg$graph)],
+  mats_pos$graph[lower.tri(mats_pos$graph)])
+graph_vals <- graph_vals[is.finite(graph_vals)]
+cf_dist_graph <- circlize::colorRamp2(
+  c(0, quantile(graph_vals, 0.95, na.rm = TRUE)), c("white", "#543005"))
+```
+
+---
+
+# 5  Expression similarity
+
+::: {.panel-tabset}
+## Full cohort
+
+```{r expr-full, fig.height=8, fig.width=8}
+plot_heatmap(mat_expr_full, cf_corr,
+             "Variable gene expression — Full cohort\n(Pearson r)", "r",
+             cluster_order = cl_order)
+```
+
+## WT
+
+```{r expr-wt, fig.height=8, fig.width=8}
+plot_heatmap(mats_wt$expr, cf_corr,
+             "Variable gene expression — WT\n(Pearson r)", "r",
+             cluster_order = cl_order)
+```
+
+## mCh−
+
+```{r expr-neg, fig.height=8, fig.width=8}
+plot_heatmap(mats_neg$expr, cf_corr,
+             "Variable gene expression — mCh−\n(Pearson r)", "r",
+             cluster_order = cl_order)
+```
+
+## mCh+
+
+```{r expr-pos, fig.height=8, fig.width=8}
+plot_heatmap(mats_pos$expr, cf_corr,
+             "Variable gene expression — mCh+\n(Pearson r)", "r",
+             cluster_order = cl_order)
+```
+:::
+
+---
+
+# 6  SCENIC TF regulon activity
+
+::: {.panel-tabset}
+## Full cohort
+
+```{r scenic-full, fig.height=8, fig.width=8}
+if (!is.null(mat_scenic_full)) {
+  plot_heatmap(mat_scenic_full, cf_corr,
+               "SCENIC TF regulon activity — Full cohort\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("SCENIC results not available.\n")
+```
+
+## WT
+
+```{r scenic-wt, fig.height=8, fig.width=8}
+if (!is.null(mats_wt$scenic)) {
+  plot_heatmap(mats_wt$scenic, cf_corr,
+               "SCENIC TF regulon activity — WT\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("SCENIC results not available.\n")
+```
+
+## mCh−
+
+```{r scenic-neg, fig.height=8, fig.width=8}
+if (!is.null(mats_neg$scenic)) {
+  plot_heatmap(mats_neg$scenic, cf_corr,
+               "SCENIC TF regulon activity — mCh−\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("SCENIC results not available.\n")
+```
+
+## mCh+
+
+```{r scenic-pos, fig.height=8, fig.width=8}
+if (!is.null(mats_pos$scenic)) {
+  plot_heatmap(mats_pos$scenic, cf_corr,
+               "SCENIC TF regulon activity — mCh+\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("SCENIC results not available.\n")
+```
+:::
+
+---
+
+# 7  CellRank fate probability similarity
+
+::: {.panel-tabset}
+## Full cohort
+
+```{r cr-full, fig.height=8, fig.width=8}
+if (!is.null(mat_cellrank_full)) {
+  plot_heatmap(mat_cellrank_full, cf_corr,
+               "CellRank fate probability — Full cohort\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("CellRank fate probabilities not available.\n")
+```
+
+## WT
+
+```{r cr-wt, fig.height=8, fig.width=8}
+if (!is.null(mats_wt$cellrank)) {
+  plot_heatmap(mats_wt$cellrank, cf_corr,
+               "CellRank fate probability — WT\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("CellRank fate probabilities not available.\n")
+```
+
+## mCh−
+
+```{r cr-neg, fig.height=8, fig.width=8}
+if (!is.null(mats_neg$cellrank)) {
+  plot_heatmap(mats_neg$cellrank, cf_corr,
+               "CellRank fate probability — mCh−\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("CellRank fate probabilities not available.\n")
+```
+
+## mCh+
+
+```{r cr-pos, fig.height=8, fig.width=8}
+if (!is.null(mats_pos$cellrank)) {
+  plot_heatmap(mats_pos$cellrank, cf_corr,
+               "CellRank fate probability — mCh+\n(Pearson r)", "r",
+               cluster_order = cl_order)
+} else cat("CellRank fate probabilities not available.\n")
+```
+:::
+
+---
+
+# 7.5  CellRank cluster transition probabilities
+
+One-step Markov transition probabilities between clusters, computed as the
+row-normalised mean of the cell-level CytoTRACE2-based transition matrix
+(`L @ T @ R`, where L and R are cluster indicator matrices). Rows are source
+clusters, columns are target clusters; each row sums to 1. High off-diagonal
+values indicate directed probability flux from source → target.
+
+```{r cr-trans, fig.height=8, fig.width=8}
+if (!is.null(mat_cl_trans)) {
+  cl_ord_filt <- cl_order[cl_order %in% rownames(mat_cl_trans)]
+  mat_plot <- mat_cl_trans[cl_ord_filt, cl_ord_filt]
+  cf_trans  <- circlize::colorRamp2(c(0, 0.05, 1), c("#f7f7f7", "#fed976", "#b10026"))
+  ComplexHeatmap::Heatmap(
+    mat_plot,
+    col                = cf_trans,
+    name               = "P(i→j)",
+    cluster_rows       = FALSE,
+    cluster_columns    = FALSE,
+    row_names_side     = "left",
+    column_names_rot   = 45,
+    row_names_gp       = grid::gpar(fontsize = 8),
+    column_names_gp    = grid::gpar(fontsize = 8),
+    column_title       = "CellRank cluster transition (CytoTRACE2)\n(one-step Markov probability)",
+    column_title_gp    = grid::gpar(fontsize = 10, fontface = "bold"),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      v <- mat_plot[i, j]
+      if (v > 0.02)
+        grid::grid.text(sprintf("%.2f", v), x, y,
+                        gp = grid::gpar(fontsize = 5,
+                                        col = if (v > 0.4) "white" else "black"))
+    }
+  )
+} else cat("CellRank cluster transition matrix not available.\n")
+```
+
+---
+
+# 8  SNN connectivity (PAGA)
+
+::: {.panel-tabset}
+## Full cohort
+
+```{r paga-full, fig.height=8, fig.width=8}
+plot_heatmap(mat_paga_full, cf_conn,
+             "SNN connectivity (PAGA) — Full cohort", "connectivity",
+             cluster_order = cl_order)
+```
+
+## WT
+
+```{r paga-wt, fig.height=8, fig.width=8}
+plot_heatmap(mats_wt$paga, cf_conn,
+             "SNN connectivity (PAGA) — WT", "connectivity",
+             cluster_order = cl_order)
+```
+
+## mCh−
+
+```{r paga-neg, fig.height=8, fig.width=8}
+plot_heatmap(mats_neg$paga, cf_conn,
+             "SNN connectivity (PAGA) — mCh−", "connectivity",
+             cluster_order = cl_order)
+```
+
+## mCh+
+
+```{r paga-pos, fig.height=8, fig.width=8}
+plot_heatmap(mats_pos$paga, cf_conn,
+             "SNN connectivity (PAGA) — mCh+", "connectivity",
+             cluster_order = cl_order)
+```
+:::
+
+---
+
+# 9  PCA centroid distance
+
+::: {.panel-tabset}
+## Full cohort
+
+```{r pca-full, fig.height=8, fig.width=8}
+plot_heatmap(mat_pca_full, cf_dist_pca,
+             "PCA centroid distance — Full cohort\n(Euclidean)", "distance",
+             cluster_order = cl_order)
+```
+
+## WT
+
+```{r pca-wt, fig.height=8, fig.width=8}
+plot_heatmap(mats_wt$pca, cf_dist_pca,
+             "PCA centroid distance — WT\n(Euclidean)", "distance",
+             cluster_order = cl_order)
+```
+
+## mCh−
+
+```{r pca-neg, fig.height=8, fig.width=8}
+plot_heatmap(mats_neg$pca, cf_dist_pca,
+             "PCA centroid distance — mCh−\n(Euclidean)", "distance",
+             cluster_order = cl_order)
+```
+
+## mCh+
+
+```{r pca-pos, fig.height=8, fig.width=8}
+plot_heatmap(mats_pos$pca, cf_dist_pca,
+             "PCA centroid distance — mCh+\n(Euclidean)", "distance",
+             cluster_order = cl_order)
+```
+:::
+
+---
+
+# 10  Graph shortest-path distance
+
+::: {.panel-tabset}
+## Full cohort
+
+```{r graph-full, fig.height=8, fig.width=8}
+plot_heatmap(mat_graph_full, cf_dist_graph,
+             "Graph shortest-path — Full cohort\n(inverse-weight Dijkstra)", "distance",
+             cluster_order = cl_order)
+```
+
+## WT
+
+```{r graph-wt, fig.height=8, fig.width=8}
+plot_heatmap(mats_wt$graph, cf_dist_graph,
+             "Graph shortest-path — WT\n(inverse-weight Dijkstra)", "distance",
+             cluster_order = cl_order)
+```
+
+## mCh−
+
+```{r graph-neg, fig.height=8, fig.width=8}
+plot_heatmap(mats_neg$graph, cf_dist_graph,
+             "Graph shortest-path — mCh−\n(inverse-weight Dijkstra)", "distance",
+             cluster_order = cl_order)
+```
+
+## mCh+
+
+```{r graph-pos, fig.height=8, fig.width=8}
+plot_heatmap(mats_pos$graph, cf_dist_graph,
+             "Graph shortest-path — mCh+\n(inverse-weight Dijkstra)", "distance",
+             cluster_order = cl_order)
+```
+:::
+
+---
+
+# 11  Cross-matrix correlation (full cohort)
+
+Pairwise Spearman correlation of lower-triangle entries for the full-cohort matrices.
+
+```{r mat-corr}
+extract_lower <- function(m) m[lower.tri(m)]
+
+reorder_mat <- function(m) { ord <- cl_order[cl_order %in% rownames(m)]; m[ord, ord] }
+
+mat_list <- list(
+  Expression = extract_lower(reorder_mat(mat_expr_full)),
+  PAGA       = extract_lower(reorder_mat(mat_paga_full)),
+  PCA_dist   = extract_lower(reorder_mat(mat_pca_full)),
+  Graph_dist = extract_lower(reorder_mat(mat_graph_full))
+)
+if (!is.null(mat_scenic_full))   mat_list$SCENIC        <- extract_lower(reorder_mat(mat_scenic_full))
+if (!is.null(mat_cellrank_full)) mat_list$CellRank_fate <- extract_lower(reorder_mat(mat_cellrank_full))
+if (!is.null(mat_cl_trans))      mat_list$CellRank_trans <- extract_lower(reorder_mat(mat_cl_trans))
+
+cross_cor <- cor(do.call(cbind, mat_list), method = "spearman")
+
+cf_cross <- circlize::colorRamp2(c(-1, 0, 1), c("#2166ac", "white", "#d73027"))
+ComplexHeatmap::Heatmap(
+  cross_cor,
+  col                 = cf_cross,
+  name                = "Spearman r",
+  cluster_rows        = TRUE,
+  cluster_columns     = TRUE,
+  row_names_gp        = grid::gpar(fontsize = 9),
+  column_names_gp     = grid::gpar(fontsize = 9),
+  column_names_rot    = 45,
+  column_title        = "Cross-matrix Spearman correlation (lower-triangle entries)",
+  column_title_gp     = grid::gpar(fontsize = 10, fontface = "bold"),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid::grid.text(round(cross_cor[i, j], 2), x, y,
+                    gp = grid::gpar(fontsize = 8))
+  }
+)
+```
+
+---
+
+# 12  Raw matrices (tables)
+
+::: {.panel-tabset}
+## Full cohort
+
+```{r tables-full, results="asis"}
+mats_table <- list(
+  "Expression correlation" = reorder_mat(mat_expr_full),
+  "PAGA connectivity"      = reorder_mat(mat_paga_full),
+  "PCA distance"           = reorder_mat(mat_pca_full),
+  "Graph distance"         = reorder_mat(mat_graph_full)
+)
+if (!is.null(mat_scenic_full))
+  mats_table[["SCENIC correlation"]] <- reorder_mat(mat_scenic_full)
+if (!is.null(mat_cellrank_full))
+  mats_table[["CellRank fate sim."]] <- reorder_mat(mat_cellrank_full)
+
+for (nm in names(mats_table)) {
+  cat("\n\n###", nm, "\n\n")
+  print(htmltools::tagList(
+    DT::datatable(as.data.frame(round(mats_table[[nm]], 3)),
+                  rownames = TRUE, filter = "none", caption = nm,
+                  options = list(pageLength = n_cl, scrollX = TRUE, dom = "t"))
+  ))
+}
+```
+
+## WT
+
+```{r tables-wt, results="asis"}
+mats_wt_tbl <- list(
+  "Expression correlation" = mats_wt$expr,
+  "PAGA connectivity"      = mats_wt$paga,
+  "PCA distance"           = mats_wt$pca,
+  "Graph distance"         = mats_wt$graph
+)
+for (nm in names(mats_wt_tbl)) {
+  cat("\n\n###", nm, "\n\n")
+  print(htmltools::tagList(
+    DT::datatable(as.data.frame(round(mats_wt_tbl[[nm]], 3)),
+                  rownames = TRUE, filter = "none", caption = nm,
+                  options = list(pageLength = length(mats_wt$clusters),
+                                 scrollX = TRUE, dom = "t"))
+  ))
+}
+```
+
+## mCh−
+
+```{r tables-neg, results="asis"}
+mats_neg_tbl <- list(
+  "Expression correlation" = mats_neg$expr,
+  "PAGA connectivity"      = mats_neg$paga,
+  "PCA distance"           = mats_neg$pca,
+  "Graph distance"         = mats_neg$graph
+)
+for (nm in names(mats_neg_tbl)) {
+  cat("\n\n###", nm, "\n\n")
+  print(htmltools::tagList(
+    DT::datatable(as.data.frame(round(mats_neg_tbl[[nm]], 3)),
+                  rownames = TRUE, filter = "none", caption = nm,
+                  options = list(pageLength = length(mats_neg$clusters),
+                                 scrollX = TRUE, dom = "t"))
+  ))
+}
+```
+
+## mCh+
+
+```{r tables-pos, results="asis"}
+mats_pos_tbl <- list(
+  "Expression correlation" = mats_pos$expr,
+  "PAGA connectivity"      = mats_pos$paga,
+  "PCA distance"           = mats_pos$pca,
+  "Graph distance"         = mats_pos$graph
+)
+for (nm in names(mats_pos_tbl)) {
+  cat("\n\n###", nm, "\n\n")
+  print(htmltools::tagList(
+    DT::datatable(as.data.frame(round(mats_pos_tbl[[nm]], 3)),
+                  rownames = TRUE, filter = "none", caption = nm,
+                  options = list(pageLength = length(mats_pos$clusters),
+                                 scrollX = TRUE, dom = "t"))
+  ))
+}
+```
+:::
+
+{{< include ../_session-info.qmd >}}

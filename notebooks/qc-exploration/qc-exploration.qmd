@@ -1,0 +1,715 @@
+---
+title: "QC Exploration"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+Parameter sweeps for cell and gene filtering thresholds.
+Work here before committing threshold changes to `metadata/project_config.yaml`.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(targets)
+library(ggalluvial)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r load}
+targets::tar_load(qc_params)
+targets::tar_load(metadata_flagged_all)
+targets::tar_load(rp_genes)
+targets::tar_load(hb_genes)
+SUBSET_NAMES <- c("stroma", "hsc", "mnc")
+```
+
+```{r qc-meta}
+df         <- metadata_flagged_all
+df_margins <- df %>% mutate(sample.name = "All")
+df_plot    <- bind_rows(df, df_margins)
+
+pct_bars <- function(feature) {
+  df_plot |>
+    dplyr::group_by(sample.name) |>
+    dplyr::summarise(p5  = quantile(.data[[feature]], 0.05),
+                     p95 = quantile(.data[[feature]], 0.95),
+                     .groups = "drop")
+}
+errorbar_layer <- function(pct_df) {
+  geom_errorbar(data = pct_df,
+                aes(x = sample.name, ymin = p5, ymax = p95),
+                inherit.aes = FALSE,
+                width = 0.3, colour = "black", linewidth = 0.8)
+}
+```
+
+---
+
+## 1. Distributions per sample {.tabset}
+
+::: {.panel-tabset}
+
+## Gene count (nFeature_RNA)
+
+The number of genes per cell across all samples shows a clear compartment-specific pattern. Stromal cells tend to have lower number of genes, while HSCs have higher numbers, and MNCs are somewhere in-between. That said, the stromal samples have unexpectedly high number of cells with low number of features that go below the range of commonly used cutoffs.
+
+```{r feat-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, nFeature_RNA)) +
+    geom_jitter(size = 0.1, alpha = 0.05) +
+    geom_violin(alpha = 0.9) +
+    errorbar_layer(pct_bars("nFeature_RNA")) +
+    coord_flip() +
+    labs(title = 'Distribution of genes detected per cell',
+         subtitle = "Black bars: 5th–95th percentile",
+         y = "Number of features (n)",
+         x = "Sample") +
+    hrbrthemes::theme_ipsum() +
+    theme(
+        axis.title.x  = element_text(size = 15),
+        axis.title.y  = element_text(size = 15),
+        axis.text.x   = element_text(size = 15),
+        axis.text.y   = element_text(size = 15),
+        legend.position = "none",
+        panel.spacing = unit(0.1, "lines"),
+        strip.text.x  = element_text(size = 8)
+    )
+```
+
+## Mitochondrial %
+
+The compartment-specific pattern can also be observed in the percentage of mitochondrial transcripts per cell. HSC samples show a consistent higher mitochondrial content compared to other samples, while large number of MNC cells show a strong pattern of mitochondrial depletion.
+
+```{r mt-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.mt)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.mt")) +
+  coord_flip() +
+  labs(title = 'Distribution of mitochondrial content per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Mitochondrial content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+## Ribosomal %
+
+Genes identified (pattern `^Rp[sl]`): `r paste(rp_genes, collapse = ", ")`.
+
+The percentage of reads mapping to ribosomal proteins differs dramatically between the compartments. MNCs and stromal samples are much lower than the expected 10x range, while HSCs are within range.
+
+```{r rp-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.rp)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.rp")) +
+  coord_flip() +
+  labs(title = 'Distribution of ribosomal protein content per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Ribosomal protein content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+## Hemoglobin %
+
+Genes identified (pattern `^Hb[^pes]`): `r paste(hb_genes, collapse = ", ")`.
+
+Stromal cells show relatively elevated percentage of hemoglobin content. MNCs also have a few cells dominated by hemoglobin transcripts.
+
+```{r hb-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.hb)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.hb")) +
+  coord_flip() +
+  labs(title = 'Distribution of hemoglobin-related features per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Hemoglobin-related content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+## Stress %
+
+Genes used: `r paste(qc_params$stress_genes, collapse = ", ")`.
+
+Although stromal cells have relatively higher levels of stress-gene enrichment, they are not dramatically high and the majority are similar to other compartments.
+
+```{r stress-hist, fig.height=8}
+ggplot(df_plot, aes(sample.name, percent.stress)) +
+  geom_jitter(size = 0.1, alpha = 0.05) +
+  geom_violin(alpha = 0.9) +
+  errorbar_layer(pct_bars("percent.stress")) +
+  coord_flip() +
+  labs(title = 'Distribution of stress-related features per cell',
+       subtitle = "Black bars: 5th–95th percentile",
+       y = "Stress-related content (%)",
+       x = "Sample") +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 8)
+  )
+```
+
+:::
+
+---
+
+## 2. Feature scatter {.tabset}
+
+Looking at the relationship between mitochondrial content and number of genes detected, HSC samples show the expected pattern where cells with low number of features are dominated by mitochondrial transcripts. MNCs lack this pattern.
+
+```{r feat-mito-scatter, fig.height=8}
+ggplot(df_plot, aes(percent.mt, nFeature_RNA, group = sample.name)) +
+  ggpointdensity::geom_pointdensity(size = 0.1, alpha = 0.05) +
+  facet_wrap(~sample.name, nrow = 2) +
+  labs(y = "Number genes (n)", x = "Mitochondrial content (%)") +
+  viridis::scale_color_viridis() +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 15)
+  )
+```
+
+The relationship between the number of genes and their count reveals an interesting double-curve pattern in MNCs — two distinct sub-populations with different complexities.
+
+```{r feat-count-scatter, fig.height=8}
+ggplot(df_plot, aes(nCount_RNA, nFeature_RNA, group = sample.name)) +
+  ggpointdensity::geom_pointdensity(size = 0.1, alpha = 0.05) +
+  facet_wrap(~sample.name, nrow = 2, scale = "free_x") +
+  labs(y = "Number genes (n)", x = "Number of reads (n)") +
+  viridis::scale_color_viridis() +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 15)
+  )
+```
+
+```{r feat-scatter-mnc, fig.height=4}
+df_plot_mnc <- df_plot %>%
+  filter(grepl("MNC", sample.name))
+
+df_plot_mnc %>%
+  ggplot(aes(nCount_RNA, nFeature_RNA, group = sample.name)) +
+  ggpointdensity::geom_pointdensity(size = 0.1, alpha = 0.05) +
+  facet_wrap(~sample.name, nrow = 1) +
+  labs(y = "Number genes (n)", x = "Number of reads (n)") +
+  viridis::scale_color_viridis() +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    legend.position = "none",
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 15)
+  )
+```
+
+The bottom curve has much lower ribosomal protein content.
+
+```{r feat-rp-scatter-mnc, fig.height=4}
+df_plot_mnc %>%
+  ggplot(aes(nCount_RNA, nFeature_RNA, color = percent.rp)) +
+  geom_point(size = 0.1, alpha = 0.05) +
+  facet_wrap(~sample.name, nrow = 1) +
+  labs(y = "Number genes (n)", x = "Number of reads (n)") +
+  viridis::scale_color_viridis() +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 15)
+  ) +
+  scale_x_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K")) +
+  scale_y_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K"))
+```
+
+```{r feat-rp-scatter-mnc-k, fig.height=4}
+k <- 5
+df_plot_mnc$percent.rp_k <- df_plot_mnc$percent.rp < k
+df_plot_mnc %>%
+  ggplot(aes(nCount_RNA, nFeature_RNA, color = percent.rp_k)) +
+  geom_point(size = 0.1, alpha = 0.05) +
+  facet_wrap(~sample.name, nrow = 1) +
+  labs(y = "Number genes (n)", x = "Number of reads (n)",
+       color = glue::glue("ribo% < {k}")) +
+  hrbrthemes::theme_ipsum() +
+  theme(
+    axis.title.x  = element_text(size = 15),
+    axis.title.y  = element_text(size = 15),
+    axis.text.x   = element_text(size = 15),
+    axis.text.y   = element_text(size = 15),
+    panel.spacing = unit(0.1, "lines"),
+    strip.text.x  = element_text(size = 15)
+  ) +
+  scale_x_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K")) +
+  scale_y_continuous(labels = scales::label_number(scale = 1/1000, suffix = "K")) +
+  guides(colour = ggplot2::guide_legend(override.aes = list(size = 4, alpha = 1)))
+```
+
+```{r cleanup-mnc-scatter}
+rm(df_plot_mnc); gc()
+```
+
+---
+
+## 2.5 Doublet / multiplet overlap
+
+Comparison of HTO-based demultiplexing (deMULTIplex2) with transcription-based doublet detection (scDblFinder). There is strong agreement between singlets and `pass` cells, but multiplet and transcriptional doublet calls do not strongly overlap.
+
+```{r doublet-table, fig.width=6, fig.height=4}
+tbl <- as.data.frame(table(scDblFinder  = df_plot$scDblFinder.class,
+                            deMULTIplex2 = df_plot$dm2_class))
+ggplot(tbl, aes(x = deMULTIplex2, y = scDblFinder, fill = Freq)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = scales::comma(Freq)), size = 4) +
+  scale_fill_distiller(palette = "Blues", direction = 1, name = "Cells") +
+  labs(title = "Doublet / multiplet overlap",
+       x = "Demultiplexing class", y = "scDblFinder class") +
+  hrbrthemes::theme_ipsum() +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        axis.title.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15))
+```
+
+---
+
+## 3. Threshold sweep {.tabset}
+
+Vary each threshold independently while holding the others at config values.
+
+```{r sweep-helper}
+count_cells <- function(md,
+                        mito_max  = qc_params$mito_percent_max,
+                        feat_min  = 0,
+                        feat_max  = Inf,
+                        ribo_min  = 0,
+                        ribo_max  = 100,
+                        hb_max    = qc_params$hb_percent_max) {
+  sum(md$percent.mt   <= mito_max &
+      md$nFeature_RNA >= feat_min  &
+      md$nFeature_RNA <= feat_max  &
+      md$percent.rp   >= ribo_min  &
+      md$percent.rp   <= ribo_max  &
+      md$percent.hb   <= hb_max)
+}
+```
+
+::: {.panel-tabset}
+
+```{r sweep-tabs}
+#| results: asis
+#| fig-width: 8
+#| fig-height: 12
+
+mito_grid <- c(10, 15, 20, 25, 30)
+feat_grid <- list(
+  list(min = 200, max = 5000), list(min = 300, max = 5000),
+  list(min = 500, max = 5000), list(min = 500, max = 6000),
+  list(min = 500, max = 7000), list(min = 700, max = 6000)
+)
+ribo_grid <- list(
+  list(min = 0,  max = 40), list(min = 0,  max = 50),
+  list(min = 0,  max = 60), list(min = 5,  max = 60),
+  list(min = 10, max = 60)
+)
+
+for (nm in SUBSET_NAMES) {
+  targets::tar_load_raw(paste0("mpn_raw_", nm))
+  srt     <- get(paste0("mpn_raw_", nm))
+  md      <- srt@meta.data
+  n_total <- nrow(md)
+  cat("\n\n### ", toupper(nm), "\n\n")
+
+  # mito sweep
+  mito_df <- data.frame(
+    mito_max     = mito_grid,
+    n_cells      = sapply(mito_grid, function(x) count_cells(md, mito_max = x)),
+    pct_retained = NA_real_
+  )
+  mito_df$pct_retained <- round(100 * mito_df$n_cells / n_total, 1)
+
+  p_mito <- ggplot(mito_df, aes(x = mito_max, y = pct_retained)) +
+    geom_line() + geom_point(size = 3) +
+    geom_vline(xintercept = qc_params$mito_percent_max,
+               linetype = "dashed", colour = "firebrick") +
+    labs(title = paste0(toupper(nm), " — mito_percent_max sweep"),
+         subtitle = paste0("Dashed = current config (", qc_params$mito_percent_max, "%)"),
+         x = "mito_percent_max", y = "% cells retained") +
+    theme_bw()
+
+  # nFeature sweep
+  feat_rows <- list()
+  for (g in feat_grid) {
+    feat_rows[[length(feat_rows) + 1]] <- data.frame(
+      feat_min = g$min,
+      feat_max = g$max,
+      n_cells  = count_cells(md, feat_min = g$min, feat_max = g$max)
+    )
+  }
+  feat_df <- do.call(rbind, feat_rows)
+  rm(feat_rows)
+  feat_df$pct_retained <- round(100 * feat_df$n_cells / n_total, 1)
+  feat_df$label        <- paste0("[", feat_df$feat_min, ", ", feat_df$feat_max, "]")
+
+  p_feat <- ggplot(feat_df, aes(x = label, y = pct_retained)) +
+    geom_col(fill = "steelblue", alpha = 0.7) +
+    geom_hline(yintercept = count_cells(md) / n_total * 100,
+               linetype = "dashed", colour = "firebrick") +
+    labs(title = paste0(toupper(nm), " — nFeature sweep"),
+         subtitle = "Dashed = current config",
+         x = "[min, max]", y = "% cells retained") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  # ribo sweep
+  ribo_rows <- list()
+  for (g in ribo_grid) {
+    ribo_rows[[length(ribo_rows) + 1]] <- data.frame(
+      ribo_min = g$min,
+      ribo_max = g$max,
+      n_cells  = count_cells(md, ribo_min = g$min, ribo_max = g$max)
+    )
+  }
+  ribo_df <- do.call(rbind, ribo_rows)
+  rm(ribo_rows)
+  ribo_df$pct_retained <- round(100 * ribo_df$n_cells / n_total, 1)
+  ribo_df$label        <- paste0("[", ribo_df$ribo_min, ", ", ribo_df$ribo_max, "]")
+
+  p_ribo <- ggplot(ribo_df, aes(x = label, y = pct_retained)) +
+    geom_col(fill = "darkorange", alpha = 0.7) +
+    geom_hline(yintercept = count_cells(md) / n_total * 100,
+               linetype = "dashed", colour = "firebrick") +
+    labs(title = paste0(toupper(nm), " — ribo % sweep"),
+         subtitle = "Dashed = current config",
+         x = "[ribo_min, ribo_max]", y = "% cells retained") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+  print(p_mito / p_feat / p_ribo)
+
+  rm(list = paste0("mpn_raw_", nm), srt, md); gc()
+}
+```
+
+:::
+
+---
+
+## 4. Chosen thresholds — preview {.tabset}
+
+::: {.panel-tabset}
+
+```{r preview-filter-tabs}
+#| results: asis
+
+for (nm in SUBSET_NAMES) {
+  targets::tar_load_raw(paste0("mpn_raw_", nm))
+  srt     <- get(paste0("mpn_raw_", nm))
+  md      <- srt@meta.data |> tibble::rownames_to_column("cell")
+  n_total <- nrow(md)
+  cat("\n\n### ", toupper(nm), "\n\n")
+
+  n_pass <- sum(srt@meta.data$pass_qc)
+  message(toupper(nm), " — Cells retained: ", n_pass, " / ", n_total,
+          " (", round(100 * n_pass / n_total, 1), "%)")
+
+  per_sample_qc <- md |>
+    dplyr::group_by(sample.name) |>
+    dplyr::summarise(
+      n_before       = dplyr::n(),
+      lost_mito      = sum(!pass_mt),
+      lost_feat_low  = sum(pass_mt & !pass_nFeature & nFeature_RNA < median(nFeature_RNA)),
+      lost_feat_high = sum(pass_mt & !pass_nFeature & nFeature_RNA >= median(nFeature_RNA)),
+      lost_ribo_low  = sum(!pass_rp & percent.rp < median(percent.rp)),
+      lost_ribo_high = sum(!pass_rp & percent.rp >= median(percent.rp)),
+      lost_hb        = sum(!pass_hb),
+      n_after        = sum(pass_qc),
+      .groups = "drop"
+    ) |>
+    dplyr::mutate(n_lost       = n_before - n_after,
+                  pct_retained = round(100 * n_after / n_before, 1)) |>
+    dplyr::rename(sample = sample.name)
+
+  print(knitr::kable(
+    dplyr::select(per_sample_qc, sample, n_before, n_after, n_lost, pct_retained,
+                  lost_mito, lost_feat_low, lost_feat_high,
+                  lost_ribo_low, lost_ribo_high, lost_hb),
+    col.names = c("Sample", "Before", "After", "Lost", "% Kept",
+                  "↑ mito", "↓ feat", "↑ feat", "↓ ribo", "↑ ribo", "↑ hb"),
+    align   = "lrrrrrrrrrr"
+  ))
+
+  rm(list = paste0("mpn_raw_", nm), srt, md); gc()
+}
+```
+
+:::
+
+---
+
+## 5. QC flag alluvial {.tabset}
+
+Each cell flows through the boolean QC flags in order: `pass_mt` → `pass_nFeature` →
+`pass_rp` → `pass_hb` → `pass_hto` → `pass_dbl`.
+Flow width = number of cells; colour = final `pass_cell` outcome (TRUE / FALSE).
+
+```{r qc-alluvial-helper}
+FLAG_COLS <- c("pass_mt", "pass_nFeature", "pass_rp", "pass_hb", "pass_hto", "pass_dbl")
+
+qc_alluvial <- function(md, title) {
+  af <- md[, c(FLAG_COLS, "pass_cell"), drop = FALSE]
+  for (col in FLAG_COLS) {
+    af[[col]] <- factor(ifelse(af[[col]], "pass", "fail"), levels = c("pass", "fail"))
+  }
+  af$pass_cell <- factor(ifelse(af$pass_cell, "pass_cell", "fail_cell"),
+                         levels = c("pass_cell", "fail_cell"))
+
+  agg <- af |>
+    dplyr::count(dplyr::across(dplyr::all_of(c(FLAG_COLS, "pass_cell"))), name = "n")
+
+  ggplot(agg,
+         aes(axis1 = pass_mt, axis2 = pass_nFeature, axis3 = pass_rp,
+             axis4 = pass_hb, axis5 = pass_hto,    axis6 = pass_dbl,
+             y = n, fill = pass_cell)) +
+    ggalluvial::geom_alluvium(alpha = 0.7, width = 1/8) +
+    ggalluvial::geom_stratum(width = 1/8, fill = "grey85", colour = "grey40",
+                             linewidth = 0.3) +
+    ggplot2::geom_text(stat = ggalluvial::StatStratum,
+                       aes(label = after_stat(stratum)),
+                       size = 3, min.y = 50) +
+    ggplot2::scale_x_continuous(breaks = 1:6, labels = FLAG_COLS) +
+    ggplot2::scale_fill_manual(
+      values = c("pass_cell" = "#2ca25f", "fail_cell" = "#de2d26"),
+      name   = "outcome"
+    ) +
+    ggplot2::labs(title = title, y = "cells") +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(axis.text.x = element_text(angle = 25, hjust = 1),
+                   legend.position = "bottom")
+}
+```
+
+::: {.panel-tabset}
+
+```{r qc-alluvial-tabs}
+#| results: asis
+#| fig-width: 13
+#| fig-height: 7
+
+for (nm in SUBSET_NAMES) {
+  targets::tar_load_raw(paste0("mpn_raw_", nm))
+  srt    <- get(paste0("mpn_raw_", nm))
+  md_sub <- srt@meta.data
+  cat("\n\n### ", toupper(nm), "\n\n")
+
+  cat("\n\n#### All samples\n\n")
+  print(qc_alluvial(md_sub, paste0(toupper(nm), " — all samples")))
+
+  for (samp in sort(unique(md_sub$sample.name))) {
+    cat("\n\n#### ", samp, "\n\n")
+    print(qc_alluvial(md_sub[md_sub$sample.name == samp, ],
+                      paste0(samp, " — QC flag flow")))
+  }
+
+  rm(list = paste0("mpn_raw_", nm), srt, md_sub); gc()
+}
+```
+
+:::
+
+---
+
+## 6. QC filter co-occurrence {.tabset}
+
+::: {.panel-tabset}
+
+```{r qc-cooccurrence-tabs}
+#| results: asis
+#| fig-width: 8
+#| fig-height: 6
+
+qc_flags  <- c("pass_mt", "pass_nFeature", "pass_rp", "pass_hb", "pass_hto", "pass_dbl")
+nice_names <- c(pass_mt = "Mito %", pass_nFeature = "nFeature",
+                pass_rp = "Ribo %",  pass_hb = "Hb %",
+                pass_hto = "HTO",    pass_dbl = "Doublet")
+
+cooc_heatmap <- function(md, title) {
+  flag_mat <- as.matrix(md[, qc_flags])
+  n        <- length(qc_flags)
+  cooc     <- matrix(0L, n, n, dimnames = list(qc_flags, qc_flags))
+  for (i in seq_len(n))
+    for (j in seq_len(n))
+      cooc[i, j] <- sum(!flag_mat[, i] & !flag_mat[, j])
+  long <- reshape2::melt(cooc, varnames = c("metric_x", "metric_y"), value.name = "n_cells")
+  long$metric_x <- factor(nice_names[as.character(long$metric_x)], levels = nice_names)
+  long$metric_y <- factor(nice_names[as.character(long$metric_y)], levels = rev(nice_names))
+
+  ggplot(long, aes(metric_x, metric_y, fill = n_cells)) +
+    geom_tile(colour = "white", linewidth = 0.5) +
+    geom_text(aes(label = n_cells,
+                  colour = n_cells > max(n_cells) * 0.5), size = 3) +
+    scale_colour_manual(values = c("TRUE" = "white", "FALSE" = "grey20"), guide = "none") +
+    scale_fill_gradient(low = "#f7fbff", high = "#08519c",
+                        name = "Cells failing\nboth metrics") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          axis.text.y = element_text(size = 10),
+          legend.position = "right")
+}
+
+for (nm in SUBSET_NAMES) {
+  targets::tar_load_raw(paste0("mpn_raw_", nm))
+  srt <- get(paste0("mpn_raw_", nm))
+  cat("\n\n### ", toupper(nm), "\n\n")
+  print(cooc_heatmap(srt@meta.data, paste0(toupper(nm), " — QC filter co-occurrence")))
+  rm(list = paste0("mpn_raw_", nm), srt); gc()
+}
+```
+
+:::
+
+---
+
+## 7. QC metrics on PCA / UMAP {.tabset}
+
+QC metrics projected onto the dimensionality reductions of each processed subset.
+
+```{r load-processed}
+targets::tar_load(proc_params)
+
+PCA_NAME   <- paste0("pca.", proc_params$ref_assay)
+QC_METRICS <- c("nFeature_RNA", "nCount_RNA", "percent.mt",
+                "percent.rp",   "percent.hb", "S.Score", "G2M.Score")
+```
+
+```{r qc-embedding-helper}
+extract_emb <- function(srt) {
+  md   <- srt@meta.data[, intersect(QC_METRICS, colnames(srt@meta.data)), drop = FALSE]
+  pca  <- as.data.frame(Seurat::Embeddings(srt, PCA_NAME)[, 1:2])
+  umap <- as.data.frame(Seurat::Embeddings(srt,
+           grep("^umap\\.", names(srt@reductions), value = TRUE)[1])[, 1:2])
+  colnames(pca)  <- c("Dim1", "Dim2")
+  colnames(umap) <- c("Dim1", "Dim2")
+  list(pca  = cbind(pca,  md),
+       umap = cbind(umap, md))
+}
+
+plot_qc_emb <- function(df, metric, title, n_max = 50000L) {
+  if (nrow(df) > n_max) df <- df[sample(nrow(df), n_max), ]
+  ggplot(df[order(df[[metric]]), ],
+         aes(x = Dim1, y = Dim2, colour = .data[[metric]])) +
+    geom_point(size = 0.3, alpha = 0.5) +
+    scale_colour_viridis_c(option = "magma", name = metric) +
+    labs(title = title) +
+    theme_void(base_size = 9) +
+    theme(legend.position  = "right",
+          legend.key.width = unit(0.3, "cm"),
+          plot.title       = element_text(size = 8))
+}
+
+plot_qc_reduction <- function(emb_df, reduction_label, subset_label) {
+  avail <- intersect(QC_METRICS, colnames(emb_df))
+  plots <- list()
+  for (m in avail) {
+    plots[[m]] <- plot_qc_emb(emb_df, m,
+                              title = paste0(m, " — ", subset_label, " (", reduction_label, ")"))
+  }
+  wrap_plots(plots, ncol = min(3L, length(avail)))
+}
+```
+
+::: {.panel-tabset}
+
+```{r qc-pca-tabs}
+#| results: asis
+#| fig-width: 12
+#| fig-height: 8
+
+PROCESSED_NAMES <- c("stroma", "hsc", "mnc")
+
+for (nm in PROCESSED_NAMES) {
+  targets::tar_load_raw(paste0("mpn_processed_", nm))
+  srt <- get(paste0("mpn_processed_", nm))
+  emb <- extract_emb(srt)
+  rm(list = paste0("mpn_processed_", nm), srt); gc()
+
+  cat("\n\n### ", nm, "\n\n")
+  cat("\n\n#### PCA\n\n")
+  print(plot_qc_reduction(emb$pca,  "PCA",  nm))
+  cat("\n\n#### UMAP\n\n")
+  print(plot_qc_reduction(emb$umap, "UMAP", nm))
+  cat("\n\n")
+}
+```
+
+:::
+
+{{< include ../_session-info.qmd >}}

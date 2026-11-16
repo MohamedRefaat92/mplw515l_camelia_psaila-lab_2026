@@ -1,0 +1,448 @@
+---
+title: "CellRank — HSC Trajectory (DPT pseudotime, res 1.5)"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+library(DT)
+library(knitr)
+
+VELOCITY_DIR       <- file.path("output/objects/cellrank/dpt_res1_5")
+CELLRANK_TABLE_DIR <- file.path(VELOCITY_DIR, "tables")
+CELLRANK_FIG_DIR   <- file.path(VELOCITY_DIR, "figures")
+CLUSTER_COL        <- "sNN_pca.SCT_30_res.1.5"
+TARGET_CLUSTER     <- "1"
+```
+
+## Overview
+
+CellRank trajectory inference on the HSC compartment (50,056 cells) using
+**Diffusion Pseudotime (DPT)** as the pseudotime signal. DPT is computed
+from the transcriptome graph (diffusion map, 15 components), making it
+fully data-driven without relying on gene count complexity.
+
+**Root cell:** `Rx_4_AAGGACTAGGTGAACG-1`
+(cluster 8 at res 0.9, WT condition — selected as a primitive HSC based on
+high CytoTRACE2 score and central UMAP position).
+
+**Workflow summary**
+
+| Step | Method | Output |
+|------|--------|--------|
+| Pseudotime | DPT on pipeline SNN graph (k=20) | `dpt_pseudotime` in obs |
+| Transition matrix | `PseudotimeKernel` (0.8) + `ConnectivityKernel` (0.2) | directed graph |
+| Terminal states | CFLARE — sparse eigendecomposition | 14 macrostates |
+| Fate probabilities | Linear system per terminal state | per-cell fate scores |
+| Driver genes | Fate–expression correlation per cluster | ranked gene lists |
+| Gene trends | GAM along DPT pseudotime | expression curves |
+
+> **Cluster column:** `sNN_pca.SCT_30_res.1.5` (33 clusters). Terminal state
+> names encode the dominant cluster label at **res 0.9** (used during the
+> CellRank Python run); per-cluster statistics in sections 5 and 8 are
+> computed at res 1.5.
+
+---
+
+## 1  DPT pseudotime
+
+```{r dpt-umap, fig.cap="Left: DPT pseudotime (viridis, low = root-proximal). Right: cluster labels at res 0.9 (used for terminal-state naming).", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "overview_umap.png"))
+```
+
+**Interpretation.** DPT orders cells by their geodesic distance from the root
+cell in diffusion space. Values near 0 (dark purple) represent the most
+primitive, root-proximal states; values near 1 (yellow) represent the most
+distant, committed states. Unlike CytoTRACE2, DPT does not rely on gene count
+complexity — it captures the actual graph topology of the transcriptome.
+
+DPT convention: 0 at the root, increasing toward differentiated states.
+This is directly compatible with `PseudotimeKernel` — no score inversion needed.
+
+---
+
+## 2  Kernel projection — directed transitions
+
+```{r kernel-projection, fig.cap="Transition probability arrows projected onto UMAP. Arrow direction reflects inferred differentiation flow from DPT pseudotime.", out.width="90%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "kernel_projection.png"))
+```
+
+**Interpretation.** Arrows point from lower to higher DPT pseudotime.
+The PseudotimeKernel (80%) biases transitions forward along the DPT axis;
+the ConnectivityKernel (20%) adds local neighbourhood smoothing. Because DPT
+has a fixed root, arrows here model **forward** differentiation from the chosen
+primitive HSC (cluster 8, WT).
+
+---
+
+## 3  CFLARE eigenspectrum
+
+```{r cflare-spectrum, fig.cap="Leading eigenvalues of the transition matrix. An eigenvalue gap indicates the number of quasi-stable macrostates.", out.width="70%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "cflare_spectrum.png"))
+```
+
+**Interpretation.** Eigenvalues near 1 correspond to absorbing (terminal)
+components of the Markov chain. The number of retained eigenvectors (`k`) sets
+the resolution of macrostate discovery. A visible gap after the retained
+eigenvalues validates the choice of `k`. CFLARE is used instead of GPCCA
+because the dense Schur decomposition at 50k cells requires ~23 GB.
+
+---
+
+## 4  Terminal states
+
+```{r terminal-states, fig.cap="CFLARE terminal states on UMAP. 14 macrostates identified; names encode dominant res-0.9 cluster label.", out.width="90%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "terminal_states.png"))
+```
+
+**Interpretation.** CFLARE identified **14 terminal states** from `k = 6`
+eigenvectors. State names (e.g., `14_1`, `7_1`) encode the dominant cluster
+at res 0.9 followed by a counter for states sharing that cluster. Multiple
+states within the same cluster indicate transcriptionally distinct
+subpopulations that converge to different attractors.
+
+---
+
+## 5  Fate probabilities
+
+```{r fate-probs-umap, fig.cap="Per-cell fate probability for each of the 14 terminal states on UMAP. Probabilities sum to 1 per cell across all fates.", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "fate_probabilities.png"))
+```
+
+**Interpretation.** Cells committed to a single fate show probability ≈ 1 for
+that state and ≈ 0 for others. Multipotent progenitors distribute probability
+across several fates. Cross-referencing with known lineage markers
+(`Gata1` for erythroid, `Pf4`/`Vwf` for MK, `Csf1r` for myeloid) annotates
+each macrostate biologically.
+
+### 5.1  Mean fate probability per cluster (res 1.5)
+
+```{r fate-per-cluster}
+fp <- read.csv(file.path(CELLRANK_TABLE_DIR, "fate_prob_per_cluster.csv"),
+               check.names = FALSE)
+colnames(fp)[1] <- "cluster"
+fp$cluster <- as.character(fp$cluster)
+
+fp_round <- fp
+fp_round[, -1] <- round(fp[, -1], 3)
+
+DT::datatable(
+  fp_round,
+  rownames = FALSE,
+  caption  = "Mean fate probability per cluster (rows) at res 1.5 for each DPT terminal state (columns).",
+  options  = list(scrollX = TRUE, pageLength = 15, dom = "ft")
+) |>
+  DT::formatStyle(
+    columns          = colnames(fp_round)[-1],
+    background       = DT::styleColorBar(c(0, 1), "#b8d4e8"),
+    backgroundSize   = "90% 70%",
+    backgroundRepeat = "no-repeat",
+    backgroundPosition = "center"
+  )
+```
+
+```{r fate-heatmap, fig.height=8, fig.width=12, fig.cap="Heatmap of mean fate probability per cluster at res 1.5. Rows = clusters, columns = terminal states."}
+mat <- as.matrix(fp[, -1])
+rownames(mat) <- fp$cluster
+mat_scaled <- apply(mat, 2, function(x) (x - min(x)) / (max(x) - min(x) + 1e-9))
+
+pheatmap(
+  mat_scaled,
+  color           = colorRampPalette(c("white", "#2166ac"))(100),
+  cluster_rows    = TRUE,
+  cluster_cols    = TRUE,
+  display_numbers = round(mat, 2),
+  number_color    = "black",
+  fontsize_number = 5,
+  fontsize_row    = 8,
+  fontsize_col    = 8,
+  angle_col       = 45,
+  main            = "Mean fate probability per cluster — res 1.5 (DPT)\n(colour = column-scaled; numbers = raw probability)"
+)
+```
+
+### 5.2  Fate probabilities by condition
+
+```{r fate-by-condition, fig.cap="Fate probability distributions per terminal state split by sample. Shifts between WT, Het mCh−, and Het mCh+ indicate condition-specific lineage biases.", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "fate_by_condition.png"))
+```
+
+---
+
+## 6  Lineage driver genes
+
+```{r lineage-drivers, results="asis"}
+driver_dir  <- file.path(CELLRANK_FIG_DIR, "lineage_drivers")
+driver_pngs <- sort(list.files(driver_dir, pattern = "\\.png$", full.names = TRUE))
+
+for (png in driver_pngs) {
+  ts_name <- tools::file_path_sans_ext(basename(png))
+  cat(sprintf("\n### Terminal state: %s\n\n", ts_name))
+  cat(sprintf('<img src="%s" style="width:90%%;display:block;margin:auto;">\n\n',
+              xfun::base64_uri(png)))
+}
+```
+
+**Interpretation.** Driver genes have the highest correlation between their
+expression level and a cell's probability of reaching a given terminal state.
+
+| Marker | Lineage |
+|--------|---------|
+| `Gata1`, `Klf1` | Erythroid |
+| `Pf4`, `Vwf`, `Mpl` | Megakaryocyte |
+| `Mpo`, `Csf1r` | Myeloid / monocyte |
+| `Cd34`, `Kit`, `Slamf1` | Progenitor |
+
+---
+
+## 7  Gene expression trends along DPT
+
+```{r gene-trends, fig.cap="GAM-smoothed expression of canonical HSC and lineage marker genes along DPT pseudotime, per terminal state.", out.width="100%", fig.height=14}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "gene_trends.png"))
+```
+
+**Interpretation.** Trends are smoothed using GAMs along the DPT axis.
+DPT has a defined root (cluster 8 / WT) so the x-axis has clear biological
+meaning: 0 = most primitive, 1 = most committed. Divergent trends between
+terminal states confirm lineage-specific gene regulation.
+
+---
+
+## 8  Cluster-level transition matrix (res 1.5)
+
+The cluster × cluster transition matrix $T^{cl}$ is aggregated from the
+full-resolution sparse Markov matrix and row-normalised. Entry $T^{cl}_{ij}$
+is the expected fraction of outgoing flux from cluster $i$ that reaches cluster
+$j$ in one step. Values computed at **res 1.5** (33 clusters).
+
+```{r cl-trans-table}
+cl_trans <- read.csv(file.path(CELLRANK_TABLE_DIR, "cluster_transition_matrix.csv"),
+                     check.names = FALSE, row.names = 1)
+
+DT::datatable(
+  round(cl_trans, 3),
+  caption = "Cluster × cluster one-step Markov transition probabilities — res 1.5 (rows sum to 1). DPT kernel.",
+  options = list(scrollX = TRUE, pageLength = 15, dom = "ft")
+) |>
+  DT::formatStyle(
+    columns          = colnames(cl_trans),
+    background       = DT::styleColorBar(c(0, 1), "#fed976"),
+    backgroundSize   = "90% 70%",
+    backgroundRepeat = "no-repeat",
+    backgroundPosition = "center"
+  )
+```
+
+```{r cl-trans-heatmap, fig.height=10, fig.width=10, fig.cap="Cluster transition probability heatmap — res 1.5 (DPT). High diagonal = terminal/slow clusters; high off-diagonal = directed flux."}
+mat_plot <- as.matrix(cl_trans)
+cl_order <- tryCatch(
+  as.character(sort(as.numeric(rownames(mat_plot)))),
+  error = function(e) rownames(mat_plot)
+)
+mat_plot <- mat_plot[cl_order, cl_order]
+
+breaks <- c(seq(0, 0.1, length.out = 90), seq(0.1, 1.0, length.out = 11))
+breaks <- sort(unique(breaks))
+
+pheatmap(
+  mat_plot,
+  color           = colorRampPalette(c("#f7f7f7", "#fed976", "#b10026"))(length(breaks) - 1),
+  breaks          = breaks,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  display_numbers = round(mat_plot, 2),
+  number_color    = "black",
+  fontsize_number = 4,
+  fontsize_row    = 8,
+  fontsize_col    = 8,
+  angle_col       = 45,
+  main            = "CellRank cluster transition probabilities — res 1.5 (DPT)\nRows sum to 1"
+)
+```
+
+---
+
+## 9  Cluster 1 fate analysis
+
+Cluster 1 (at res 1.5) is examined as a potential intermediate or progenitor
+state. This section (a) profiles the fate probability distribution for cluster 1
+cells, (b) identifies clusters that send the greatest Markov flux *into* cluster
+1 (candidate clusters of origin), and (c) compares fate profiles of candidate
+origin clusters with cluster 1.
+
+### 9.1  Fate probability profile of cluster 1
+
+```{r c1-fate-profile, fig.height=5, fig.width=9, fig.cap="Mean fate probability for cluster 1 cells across all 14 DPT terminal states."}
+fp1 <- fp |>
+  filter(cluster == TARGET_CLUSTER) |>
+  select(-cluster) |>
+  pivot_longer(everything(), names_to = "terminal_state", values_to = "mean_prob") |>
+  arrange(desc(mean_prob))
+
+ggplot(fp1, aes(x = reorder(terminal_state, -mean_prob), y = mean_prob)) +
+  geom_col(fill = "#2166ac", colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(mean_prob, 3)), vjust = -0.4, size = 3) +
+  labs(
+    title   = paste0("Cluster ", TARGET_CLUSTER, " — Mean fate probability (DPT)"),
+    x       = "Terminal state",
+    y       = "Mean fate probability",
+    caption = "Cluster resolution: sNN_pca.SCT_30_res.1.5"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r c1-fate-table}
+DT::datatable(
+  fp1 |> mutate(mean_prob = round(mean_prob, 4)),
+  rownames = FALSE,
+  caption  = paste0("Cluster ", TARGET_CLUSTER, " fate probabilities, ranked by mean probability."),
+  options  = list(pageLength = 20, dom = "t")
+)
+```
+
+### 9.2  Candidate clusters of origin
+
+Clusters that send the most Markov flux into cluster 1 are the most likely
+progenitor sources. The column of the transition matrix for cluster 1
+($T^{cl}_{i,1}$) gives the per-step probability of transitioning from cluster
+$i$ to cluster 1.
+
+```{r c1-origin-candidates, fig.height=5, fig.width=9, fig.cap="Inbound Markov flux into cluster 1 from all other clusters. Bars ranked by transition probability (DPT kernel)."}
+cl_trans_sorted <- cl_trans[
+  tryCatch(as.character(sort(as.numeric(rownames(cl_trans)))), error = function(e) rownames(cl_trans)),
+  , drop = FALSE
+]
+
+inbound <- data.frame(
+  source_cluster = rownames(cl_trans_sorted),
+  prob_to_c1     = cl_trans_sorted[, TARGET_CLUSTER]
+) |>
+  filter(source_cluster != TARGET_CLUSTER) |>
+  arrange(desc(prob_to_c1))
+
+TOP_N <- 10
+top_origins <- inbound |> slice_head(n = TOP_N)
+
+ggplot(top_origins,
+       aes(x = reorder(source_cluster, -prob_to_c1), y = prob_to_c1)) +
+  geom_col(fill = "#d6604d", colour = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(prob_to_c1, 3)), vjust = -0.4, size = 3) +
+  labs(
+    title   = paste0("Top ", TOP_N, " candidate origin clusters for cluster ", TARGET_CLUSTER,
+                     " (DPT)"),
+    x       = "Source cluster",
+    y       = paste0("P(source → cluster ", TARGET_CLUSTER, ") per Markov step"),
+    caption = "Cluster resolution: sNN_pca.SCT_30_res.1.5"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r c1-origin-table}
+DT::datatable(
+  inbound |> mutate(prob_to_c1 = round(prob_to_c1, 4)),
+  rownames = FALSE,
+  caption  = paste0("All clusters ranked by Markov flux into cluster ", TARGET_CLUSTER, " (DPT)."),
+  options  = list(pageLength = 15, dom = "ft")
+)
+```
+
+### 9.3  Fate comparison: origin clusters vs cluster 1
+
+Comparing the mean fate probability profiles of cluster 1 with its top
+candidate origin clusters reveals whether the upstream populations share or
+diverge in lineage bias — a hallmark of genuine progenitor → progeny
+relationships.
+
+```{r c1-fate-comparison, fig.height=7, fig.width=12, fig.cap="Mean fate probability heatmap for cluster 1 and its top candidate origin clusters (DPT). Colour = column-scaled; numbers = raw probability."}
+origin_clusters <- top_origins$source_cluster[seq_len(min(8, nrow(top_origins)))]
+show_clusters   <- c(origin_clusters, TARGET_CLUSTER)
+
+fp_subset <- fp |>
+  filter(cluster %in% show_clusters) |>
+  mutate(cluster = factor(cluster, levels = show_clusters))
+
+mat_sub <- as.matrix(fp_subset[, -1])
+rownames(mat_sub) <- fp_subset$cluster
+
+mat_sub_scaled <- apply(mat_sub, 2, function(x) (x - min(x)) / (max(x) - min(x) + 1e-9))
+
+row_ann <- data.frame(
+  type = ifelse(rownames(mat_sub) == TARGET_CLUSTER, "Target (cluster 1)", "Origin candidate"),
+  row.names = rownames(mat_sub)
+)
+ann_colors <- list(type = c("Target (cluster 1)" = "#d6604d", "Origin candidate" = "#92c5de"))
+
+pheatmap(
+  mat_sub_scaled,
+  color            = colorRampPalette(c("white", "#2166ac"))(100),
+  cluster_rows     = FALSE,
+  cluster_cols     = TRUE,
+  annotation_row   = row_ann,
+  annotation_colors = ann_colors,
+  display_numbers  = round(mat_sub, 3),
+  number_color     = "black",
+  fontsize_number  = 6,
+  fontsize_row     = 10,
+  fontsize_col     = 9,
+  angle_col        = 45,
+  main             = paste0("Fate profiles: cluster ", TARGET_CLUSTER,
+                            " vs candidate origin clusters (DPT)\n",
+                            "(colour = column-scaled; numbers = raw probability)")
+)
+```
+
+---
+
+## Methods
+
+### How CellRank works
+
+CellRank frames trajectory inference as a **finite, absorbing Markov chain**.
+The transition matrix $T$ is constructed from:
+
+**`PseudotimeKernel`** — assigns transition weights using a sigmoid:
+
+$$w_{ij} = \sigma\!\left(\nu \cdot \frac{t_j - t_i}{\text{std}(t)}\right)$$
+
+where $t$ is DPT pseudotime. Transitions toward higher DPT (more committed
+states) are favoured; backward transitions are penalised.
+
+**`ConnectivityKernel`** — symmetrised $k$-NN graph; adds local smoothing.
+Combined at 80:20 ratio.
+
+**CFLARE** identifies terminal states from the top $k$ eigenvectors of $T$.
+Fate probabilities are solved from $(I - Q)\Pi = R$ per terminal state using
+GMRES + ILU preconditioner.
+
+### DPT as pseudotime
+
+DPT measures geodesic distance in diffusion map space from a manually
+specified root cell. Its convention (0 at root, increasing toward differentiated
+states) is directly compatible with `PseudotimeKernel` — no score inversion
+needed. Unlike CytoTRACE2, DPT captures graph topology rather than
+transcriptional complexity, making it robust to gene-depth confounders.
+
+### Cluster transition matrix (res 1.5)
+
+The cluster-level matrix $T^{cl}_{ij}$ is derived by row-normalised aggregation:
+
+$$T^{cl}_{ij} = \frac{1}{n_i} \sum_{a \in C_i} \sum_{b \in C_j} T_{ab}$$
+
+Computed at res 1.5 (33 clusters) from the stored `transition_matrix.npz`.
+
+{{< include ../_session-info.qmd >}}

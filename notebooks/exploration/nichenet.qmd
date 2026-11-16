@@ -1,0 +1,218 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+# devtools::install_github("saeyslab/nichenetr")   # R packages come from renv (scripts/R/install-r-packages.R)
+
+```
+
+```{r}
+  lr_network <- readRDS(url("https://zenodo.org/record/7074291/files/lr_network_mouse_21122021.rds"))
+  ligand_target_matrix <- readRDS(url("https://zenodo.org/record/7074291/files/ligand_target_matrix_nsga2r_final_mouse.rds"))
+  weighted_networks <- readRDS(url("https://zenodo.org/record/7074291/files/weighted_networks_nsga2r_final_mouse.rds"))
+
+```
+
+```{r}
+lr_network <- lr_network %>% distinct(from, to)
+
+```
+
+```{r}
+receiver = c("5", "2")
+expressed_genes_receiver <- cluster_de_each_vs_rest_hsc_1_5 %>% 
+  filter(group1 %in% receiver, rate1 >= 0.1) %>% pull(feature) %>% unique()
+```
+
+```{r}
+all_receptors <- unique(lr_network$to)  
+expressed_receptors <- intersect(all_receptors, expressed_genes_receiver)
+
+potential_ligands <- lr_network %>% filter(to %in% expressed_receptors) %>% pull(from) %>% unique()
+```
+
+```{r}
+sender = c("1", "3", "15", "2", "7", "4")
+
+expressed_genes_sender <- cluster_de_each_vs_rest_stroma_0_9 %>% 
+  filter(group1 %in% sender, rate1 >= 0.1) %>% pull(feature) %>% unique()
+potential_ligands_focused <- intersect(potential_ligands, expressed_genes_sender)
+
+```
+
+```{r}
+geneset_oi <- cluster_de_each_vs_rest_hsc_1_5 %>% 
+  filter(group1 %in% receiver, log_fc >= 1, padj < 0.0005, feature %in% rownames(ligand_target_matrix)) %>%
+  pull(feature) %>%
+  unique() 
+```
+
+```{r}
+background_expressed_genes <-  expressed_genes_receiver[expressed_genes_receiver %in% rownames(ligand_target_matrix)]
+
+```
+
+```{r}
+ligand_activities <- nichenetr::predict_ligand_activities(geneset = geneset_oi,
+                                               background_expressed_genes = background_expressed_genes,
+                                               ligand_target_matrix = ligand_target_matrix,
+                                               potential_ligands = potential_ligands)
+
+ligand_activities <- ligand_activities %>% arrange(-aupr_corrected) %>% mutate(rank = rank(desc(aupr_corrected)))
+ligand_activities
+
+```
+
+```{r}
+aupr_corr_cutoff <- ligand_activities %>% filter(rank == 30) %>% pull(aupr_corrected )
+p_hist_lig_activity <- ggplot(ligand_activities, aes(x=aupr_corrected)) + 
+  geom_histogram(color="black", fill="darkorange")  + 
+  geom_vline(aes(xintercept= aupr_corr_cutoff),
+             color="red", linetype="dashed", size=1) + 
+  labs(x="ligand activity (PCC)", y = "# ligands") +
+  theme_classic()
+
+p_hist_lig_activity
+```
+
+```{r}
+best_upstream_ligands <- ligand_activities %>% 
+  filter(aupr_corrected >= aupr_corr_cutoff)%>% 
+  pull(test_ligand)
+
+```
+
+```{r}
+active_ligand_target_links_df <- best_upstream_ligands %>%
+  lapply(nichenetr::get_weighted_ligand_target_links,
+         geneset = geneset_oi,
+         ligand_target_matrix = ligand_target_matrix,
+         n = 100) %>%
+  bind_rows() %>% drop_na()
+```
+
+```{r}
+active_ligand_target_links <- nichenetr::prepare_ligand_target_visualization(
+  ligand_target_df = active_ligand_target_links_df,
+  ligand_target_matrix = ligand_target_matrix,
+  cutoff = 0.25) 
+```
+
+```{r}
+order_ligands <- intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev()
+order_targets <- active_ligand_target_links_df$target %>% unique() %>% intersect(rownames(active_ligand_target_links))
+
+vis_ligand_target <- t(active_ligand_target_links[order_targets,order_ligands])
+
+```
+
+```{r}
+
+nichenetr::make_heatmap_ggplot(vis_ligand_target, "Prioritized ligands", "Predicted target genes",
+                    color = "purple", legend_title = "Regulatory potential") +
+  scale_fill_gradient2(low = "whitesmoke",  high = "purple")
+
+```
+
+```{r}
+ligand_receptor_links_df <- nichenetr::get_weighted_ligand_receptor_links(
+  best_upstream_ligands, expressed_receptors,
+  lr_network, weighted_networks$lr_sig) 
+```
+
+```{r}
+vis_ligand_receptor_network <- nichenetr::prepare_ligand_receptor_visualization(
+  ligand_receptor_links_df,
+  best_upstream_ligands,
+  order_hclust = "both") 
+
+```
+
+```{r}
+nichenetr::make_heatmap_ggplot(t(vis_ligand_receptor_network), 
+                     y_name = "Ligands", x_name = "Receptors",  
+                     color = "mediumvioletred", legend_title = "Prior interaction potential")
+
+
+```
+
+```{r}
+t(vis_ligand_receptor_network) %>% data.frame(check.names = FALSE) %>% 
+    rownames_to_column("y") %>% as_tibble() %>% gather(x, 
+                                                       "score", -y) %>% ggplot(aes(x, y, fill = score)) + 
+    geom_tile(color = "white", size = 0.5) + scale_fill_gradient(low = "whitesmoke", 
+                                                                 high = "black") + theme_minimal()
+```
+
+```{r}
+ligand_activities_all <- ligand_activities 
+best_upstream_ligands_all <- best_upstream_ligands
+
+ligand_activities <- ligand_activities %>% filter(test_ligand %in% potential_ligands_focused)
+best_upstream_ligands <- ligand_activities %>% top_n(50, aupr_corrected) %>% arrange(-aupr_corrected) %>%
+  pull(test_ligand) %>% unique()
+
+```
+
+```{r}
+active_ligand_target_links_df <- best_upstream_ligands %>%
+  lapply(nichenetr::get_weighted_ligand_target_links,
+         geneset = geneset_oi,
+         ligand_target_matrix = ligand_target_matrix,
+         n = 100) %>%
+  bind_rows() %>% drop_na()
+
+active_ligand_target_links <- nichenetr::prepare_ligand_target_visualization(
+  ligand_target_df = active_ligand_target_links_df,
+  ligand_target_matrix = ligand_target_matrix,
+  cutoff = 0.33) 
+
+order_ligands <- intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev()
+order_targets <- active_ligand_target_links_df$target %>% unique() %>% intersect(rownames(active_ligand_target_links))
+
+vis_ligand_target <- t(active_ligand_target_links[order_targets,order_ligands])
+
+```
+
+```{r}
+
+nichenetr::make_heatmap_ggplot(vis_ligand_target, "Prioritized ligands", "Predicted target genes",
+                    color = "purple", legend_title = "Regulatory potential") +
+  scale_fill_gradient2(low = "whitesmoke",  high = "purple")
+
+
+```
+
+```{r}
+ligand_receptor_links_df <- nichenetr::get_weighted_ligand_receptor_links(
+  best_upstream_ligands, expressed_receptors,
+  lr_network, weighted_networks$lr_sig) 
+
+vis_ligand_receptor_network <-  nichenetr::prepare_ligand_receptor_visualization(
+  ligand_receptor_links_df,
+  best_upstream_ligands,
+  order_hclust = "both") 
+
+```
+
+```{r}
+
+p_ligand_receptor <-  nichenetr::make_heatmap_ggplot(t(vis_ligand_receptor_network), 
+                     y_name = "Ligands", x_name = "Receptors",  
+                     color = "mediumvioletred", legend_title = "Prior interaction potential")
+
+p_ligand_receptor
+
+```
+
+```{r}
+DotPlot(mpn_processed_hsc_fullcc,
+        features = rev(best_upstream_ligands), group.by = "sNN_pca.SCT_30_res.0.9",cols = "RdYlBu") + 
+  coord_flip() +
+  scale_y_discrete(position = "right")
+
+
+```

@@ -1,0 +1,890 @@
+---
+title: "Stress Response — mCh+ and mCh- vs WT"
+format:
+  html:
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(UCell)
+library(ggnewscale)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(pheatmap)
+library(viridis)
+library(msigdbr)
+library(fgsea)
+library(DT)
+library(htmltools)
+
+
+theme_set(theme_cowplot(font_size = 11))
+
+# Palette: WT = grey, mCh- = teal, mCh+ = coral
+cond_pal <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+cond_order <- c("WT", "mCh-", "mCh+")
+
+label_condition <- function(x) {
+  dplyr::case_when(
+    grepl("WT",     x) ~ "WT",
+    grepl("mCh-",  x) ~ "mCh-",
+    grepl("mCh\\+", x) ~ "mCh+",
+    TRUE               ~ x
+  )
+}
+```
+
+# Overview
+
+Tests whether *Het mCh+* and *Het mCh−* HSC show elevated stress / senescence
+transcriptional programmes compared to WT, within each cluster.
+
+**Approach:**
+
+1. **Signatures** — in-house (DE-derived) + public MSigDB stress/senescence genesets
+2. **UCell scores** — rank-based per-cell scoring (no background gene bias)
+3. **Pairwise testing** — Wilcoxon test per geneset × cluster × comparison
+   (WT vs mCh−, WT vs mCh+, mCh− vs mCh+); BH correction across all tests
+4. **Violin plots** — genesets significant in ≥ 1 cluster × comparison (padj < 0.05)
+5. **ORA** — over-representation of stress genesets in per-cluster upregulated genes
+
+---
+
+# 1  Signature definition
+
+## In-house signature
+
+Genes upregulated in Het (mCh+ or mCh−) vs WT (padj ≤ 0.05, log FC ≥ 0.25)
+filtered for stress / chaperone / UPR / DNA-damage annotations.
+
+```{r inhouse-sig}
+stress_patterns <- c(
+  "^Hspa", "^Hspb", "^Hspc", "^Hspd", "^Hspe", "^Hsph", "^Hsp90", "^Dnaj",
+  "^Atf[34]$", "Ddit3", "Eif2ak3", "Ern1", "Atf6", "Hspa5", "Hyou1", "Calr",
+  "^Sod[12]", "Cat", "^Gpx", "^Prdx", "^Txn", "Nfe2l2", "Hmox1", "Sqstm1",
+  "Trp53", "Cdkn1a", "Gadd45", "^Brca", "Rad51",
+  "^Atg", "Becn1", "Map1lc3",
+  "Nfkb1", "Tnf", "Il6", "Cxcl1", "Cxcl2",
+  "Hif1a", "Vegfa", "Ldha", "Pgk1", "Eno1"
+)
+stress_regex <- paste(stress_patterns, collapse = "|")
+
+de_hsc <- targets::tar_read(delegate_allvsall_markers_hsc)
+inhouse_stress <- de_hsc |>
+  dplyr::filter(padj <= 0.05, log_fc >= 0.25,
+                grepl("mCh", group1), grepl("WT", group2)) |>
+  dplyr::pull(feature) |>
+  unique() |>
+  (\(x) x[grepl(stress_regex, x, ignore.case = TRUE)])()
+
+rm(de_hsc); gc()
+
+cat("In-house stress signature:", length(inhouse_stress), "genes\n")
+```
+
+```{r inhouse-table}
+DT::datatable(data.frame(gene = sort(inhouse_stress)), rownames = FALSE,
+              caption = "In-house stress genes (Het vs WT, HSC)")
+```
+
+## Public signatures
+
+```{r public-sigs}
+stress_pattern <- paste(c(
+  "STRESS", "HEAT_SHOCK", "HSP", "CHAPERONE", "ER_STRESS",
+  "OXIDATIVE", "REACTIVE_OXYGEN", "_ROS", "HYPOXIA",
+  "DNA_DAMAGE", "DNA_REPAIR", "SENESCEN", "P53", "TP53",
+  "APOPTOSIS", "AUTOPHAGY", "INFLAMMATORY_RESPONSE", "INTERFERON"
+), collapse = "|")
+
+clean_names <- function(x) {
+  x |>
+    gsub("HALLMARK_|REACTOME_|GOBP_|GOCC_|GOMF_|WP_|KEGG_", "", x = _) |>
+    tolower() |> gsub("_", " ", x = _) |>
+    tools::toTitleCase() |> substr(1, 50)
+}
+
+sig_tbl <- purrr::map_dfr(
+  c("H", "C5"),
+  ~ msigdbr::msigdbr(species = "Mus musculus", category = .x) |>
+      dplyr::select(gs_name, gs_collection = gs_cat, gene_symbol)
+) |>
+  dplyr::filter(grepl(stress_pattern, gs_name, ignore.case = TRUE)) |>
+  dplyr::group_by(gs_name, gs_collection) |>
+  dplyr::summarise(genes = list(unique(gene_symbol)), .groups = "drop") |>
+  dplyr::filter(lengths(genes) >= 20, lengths(genes) <= 500) |>
+  dplyr::arrange(gs_collection, gs_name) |>
+  dplyr::mutate(label = clean_names(gs_name)) |>
+  dplyr::distinct(label, .keep_all = TRUE)
+
+public_sigs <- setNames(sig_tbl$genes, sig_tbl$label)
+all_sigs    <- c(list(`In-house stress` = inhouse_stress), public_sigs)
+
+cat("Total signatures:", length(all_sigs), "\n")
+purrr::iwalk(all_sigs, ~ cat(" ", .y, ":", length(.x), "genes\n"))
+```
+
+```{r sig-table}
+purrr::imap_dfr(all_sigs, ~ data.frame(signature = .y, gene = .x)) |>
+  DT::datatable(rownames = FALSE, filter = "top",
+                options = list(pageLength = 15, scrollY = "350px"))
+```
+
+---
+
+# 2  UCell scores — HSC
+
+```{r ucell-scores}
+srt_hsc    <- targets::tar_read(mpn_processed_hsc)
+hsc_cl_col <- grep("sNN.*res\\.0\\.9$", colnames(srt_hsc@meta.data), value = TRUE)[1]
+
+# Rank-based per-cell UCell scoring
+expr_mat <- GetAssayData(srt_hsc, assay = "SCT", layer = "data")
+ucell_scores <- UCell::ScoreSignatures_UCell(
+  matrix   = expr_mat,
+  features = all_sigs,
+  ncores   = 4
+)
+# ucell_scores: cells × genesets (colnames have "_UCell" suffix — strip it)
+colnames(ucell_scores) <- gsub("_UCell$", "", colnames(ucell_scores))
+
+# Build long data.frame: cell × geneset × score + metadata
+scores_df <- ucell_scores |>
+  as.data.frame() |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::left_join(
+    srt_hsc@meta.data |>
+      tibble::rownames_to_column("cell_id") |>
+      dplyr::select(cell_id,
+                    cluster     = dplyr::all_of(hsc_cl_col),
+                    sample.name),
+    by = "cell_id"
+  ) |>
+  dplyr::mutate(
+    cluster   = as.character(cluster),
+    condition = label_condition(sample.name)
+  ) |>
+  tidyr::pivot_longer(
+    cols      = dplyr::all_of(names(all_sigs)),
+    names_to  = "geneset",
+    values_to = "score"
+  )
+
+rm(srt_hsc, expr_mat, ucell_scores); gc()
+
+cat("Scored", dplyr::n_distinct(scores_df$cell_id), "cells ×",
+    dplyr::n_distinct(scores_df$geneset), "genesets\n")
+cat("Clusters:", paste(sort(unique(scores_df$cluster)), collapse = ", "), "\n")
+cat("Conditions:", paste(sort(unique(scores_df$condition)), collapse = ", "), "\n")
+```
+
+---
+
+# 3  Pairwise testing per geneset × cluster
+
+Wilcoxon rank-sum test for each geneset × cluster × pairwise condition comparison.
+BH correction applied across all tests.
+
+```{r pairwise-test}
+pairs <- list(
+  `WT vs mCh-`  = c("WT", "mCh-"),
+  `WT vs mCh+`  = c("WT", "mCh+"),
+  `mCh- vs mCh+` = c("mCh-", "mCh+")
+)
+
+pairwise_res <- scores_df |>
+  dplyr::group_by(geneset, cluster) |>
+  dplyr::group_modify(~ {
+    d <- .x
+    purrr::map_dfr(names(pairs), function(pair_name) {
+      g <- pairs[[pair_name]]
+      x <- d$score[d$condition == g[1]]
+      y <- d$score[d$condition == g[2]]
+      if (length(x) < 3 || length(y) < 3) return(NULL)
+      wt <- wilcox.test(x, y, exact = FALSE)
+      tibble::tibble(
+        comparison  = pair_name,
+        n_g1        = length(x),
+        n_g2        = length(y),
+        median_g1   = median(x),
+        median_g2   = median(y),
+        median_diff = median(y) - median(x),
+        pval        = wt$p.value
+      )
+    })
+  }) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(padj = p.adjust(pval, method = "BH"))
+
+cat("Total tests:", nrow(pairwise_res), "\n")
+cat("Significant (padj < 0.001):", sum(pairwise_res$padj < 0.001, na.rm = TRUE), "\n")
+```
+
+```{r test-table}
+pairwise_res |>
+  dplyr::filter(padj < 0.001) |>
+  dplyr::arrange(padj) |>
+  dplyr::mutate(
+    pval        = signif(pval, 3),
+    padj        = signif(padj, 3),
+    median_diff = round(median_diff, 4)
+  ) |>
+  DT::datatable(
+    rownames = FALSE, filter = "top",
+    caption  = "Significant pairwise comparisons (padj < 0.05)",
+    options  = list(pageLength = 15, scrollX = TRUE)
+  )
+```
+
+---
+
+# 4  Violin plots — significant genesets
+
+Genesets with padj < 0.001 in at least one cluster × comparison.
+Each panel = one cluster; fill = condition; significance brackets from the pairwise test.
+
+```{r sig-genesets}
+sig_genesets <- pairwise_res |>
+  dplyr::filter(padj < 0.001) |>
+  dplyr::pull(geneset) |>
+  unique() |>
+  sort()
+
+cat("Significant genesets:", length(sig_genesets), "\n")
+cat(paste(sig_genesets, collapse = "\n"), "\n")
+```
+
+```{r violin-fn}
+# Significance label from padj
+sig_label <- function(p) {
+  dplyr::case_when(
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    TRUE      ~ ""
+  )
+}
+
+#' Violin plot for one geneset across all clusters, split by condition.
+#' Significance brackets drawn for comparisons with padj < 0.05.
+plot_geneset_violin <- function(gs_name, scores, tests) {
+  df <- scores |>
+    dplyr::filter(geneset == gs_name) |>
+    dplyr::mutate(condition = factor(condition, levels = cond_order))
+
+  clusters <- sort(unique(df$cluster))
+
+  # Per-cluster significance annotations
+  annot <- tests |>
+    dplyr::filter(geneset == gs_name, padj < 0.05) |>
+    dplyr::mutate(label = sig_label(padj))
+
+  # y-position for brackets: slightly above per-cluster max
+  y_range <- range(df$score, na.rm = TRUE)
+  y_step  <- diff(y_range) * 0.10
+  pair_y  <- c(`WT vs mCh-` = y_range[2] + y_step,
+               `WT vs mCh+` = y_range[2] + 2 * y_step,
+               `mCh- vs mCh+` = y_range[2] + 3 * y_step)
+
+  # x-positions of conditions within each facet
+  x_pos <- setNames(seq_along(cond_order), cond_order)
+  bracket_df <- annot |>
+    dplyr::mutate(
+      x_left  = dplyr::case_when(
+        comparison == "WT vs mCh-"   ~ x_pos["WT"],
+        comparison == "WT vs mCh+"   ~ x_pos["WT"],
+        comparison == "mCh- vs mCh+" ~ x_pos["mCh-"]
+      ),
+      x_right = dplyr::case_when(
+        comparison == "WT vs mCh-"   ~ x_pos["mCh-"],
+        comparison == "WT vs mCh+"   ~ x_pos["mCh+"],
+        comparison == "mCh- vs mCh+" ~ x_pos["mCh+"]
+      ),
+      y_pos = pair_y[comparison]
+    )
+
+  p <- ggplot(df, aes(condition, score, fill = condition)) +
+    geom_violin(scale = "width", alpha = 0.7, trim = TRUE) +
+    geom_boxplot(width = 0.12, outlier.shape = NA,
+                 fill = "white", alpha = 0.8) +
+    stat_summary(fun = median, geom = "line", aes(group = 1),
+                 colour = "grey20", linewidth = 0.7, linetype = "solid") +
+    stat_summary(fun = median, geom = "point", aes(group = 1),
+                 colour = "grey20", size = 1.8) +
+    scale_fill_manual(values = cond_pal, guide = "none") +
+    facet_wrap(~ cluster, nrow = 1) +
+    labs(title = gs_name, x = NULL, y = "UCell score") +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+      strip.text  = element_text(size = 9),
+      plot.title  = element_text(size = 10, face = "bold")
+    )
+
+  # Add significance brackets per cluster
+  if (nrow(bracket_df) > 0) {
+    p <- p +
+      ggnewscale::new_scale_fill() +   # brackets don't need fill
+      geom_segment(
+        data = bracket_df,
+        aes(x = x_left, xend = x_right, y = y_pos, yend = y_pos),
+        inherit.aes = FALSE, colour = "grey30", linewidth = 0.4
+      ) +
+      geom_text(
+        data = bracket_df,
+        aes(x = (x_left + x_right) / 2, y = y_pos + y_step * 0.3,
+            label = label),
+        inherit.aes = FALSE, size = 3, vjust = 0
+      )
+  }
+
+  p
+}
+```
+
+---
+
+# 5  Significance heatmap
+
+-log10(padj) for every geneset × cluster × comparison.
+Only genesets significant in ≥ 1 test shown.
+
+```{r sig-heatmap, fig.height=8, fig.width=10}
+if (length(sig_genesets) > 0) {
+  heat_df <- pairwise_res |>
+    dplyr::filter(geneset %in% sig_genesets) |>
+    dplyr::mutate(
+      neg_log_p  = pmin(-log10(pmax(padj, 1e-10)), 10),
+      # Condition: extract mCh- / mCh+ / both from comparison string
+      het_cond   = dplyr::case_when(
+        grepl("mCh\\+", comparison) & grepl("mCh-", comparison) ~ "mCh- vs mCh+",
+        grepl("mCh\\+", comparison) ~ "mCh+",
+        grepl("mCh-",   comparison) ~ "mCh-",
+        TRUE                        ~ comparison
+      ),
+      col_key    = paste0(cluster, " | ", het_cond)
+    )
+
+  # Column order: sort by cluster then condition
+  col_order <- heat_df |>
+    dplyr::distinct(col_key, cluster, het_cond) |>
+    dplyr::arrange(as.integer(cluster),
+                   factor(het_cond, levels = c("mCh-", "mCh+", "mCh- vs mCh+"))) |>
+    dplyr::pull(col_key)
+
+  heat_mat <- heat_df |>
+    dplyr::select(geneset, col_key, neg_log_p) |>
+    tidyr::pivot_wider(names_from  = col_key, values_from = neg_log_p,
+                       values_fill = 0) |>
+    tibble::column_to_rownames("geneset") |>
+    as.matrix()
+  heat_mat <- heat_mat[, col_order, drop = FALSE]
+
+  # Column annotation data
+  ann_col <- heat_df |>
+    dplyr::distinct(col_key, cluster, het_cond) |>
+    dplyr::arrange(match(col_key, col_order))
+
+  cl_vals   <- ann_col$cluster          # cluster label per column, in col_order
+  cond_vals <- ann_col$het_cond         # condition per column, in col_order
+  n_col     <- length(col_order)
+
+  # Cluster bar: grey fill with cluster number as text (ComplexHeatmap AnnotationFunction)
+  cluster_anno <- ComplexHeatmap::AnnotationFunction(
+    fun = function(index, k, n) {
+      for (i in seq_along(index)) {
+        v <- cl_vals[index[i]]
+        grid::grid.rect(
+          x      = grid::unit((i - 0.5) / length(index), "npc"),
+          y      = grid::unit(0.5, "npc"),
+          width  = grid::unit(1 / length(index), "npc"),
+          height = grid::unit(1, "npc"),
+          gp     = grid::gpar(fill = "#cccccc", col = "white", lwd = 0.3))
+        grid::grid.text(
+          as.character(v),
+          x  = grid::unit((i - 0.5) / length(index), "npc"),
+          y  = grid::unit(0.5, "npc"),
+          gp = grid::gpar(fontsize = 7, fontface = "bold", col = "#333333"))
+      }
+    },
+    which = "column", n = n_col, height = grid::unit(5, "mm"))
+
+  cond_pal <- c(`mCh-` = "#2a9d8f", `mCh+` = "#e76f51", `mCh- vs mCh+` = "#9b59b6")
+
+  col_anno <- ComplexHeatmap::HeatmapAnnotation(
+    Cluster   = cluster_anno,
+    Condition = cond_vals,
+    col       = list(Condition = cond_pal),
+    annotation_name_gp   = grid::gpar(fontsize = 8),
+    annotation_name_side = "left",
+    show_legend          = c(Cluster = FALSE, Condition = TRUE),
+    annotation_height    = grid::unit(c(5, 4), "mm")
+  )
+
+  # Effect size matrix: median_diff, NA for non-significant cells (shown as grey)
+  diff_mat <- heat_df |>
+    dplyr::mutate(value = dplyr::if_else(padj < 0.05, median_diff, NA_real_)) |>
+    dplyr::select(geneset, col_key, value) |>
+    tidyr::pivot_wider(names_from  = col_key, values_from = value,
+                       values_fill = NA_real_) |>
+    tibble::column_to_rownames("geneset") |>
+    as.matrix()
+  diff_mat <- diff_mat[, col_order, drop = FALSE]
+
+  lim <- max(abs(diff_mat), na.rm = TRUE)
+  col_fun_diff <- circlize::colorRamp2(c(-lim, 0, lim),
+                                       c("#2166ac", "white", "#d73027"))
+
+  ComplexHeatmap::Heatmap(
+    diff_mat,
+    col                  = col_fun_diff,
+    na_col               = "grey88",
+    name                 = "\u0394 median\n(UCell)",
+    top_annotation       = col_anno,
+    cluster_rows         = TRUE,
+    cluster_columns      = TRUE,
+    column_labels        = cond_vals,
+    column_names_rot     = 45,
+    column_names_gp      = grid::gpar(fontsize = 7),
+    row_names_gp         = grid::gpar(fontsize = 8),
+    column_title         = "\u0394 median UCell score (g2 \u2212 g1) \u2014 grey = not significant (padj \u2265 0.05)",
+    column_title_gp      = grid::gpar(fontsize = 10),
+    heatmap_legend_param = list(title = "\u0394 median\n(UCell)")
+  )
+}
+```
+
+```{r top-geneset-violin, fig.height=4, fig.width=14}
+# Geneset appearing in the most significant tests across all clusters × comparisons
+top_gs <- pairwise_res |>
+  dplyr::filter(padj < 0.05) |>
+  dplyr::count(geneset, name = "n_sig") |>
+  dplyr::slice_max(n_sig, n = 5, with_ties = FALSE) |>
+  dplyr::pull(geneset)
+
+for(gs in top_gs){
+  cat("Top geneset (", sum(pairwise_res$geneset == gs & pairwise_res$padj < 0.05, na.rm = TRUE),
+      " significant tests):", gs, "\n")
+  print(plot_geneset_violin(gs, scores_df, pairwise_res))
+}
+```
+
+---
+
+# 6  ORA — stress genesets × cluster (HSC)
+
+Over-representation analysis (Fisher's exact test via `fgsea::fora()`) of each stress /
+senescence signature against upregulated genes per cluster × comparison.
+
+- **Foreground** — upregulated genes in a given cluster × comparison (padj ≤ 0.05, log FC > 0)
+- **Background** — all genes tested in that cluster × comparison
+
+```{r ora-run}
+de_hsc_full <- targets::tar_read(delegate_allvsall_markers_hsc)
+
+comparisons <- list(
+  `mCh- vs WT` = list(g1_pat = "mCh-",  g2_pat = "WT"),
+  `mCh+ vs WT` = list(g1_pat = "mCh\\+", g2_pat = "WT")
+)
+
+clusters_ora <- sort(unique(de_hsc_full$cluster))
+
+run_ora_stress <- function(de_df, sig_list, padj_thr = 0.05, lfc_thr = 0) {
+  purrr::map_dfr(names(comparisons), function(comp_name) {
+    cfg     <- comparisons[[comp_name]]
+    de_comp <- de_df |>
+      dplyr::filter(grepl(cfg$g1_pat, group1), grepl(cfg$g2_pat, group2))
+    purrr::map_dfr(clusters_ora, function(cl) {
+      de_cl      <- dplyr::filter(de_comp, cluster == cl)
+      if (nrow(de_cl) == 0) return(NULL)
+      universe   <- unique(de_cl$feature)
+      foreground <- de_cl |>
+        dplyr::filter(padj <= padj_thr, log_fc > lfc_thr) |>
+        dplyr::pull(feature) |> unique()
+      if (length(foreground) < 3) return(NULL)
+      purrr::map_dfr(names(sig_list), function(sig_name) {
+        genes_use <- intersect(sig_list[[sig_name]], universe)
+        if (length(genes_use) < 3) return(NULL)
+        res <- fgsea::fora(
+          pathways = list(sig = genes_use),
+          genes    = foreground,
+          universe = universe,
+          minSize  = 3
+        )
+        if (nrow(res) == 0) return(NULL)
+        tibble::tibble(
+          comparison    = comp_name,
+          cluster       = as.character(cl),
+          geneset       = sig_name,
+          pval          = res$pval[1],
+          padj          = res$padj[1],
+          overlap       = res$overlap[1],
+          pathway_size  = length(genes_use),
+          foreground_n  = length(foreground),
+          universe_n    = length(universe),
+          overlap_genes = list(res$overlapGenes[[1]])
+        )
+      })
+    })
+  })
+}
+
+ora_stress <- run_ora_stress(de_hsc_full, all_sigs) |>
+  dplyr::mutate(
+    fold_enrichment = (overlap / foreground_n) / (pathway_size / universe_n),
+    log2_fe         = log2(pmax(fold_enrichment, 1e-3)),
+    sig             = padj < 0.001,
+    overlap_ratio   = overlap / pathway_size
+  )
+
+rm(de_hsc_full); gc()
+
+cat("ORA complete:", nrow(ora_stress), "tests\n")
+cat("Significant (padj < 0.001):", sum(ora_stress$sig, na.rm = TRUE), "\n")
+```
+
+## Bubble plot
+
+```{r ora-bubble-fn}
+ora_bubble_gs_order <- ora_stress |>
+  dplyr::filter(sig) |>
+  dplyr::group_by(geneset) |>
+  dplyr::summarise(min_padj = min(padj, na.rm = TRUE), .groups = "drop") |>
+  dplyr::arrange(min_padj) |>
+  dplyr::pull(geneset)
+
+plot_ora_bubble <- function(comp_name, gs_order,
+                            show_y = TRUE, show_legend = TRUE) {
+  df <- ora_stress |>
+    dplyr::filter(comparison == comp_name, geneset %in% gs_order) |>
+    dplyr::mutate(
+      geneset = factor(geneset, levels = rev(gs_order)),
+      cluster = factor(cluster, levels = sort(unique(cluster)))
+    )
+  if (nrow(df) == 0)
+    return(ggplot() + labs(title = comp_name, subtitle = "No data") + theme_void())
+
+  p <- ggplot(df, aes(x = cluster, y = geneset)) +
+    geom_point(data = ~ dplyr::filter(.x, !sig),
+               aes(size = overlap_ratio),
+               shape = 21, fill = "grey88", colour = "white",
+               stroke = 0.3, alpha = 0.6) +
+    geom_point(data = ~ dplyr::filter(.x, sig),
+               aes(size = overlap_ratio, fill = log2_fe),
+               colour = "black", shape = 21, stroke = 0.4, alpha = 0.9) +
+    scale_fill_gradientn(colours  = c("white", "#fc8d59", "#d73027"),
+                         na.value = "grey90", name = "log2 fold\nenrichment") +
+    scale_size_continuous(name = "Overlap\nratio", range = c(1, 8)) +
+    scale_x_discrete(position = "top") +
+    labs(x = NULL, y = NULL, title = comp_name) +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x     = element_text(angle = 40, hjust = 0, size = 9),
+          axis.text.y     = element_text(size = 8),
+          panel.grid      = element_line(colour = "grey93"),
+          legend.position = if (show_legend) "right" else "none",
+          plot.title      = element_text(face = "bold", size = 10))
+
+  if (!show_y)
+    p <- p + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  p
+}
+```
+
+```{r ora-bubble}
+#| fig.width: 14
+#| fig.height: !expr max(4, 0.28 * length(ora_bubble_gs_order) + 1.5)
+
+if (length(ora_bubble_gs_order) == 0) {
+  cat("No significant stress genesets found in ORA.\n")
+} else {
+  comp_names <- names(comparisons)
+  p_left  <- plot_ora_bubble(comp_names[1], ora_bubble_gs_order,
+                             show_y = TRUE,  show_legend = FALSE)
+  p_right <- plot_ora_bubble(comp_names[2], ora_bubble_gs_order,
+                             show_y = FALSE, show_legend = TRUE)
+  p_left + p_right +
+    patchwork::plot_layout(widths = c(1.15, 1)) +
+    patchwork::plot_annotation(
+      title   = "HSC — stress / senescence ORA per cluster",
+      caption = "Filled: padj < 0.05  |  Size: overlap / geneset size  |  Colour: log2 fold enrichment",
+      theme   = theme(plot.title = element_text(face = "bold", size = 12))
+    )
+}
+```
+
+## Significant results table
+
+```{r ora-sig-table}
+ora_stress |>
+  dplyr::filter(sig) |>
+  dplyr::arrange(comparison, cluster, padj) |>
+  dplyr::mutate(
+    padj            = signif(padj, 3),
+    fold_enrichment = round(fold_enrichment, 2),
+    overlap_ratio   = round(overlap_ratio, 3),
+    overlap_genes   = purrr::map_chr(overlap_genes,
+                                     ~ paste(sort(.x), collapse = ", "))
+  ) |>
+  dplyr::select(comparison, cluster, geneset, fold_enrichment, padj,
+                overlap, pathway_size, overlap_genes) |>
+  DT::datatable(rownames = FALSE, filter = "top",
+                caption  = "Significant stress / senescence ORA results (padj < 0.05)",
+                options  = list(pageLength = 15, scrollX = TRUE))
+```
+
+## Full results table
+
+```{r ora-full-table}
+ora_stress |>
+  dplyr::arrange(comparison, cluster, padj) |>
+  dplyr::mutate(
+    padj            = signif(padj, 3),
+    pval            = signif(pval, 3),
+    fold_enrichment = round(fold_enrichment, 2),
+    overlap_genes   = purrr::map_chr(overlap_genes,
+                                     ~ paste(sort(.x), collapse = ", "))
+  ) |>
+  dplyr::select(comparison, cluster, geneset, fold_enrichment, padj, pval,
+                overlap, pathway_size, overlap_genes) |>
+  DT::datatable(rownames = FALSE, filter = "top",
+                caption  = "Full ORA results",
+                options  = list(pageLength = 15, scrollX = TRUE))
+```
+
+## Consistent genes
+```{r}
+# general consistency
+ora_stress %>%
+  dplyr::filter(sig) |>
+  dplyr::arrange(padj) %>% 
+  unnest(overlap_genes) %>% 
+  dplyr::count(overlap_genes,sort = TRUE)
+
+#mCh+/- test consistency
+ora_stress %>%
+  dplyr::filter(sig) |>
+  dplyr::arrange(padj) %>% 
+  unnest(overlap_genes) %>% 
+  dplyr::count(comparison, overlap_genes,sort = TRUE) %>%
+  arrange(-n)
+  
+#cluster consistency
+ora_stress %>%
+  dplyr::filter(sig) |>
+  dplyr::arrange(padj) %>% 
+  unnest(overlap_genes) %>% 
+  dplyr::count(cluster, overlap_genes,sort = TRUE) %>%
+  arrange(-n)
+  
+```
+
+```{r}
+#heatmap consistency
+ora_stress %>%
+  dplyr::filter(sig) |>
+  dplyr::arrange(padj) %>% 
+  unnest(overlap_genes) %>% 
+  dplyr::count(cluster,
+               overlap_genes) %>%
+  filter(n>=1) %>% 
+  pivot_wider(id_cols = overlap_genes,
+              names_from = "cluster",
+              values_from = "n",
+              values_fill = 0) %>% 
+  column_to_rownames("overlap_genes") %>%
+  pheatmap::pheatmap(scale = "row")
+```
+
+```{r stress_genes_expr_heatmap, fig.height=10, fig.width=14}
+feats <- ora_stress |>
+  dplyr::filter(sig) |>
+  dplyr::arrange(padj) |>
+  tidyr::unnest(overlap_genes) |>
+  dplyr::count(cluster, overlap_genes) |>
+  dplyr::filter(n >= 1) |>
+  dplyr::pull(overlap_genes) |>
+  unique()
+
+if (!exists("mpn_processed_hsc"))
+  mpn_processed_hsc <- targets::tar_read(mpn_processed_hsc)
+
+mat <- AverageExpression(
+  mpn_processed_hsc,
+  group.by      = c("sample.name", "sNN_pca.SCT_30_res.0.5"),
+  assays        = "SCT",
+  layer         = "data",
+  features      = feats,
+  return.seurat = FALSE
+)
+
+# Row-scale then clamp to ±4
+mat_sc <- t(scale(t(mat$SCT)))
+mat_sc <- pmin(pmax(mat_sc, -4), 4)
+
+# Pre-compute row clustering so modules can be cut and reused downstream
+row_dend   <- hclust(dist(mat_sc), method = "ward.D2")
+N_MODULES  <- 4L   # adjust to match visible blocks
+row_modules <- cutree(row_dend, k = N_MODULES)
+row_modules <- factor(paste0("M", row_modules),
+                      levels = paste0("M", unique(row_modules[row_dend$order])))
+cat("Row modules:\n")
+print(table(row_modules))
+
+# Parse column names → cluster (last numeric token) + sample (everything before)
+col_nm      <- colnames(mat_sc)
+cl_vals_e   <- sub(".*_([0-9]+)$", "\\1", col_nm)
+samp_vals_e <- sub("_[0-9]+$",     "",    col_nm)
+
+# Cluster bar: grey fill + number as text
+n_col_e <- length(col_nm)
+cluster_anno_e <- ComplexHeatmap::AnnotationFunction(
+  fun = function(index, k, n) {
+    for (i in seq_along(index)) {
+      v <- cl_vals_e[index[i]]
+      grid::grid.rect(
+        x      = grid::unit((i - 0.5) / length(index), "npc"),
+        y      = grid::unit(0.5, "npc"),
+        width  = grid::unit(1 / length(index), "npc"),
+        height = grid::unit(1, "npc"),
+        gp     = grid::gpar(fill = "#cccccc", col = "white", lwd = 0.3))
+      grid::grid.text(
+        as.character(v),
+        x  = grid::unit((i - 0.5) / length(index), "npc"),
+        y  = grid::unit(0.5, "npc"),
+        gp = grid::gpar(fontsize = 7, fontface = "bold", col = "#333333"))
+    }
+  },
+  which = "column", n = n_col_e, height = grid::unit(5, "mm"))
+
+# Sample palette: map each sample to its condition colour via label_condition()
+samp_levels <- sort(unique(samp_vals_e))
+samp_pal_e  <- setNames(cond_pal[label_condition(samp_levels)], samp_levels)
+
+col_anno_e <- ComplexHeatmap::HeatmapAnnotation(
+  Cluster = cluster_anno_e,
+  Sample  = samp_vals_e,
+  col     = list(Sample = samp_pal_e),
+  annotation_name_gp   = grid::gpar(fontsize = 8),
+  annotation_name_side = "left",
+  show_legend          = c(Cluster = FALSE, Sample = TRUE),
+  annotation_height    = grid::unit(c(5, 4), "mm")
+)
+
+col_fun_e <- circlize::colorRamp2(c(-4, 0, 4), c("#2166ac", "white", "#d73027"))
+
+ComplexHeatmap::Heatmap(
+  mat_sc,
+  col                  = col_fun_e,
+  name                 = "Row-scaled\nexpr.",
+  top_annotation       = col_anno_e,
+  cluster_rows         = as.dendrogram(row_dend),
+  cluster_columns      = TRUE,
+  row_split            = 4,
+  column_split         = 4,
+  column_names_rot     = 45,
+  column_names_gp      = grid::gpar(fontsize = 0),
+  row_names_gp         = grid::gpar(fontsize = 7),
+  column_title         = "Average SCT expression — stress overlap genes",
+  column_title_gp      = grid::gpar(fontsize = 10),
+  heatmap_legend_param = list(title = "Row-scaled\nexpr.", at = c(-4, -2, 0, 2, 4))
+)
+```
+
+```{r}
+#Module score of the stress genes of each clusters
+df <- ora_stress %>%
+  dplyr::filter(sig, cluster %in% c("9","7","6")) |>
+  dplyr::arrange(padj) %>% 
+  unnest(overlap_genes) %>% 
+  dplyr::count(cluster, overlap_genes,sort = TRUE) %>%
+  filter(n>=1)
+stress_clust_feats <- unique(df$overlap_genes)
+mpn_processed_hsc <- AddModuleScore(mpn_processed_hsc,list(stress_clust_feats))
+
+p1 <- FeaturePlot(mpn_processed_hsc,
+            c("Cluster1"),
+            split.by = "sample.name")&
+  RestoreLegend()&
+  scale_color_viridis_c(option = "turbo",limits = range(mpn_processed_hsc$Cluster1))
+p2 <- VlnPlot(mpn_processed_hsc,
+        features = c("Cluster1"),
+        group.by = "sNN_pca.SCT_30_res.0.5",
+        split.by = "sample.name",
+        sort = TRUE)
+p1/p2
+```
+
+```{r}
+df <- ora_stress %>%
+  dplyr::filter(sig, cluster %in% c("2","1","7")) |>
+  dplyr::arrange(padj) %>% 
+  unnest(overlap_genes) %>% 
+  dplyr::count(cluster, overlap_genes,sort = TRUE) %>%
+  filter(n>=1)
+stress_clust_feats <- unique(df$overlap_genes)
+mpn_processed_hsc <- AddModuleScore(mpn_processed_hsc,list(stress_clust_feats))
+
+p1 <- FeaturePlot(mpn_processed_hsc,
+            c("Cluster1"),
+            split.by = "sample.name")&
+  RestoreLegend()&
+  scale_color_viridis_c(option = "turbo",limits = range(mpn_processed_hsc$Cluster1))
+p2 <- VlnPlot(mpn_processed_hsc,
+        features = c("Cluster1"),
+        group.by = "sNN_pca.SCT_30_res.0.5",
+        split.by = "sample.name",
+        sort = TRUE)
+p1/p2
+```
+
+```{r}
+df <- ora_stress %>%
+  dplyr::filter(sig, cluster %in% c("4","0","14")) |>
+  dplyr::arrange(padj) %>% 
+  unnest(overlap_genes) %>% 
+  dplyr::count(cluster, overlap_genes,sort = TRUE) %>%
+  filter(n>=1)
+stress_clust_feats <- unique(df$overlap_genes)
+mpn_processed_hsc <- AddModuleScore(mpn_processed_hsc,list(stress_clust_feats))
+
+p1 <- FeaturePlot(mpn_processed_hsc,
+            c("Cluster1"),
+            split.by = "sample.name")&
+  RestoreLegend()&
+  scale_color_viridis_c(option = "turbo",limits = range(mpn_processed_hsc$Cluster1))
+p2 <- VlnPlot(mpn_processed_hsc,
+        features = c("Cluster1"),
+        group.by = "sNN_pca.SCT_30_res.0.5",
+        split.by = "sample.name",
+        sort = TRUE)
+p1/p2
+```
+
+```{r}
+n <- 6
+l <- cutree(row_dend, n) %>% split(names(.),.)
+mpn_processed_hsc <- AddModuleScore(mpn_processed_hsc,l)
+
+lapply( paste0("Cluster",1:n), function(feat){
+  FeaturePlot(mpn_processed_hsc,
+            feat,
+            split.by = "sample.name")&
+  RestoreLegend()&
+  scale_color_viridis_c(option = "turbo",limits = range(mpn_processed_hsc@meta.data[[feat]]))
+})
+
+
+```
+

@@ -1,0 +1,64 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Phlda3", "Bbc3", "Xaf1"), order = TRUE,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Serpine2", "Bax", "Dglucy"), order = TRUE,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Epor"), order = TRUE,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Glul"), order = TRUE,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Trp53"), order = TRUE,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Eda2r"), order = TRUE,split.by = "sample.name")&scale_color_viridis_c(option = "turbo", limit = c(0, 2))&RestoreLegend()
+```
+
+```{r}
+gs_lst <-msigdbr::msigdbr(species = "Mus musculus",
+                 collection = "H",
+                 subcollection = NULL) %>%
+    with(.,split(gene_symbol, gs_name))
+
+mpn_processed_hsc_fullcc <- Seurat::AddModuleScore(mpn_processed_hsc_fullcc,gs_lst["HALLMARK_P53_PATHWAY"])
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Cluster1"), order = TRUE,split.by = "sample.name")&scale_color_viridis_c(option = "turbo", limit = c(0,0.35))&RestoreLegend()
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.1.5"
+VlnPlot(mpn_processed_hsc_fullcc,features = "Cluster1",group.by = "sNN_pca.SCT_30_res.1.5",sort = TRUE)
+VlnPlot(mpn_processed_hsc_fullcc,features = "Cluster1",group.by = "sNN_pca.SCT_30_res.1.5",sort = TRUE, idents = c("5", "21", "2"))
+```
+
+```{r}
+VlnPlot(mpn_processed_hsc_fullcc,features = "Cluster1",group.by = "sNN_pca.SCT_30_res.1.5",sort = TRUE, idents = c("5", "21", "2"),split.by = "sample.name")
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.1.5"
+mpn_processed_hsc_fullcc <- Seurat::FindSubCluster(mpn_processed_hsc_fullcc,cluster = "5",graph.name = "sNN_pca.SCT_30",resolution = 0.2)
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- "sub.cluster"
+
+VlnPlot(mpn_processed_hsc_fullcc,features = "Cluster1",group.by = "sub.cluster",sort = TRUE, idents = c("5_0","5_1","5_2", "21", "2"))
+```

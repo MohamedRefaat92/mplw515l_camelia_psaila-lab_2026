@@ -1,0 +1,910 @@
+---
+title: "DEG Pathway Enrichment (ORA / GSEA)"
+format:
+  html:
+    embed-resources: false
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup}
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(htmltools)
+library(dplyr)
+library(tidyr)
+library(DT)
+library(targets)
+library(tidyverse)
+library(patchwork)
+library(stringr)
+library(dendsort)
+```
+
+```{r params}
+padj_allvsall       <- 0.001
+logfc_allvsall      <- 1
+logfc_allvsall_high <- 3
+rate_cutoff         <- 0.2
+PADJ_ORA            <- 0.001
+N_TOP_ORA           <- 10
+PADJ_HET            <- 0.001
+N_TOP_HET           <- 10
+PADJ_THRESH         <- 0.05
+N_TOP_SETS          <- 10
+band_cols <- c("shared" = "#888888", "mCh⁺-biased" = "#56B4E9",
+               "mCh−-biased" = "#E69F00")
+```
+
+```{r helpers}
+plot_feature_expr <- function(df, genes, title = NULL) {
+  df_genes <- dplyr::filter(df, gene %in% genes)
+  p <- ggplot(df_genes, aes(x = UMAP1, y = UMAP2, colour = expr)) +
+    geom_point(size = 0.4, alpha = 0.6) +
+    scale_colour_viridis_c(option = "magma", name = "expr") +
+    facet_grid(gene ~ sample.name) +
+    theme_void(base_size = 9) +
+    theme(strip.text = element_text(size = 7),
+          legend.position = "right")
+  if (!is.null(title)) p <- p + labs(title = title)
+  p
+}
+
+COLLECTION_ABBREV <- c(
+  "^HALLMARK_" = "HM_", "^KEGG_" = "KG_", "^REACTOME_" = "RE_",
+  "^WP_" = "WP_", "^GOBP_" = "BP_"
+)
+abbreviate_pathway <- function(x) {
+  for (pat in names(COLLECTION_ABBREV)) x <- sub(pat, COLLECTION_ABBREV[[pat]], x)
+  x
+}
+
+hclust_ord <- function(mat) {
+  if (nrow(mat) < 2) return(rownames(mat))
+  rownames(mat)[dendsort::dendsort(hclust(dist(mat), method = "ward.D2"))$order]
+}
+
+scatter_theme <- theme_bw(base_size = 11) +
+  theme(
+    legend.position  = "right",
+    panel.grid.major = element_line(colour = "grey90", linewidth = 0.2),
+    panel.grid.minor = element_blank()
+  )
+
+scatter_guides <- guides(
+  fill = guide_legend(
+    override.aes = list(alpha = 1, size = 4, shape = 21, colour = "white")
+  ),
+  size = guide_legend(
+    override.aes = list(alpha = 1, fill = "grey50", colour = "white", shape = 21),
+    range        = c(2, 8)
+  )
+)
+
+top_n_combined <- function(df, n_origin = 20, n_diag = 20) {
+  df <- df %>%
+    mutate(
+      quadrant  = paste0(if_else(log_fc_neg >= 0, "R", "L"),
+                         if_else(log_fc_pos >= 0, "U", "D")),
+      dist      = sqrt(log_fc_neg^2 + log_fc_pos^2),
+      diag_dist = abs(log_fc_pos - log_fc_neg) / sqrt(2)
+    )
+  by_origin <- df %>% group_by(quadrant) %>% slice_max(dist,      n = n_origin) %>% ungroup()
+  by_diag   <- df %>% group_by(quadrant) %>% slice_max(diag_dist, n = n_diag)   %>% ungroup()
+  bind_rows(by_origin, by_diag) %>% distinct(feature, cluster, quadrant, .keep_all = TRUE)
+}
+
+repel_combined <- function(df_label, inf = 30) {
+  quad_limits <- list(
+    RU = list(xlim = c(0,    inf), ylim = c(0,   inf)),
+    RD = list(xlim = c(0,    inf), ylim = c(-inf, 0)),
+    LU = list(xlim = c(-inf, 0),   ylim = c(0,   inf)),
+    LD = list(xlim = c(-inf, 0),   ylim = c(-inf, 0))
+  )
+  lapply(names(quad_limits), function(q) {
+    d <- filter(df_label, quadrant == q)
+    if (nrow(d) == 0) return(NULL)
+    lims <- quad_limits[[q]]
+    ggrepel::geom_text_repel(
+      data           = d,
+      aes(label = feature, colour = cluster),
+      size           = 2.3, max.overlaps = 30, show.legend = FALSE,
+      segment.size   = 0.2,
+      segment.colour = scales::alpha("grey", alpha = 0.6),
+      xlim           = lims$xlim,
+      ylim           = lims$ylim
+    )
+  })
+}
+
+make_volcano <- function(df, comparison_label) {
+  df |>
+    dplyr::mutate(
+      neg_log_p  = -log10(pmax(padj, 1e-30)),
+      sig        = (padj <= padj_allvsall & log_fc >=  logfc_allvsall & rate1 >= rate_cutoff) |
+                   (padj <= padj_allvsall & log_fc <= -logfc_allvsall & rate2 >= rate_cutoff),
+      max_rate   = pmax(rate1, rate2),
+      comparison = comparison_label
+    ) |>
+    dplyr::filter(!feature %in% c(sex_degs, "ENSMUSG00000121395"))
+}
+
+make_het_bubble <- function(df_ora, paths, dir_label) {
+  df_dir <- df_ora %>%
+    dplyr::filter(reg_dir == dir_label, pathway %in% paths)
+  if (nrow(df_dir) == 0) return(patchwork::plot_spacer())
+
+  fe_mat <- df_dir %>%
+    dplyr::select(pathway, cluster, fold_enrichment) %>%
+    tidyr::pivot_wider(names_from = cluster, values_from = fold_enrichment,
+                       values_fill = 0, values_fn = mean) %>%
+    tibble::column_to_rownames("pathway") %>%
+    as.matrix()
+  fe_mat[!is.finite(fe_mat)] <- 0
+
+  row_ord <- hclust_ord(fe_mat)
+  col_ord <- hclust_ord(t(fe_mat))
+
+  df_dir <- df_dir %>%
+    dplyr::mutate(
+      pathway = factor(pathway, levels = row_ord),
+      cluster = factor(cluster, levels = col_ord)
+    )
+
+  fill_colours <- if (dir_label == "up") c("white", "#fc8d59", "#d73027") else c("white", "#87ceeb", "#2166ac")
+  ggplot(df_dir, aes(x = cluster, y = pathway)) +
+    geom_point(data = ~dplyr::filter(.x, !sig),
+               aes(size = overlap_ratio),
+               shape = 21, fill = "grey88", colour = "white", stroke = 0.3, alpha = 0.5) +
+    geom_point(data = ~dplyr::filter(.x, sig),
+               aes(size = overlap_ratio, fill = fold_enrichment),
+               colour = "black", shape = 21, stroke = 0.3, alpha = 0.9) +
+    scale_fill_gradientn(colours = fill_colours,
+                         na.value = "grey90", name = "log2 fold\nenrichment") +
+    scale_size_continuous(name = "Overlap\nratio", range = c(1, 7)) +
+    labs(x = "Cluster", y = NULL,
+         subtitle = paste0(df_ora$comparison[1], " — ",
+                           if (dir_label == "up") "Up-regulated" else "Down-regulated"),
+         caption  = "Filled: sig | Colour: log2 fold enrichment | Size: overlap/pathway size") +
+    scale_x_discrete(position = "top") +
+    theme_bw(base_size = 9) +
+    theme(axis.text.x    = element_text(angle = 40, hjust = 0),
+          axis.text.y    = element_text(size = 7),
+          panel.grid     = element_line(colour = "grey93"),
+          plot.subtitle  = element_text(face = "bold"),
+          legend.position = "right")
+}
+```
+
+# Cluster marker ORA
+
+ORA on per-cluster marker genesets derived from `cluster_markers_res_lst_hsc` (genes consistently up in a cluster across all pairwise comparisons).
+
+```{r clust-markers-data}
+targets::tar_load(cluster_markers_res_lst_hsc)
+
+feat_delegate_summary <- cluster_markers_res_lst_hsc$sNN_pca.SCT_30_res.0.9 %>%
+  mutate(sig = log_fc >= 1 & padj <= 1e-5) %>%
+  group_by(feature, group1) %>%
+  summarize(rate1 = unique(rate1),
+            rate2_median = median(rate2),
+            rate2_max = max(rate2),
+            group1_is_max = rate1 > rate2_max,
+            n = dplyr::n(),
+            n_sig = sum(sig),
+            sig_groups = paste0(unique(group2[sig]), collapse = ","),
+            notsig_groups = paste0(unique(group2[!sig]), collapse = ","),
+            prop = n_sig / n,
+            median_padj = median(padj),
+            median_logfc = median(log_fc),
+            min_padj = min(padj),
+            max_logfc = max(log_fc)) %>%
+  ungroup() %>%
+  arrange(-(median_logfc * rate1 / rate2_median))
+rm(cluster_markers_res_lst_hsc)
+```
+
+```{r clust-markers-lst}
+clust_marker_lst <- feat_delegate_summary %>%
+  filter(prop >= 0.6 & max_logfc >= 1 & min_padj < 1e-5) %>%
+  with(split(feature, group1))
+```
+
+```{r clust-markers-universe}
+srt_tmp <- targets::tar_read(mpn_processed_data_hsc)
+clust_marker_ora_universe <- rownames(srt_tmp)
+rm(srt_tmp); gc()
+```
+
+```{r clust-markers-ora-run}
+clust_marker_ora_list <- compute_ora_results(
+  genesets = clust_marker_lst,
+  universe = clust_marker_ora_universe,
+  min_size = 20
+)
+```
+
+```{r clust-markers-ora-bubble}
+ora_all_clust <- dplyr::bind_rows(clust_marker_ora_list)
+
+top_paths_clust <- ora_all_clust %>%
+  dplyr::filter(padj < PADJ_ORA) %>%
+  dplyr::mutate(foldEnrichment = ifelse(is.infinite(foldEnrichment),
+                                        max(foldEnrichment[is.finite(foldEnrichment)], na.rm = TRUE),
+                                        foldEnrichment)) %>%
+  dplyr::group_by(geneset) %>%
+  dplyr::slice_max(foldEnrichment, n = N_TOP_ORA, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::pull(pathway) %>%
+  unique()
+```
+
+```{r clust-markers-ora-bubble-plot}
+#| fig.height: !expr min(10, max(3, 0.22 * length(top_paths_clust) + 1.2))
+#| fig.width: !expr min(14, max(5, 0.9 * length(clust_marker_ora_list) + 2.5))
+if (length(top_paths_clust) > 0) {
+  bubble_df_clust <- ora_all_clust %>%
+    dplyr::filter(pathway %in% top_paths_clust) %>%
+    dplyr::mutate(
+      pathway         = stringr::str_trunc(abbreviate_pathway(pathway), 55),
+      fold_enrichment = log2(foldEnrichment),
+      overlap_ratio   = overlap / size,
+      sig             = padj < PADJ_ORA
+    )
+
+  fe_mat <- bubble_df_clust %>%
+    dplyr::select(pathway, geneset, fold_enrichment) %>%
+    tidyr::pivot_wider(names_from = geneset, values_from = fold_enrichment,
+                       values_fill = 0, values_fn = mean) %>%
+    tibble::column_to_rownames("pathway") %>%
+    as.matrix()
+  fe_mat[!is.finite(fe_mat)] <- 0
+
+  row_ord <- hclust_ord(fe_mat)
+  col_ord <- hclust_ord(t(fe_mat))
+
+  ggplot(bubble_df_clust,
+         aes(x = factor(geneset, levels = col_ord),
+             y = factor(pathway,  levels = row_ord))) +
+    geom_point(data = ~dplyr::filter(.x, !sig),
+               aes(size = overlap_ratio),
+               shape = 21, fill = "grey88", colour = "white", stroke = 0.3, alpha = 0.5) +
+    geom_point(data = ~dplyr::filter(.x, sig),
+               aes(size = overlap_ratio, fill = fold_enrichment),
+               colour = "black", shape = 21, stroke = 0.3, alpha = 0.9) +
+    scale_fill_gradientn(colours = c("white", "#fc8d59", "#d73027"),
+                         na.value = "grey90", name = "log2 fold\nenrichment") +
+    scale_size_continuous(name = "Overlap\nratio", range = c(1, 8)) +
+    labs(x = "Cluster", y = NULL,
+         title   = "HSC cluster markers — ORA bubble plot",
+         caption = "Filled: padj < 0.05  |  Grey: not significant  |  Colour: log2 fold enrichment  |  Size: overlap/pathway size\nRows and columns ordered by Ward hierarchical clustering of log2 fold enrichment") +
+    scale_x_discrete(position = "top") +
+    theme_bw(base_size = 10) +
+    theme(axis.text.x  = element_text(angle = 40, hjust = 0),
+          axis.text.y  = element_text(size = 7),
+          panel.grid   = element_line(colour = "grey93"),
+          legend.position = "right")
+} else {
+  message("No significant pathways found for any cluster marker geneset.")
+}
+```
+
+# Het vs all ORA
+
+::: {.panel-tabset}
+
+## HSC
+
+```{r allvsall-hsc-gsea-data}
+hsc_clust_level <- "res_0.9"
+tar_load(delegate_pairwise_markers_hsc)
+tar_load(sex_degs)
+hsc_raw <- delegate_pairwise_markers_hsc[[hsc_clust_level]]
+rm(delegate_pairwise_markers_hsc)
+
+volcano_neg <- make_volcano(hsc_raw$mch_neg_vs_wt, "Het mCh− vs WT")
+volcano_pos <- make_volcano(hsc_raw$mch_pos_vs_wt, "Het mCh⁺ vs WT")
+volcano_df  <- bind_rows(volcano_neg, volcano_pos)
+rm(hsc_raw, volcano_neg, volcano_pos)
+```
+
+### Het mCh geneset ORA {.unnumbered}
+
+All pairwise comparisons between sample groups per cluster (WT vs HET+, WT vs HET-, HET+ vs HET-) via `DElegate::findDE(..., compare = "all_vs_all")`.
+
+```{r het-clust-geneset}
+# Gene lists per cluster × comparison × direction — used for ORA below
+het_clust_genesets <- volcano_df %>%
+  dplyr::filter(!cluster %in% c("12", "15", "16", "17", "13", "11", "10", "8"),
+                abs(log_fc) >= 0.2 & padj < 1e-2) %>%
+  dplyr::mutate(reg_dir = ifelse(log_fc >= 0, "up", "down")) %>%
+  dplyr::group_by(cluster, comparison, reg_dir) %>%
+  dplyr::summarise(genes = list(unique(feature)), .groups = "drop") %>%
+  dplyr::mutate(gs_name = paste(cluster, comparison, reg_dir, sep = "|||"))
+
+het_clust_gs_list <- setNames(het_clust_genesets$genes, het_clust_genesets$gs_name)
+```
+
+```{r het-clust-ora-run}
+het_clust_ora_list <- compute_ora_results(
+  genesets = het_clust_gs_list,
+  universe = clust_marker_ora_universe,
+  min_size = 20
+)
+```
+
+```{r het-clust-ora-prep}
+het_clust_ora_df <- dplyr::bind_rows(het_clust_ora_list) %>%
+  tidyr::separate(geneset, into = c("cluster", "comparison", "reg_dir"), sep = "\\|\\|\\|") %>%
+  dplyr::mutate(
+    pathway         = stringr::str_trunc(abbreviate_pathway(pathway), 55),
+    fe_finite       = ifelse(is.infinite(foldEnrichment),
+                             max(foldEnrichment[is.finite(foldEnrichment)], na.rm = TRUE),
+                             foldEnrichment),
+    fold_enrichment = log2(fe_finite),
+    overlap_ratio   = overlap / size,
+    sig             = padj < PADJ_HET
+  )
+
+# Top N pathways per cluster × comparison × direction, then take the union.
+# This ensures every cluster contributes equally to the displayed pathway set.
+top_paths_het <- het_clust_ora_df %>%
+  dplyr::filter(padj < PADJ_HET, is.finite(fold_enrichment)) %>%
+  dplyr::group_by(cluster, comparison, reg_dir) %>%
+  dplyr::slice_max(fold_enrichment, n = N_TOP_HET, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct(comparison, reg_dir, pathway)
+```
+
+```{r het-clust-ora-plot, results="asis", fig.width=14}
+#| fig.height: !expr 0.35 * N_TOP_HET + 2.5
+
+for (comp in unique(top_paths_het$comparison)) {
+  cat("####", comp, "{.unnumbered}\n\n")
+
+  paths_up   <- top_paths_het %>%
+    dplyr::filter(comparison == comp, reg_dir == "up") %>%
+    dplyr::pull(pathway)
+  paths_down <- top_paths_het %>%
+    dplyr::filter(comparison == comp, reg_dir == "down") %>%
+    dplyr::pull(pathway)
+
+  df_comp <- dplyr::filter(het_clust_ora_df, comparison == comp)
+
+  p_up   <- make_het_bubble(df_comp, paths_up,   "up")
+  p_down <- make_het_bubble(df_comp, paths_down, "down")
+
+  print(patchwork::wrap_plots(p_up, p_down, nrow = 1, guides = "collect"))
+  cat("\n\n")
+}
+```
+
+### Geneset definition {.unnumbered}
+
+Genes with |log FC| ≥ 1 in at least one comparison are split into three groups per quadrant based on their position relative to the diagonal band (y = x ± 1):
+
+- **shared**: between the diagonal lines — similar effect in both mCh− and mCh+
+- **mCh⁺-biased**: above the upper diagonal (y = x + 1) — stronger in mCh+
+- **mCh⁻-biased**: below the lower diagonal (y = x − 1) — stronger in mCh−
+
+```{r allvsall-hsc-gsea-scatter-prep}
+tar_load(scatter_df_hsc)
+tar_load(genesets_hsc)
+scatter_df      <- scatter_df_hsc[[hsc_clust_level]]
+hsc_genesets_df <- genesets_hsc$genesets_df
+hsc_genesets    <- genesets_hsc$genesets
+rm(scatter_df_hsc, genesets_hsc)
+```
+
+```{r allvsall-hsc-geneset-scatter, fig.height=9, fig.width=9}
+df_label_gs <- hsc_genesets_df %>%
+  group_by(geneset) %>%
+  slice_max(sqrt(log_fc_neg^2 + log_fc_pos^2), n = 8) %>%
+  ungroup()
+
+ggplot(mapping = aes(x = log_fc_neg, y = log_fc_pos)) +
+  geom_point(data = scatter_df, aes(size = max_rate),
+             fill = "grey88", colour = "white", shape = 21, alpha = 0.4) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.6) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.6) +
+  geom_abline(slope = 1, intercept =  0, colour = "grey50", linewidth = 0.55,
+              linetype = "solid") +
+  geom_abline(slope = 1, intercept =  1, colour = "grey50", linewidth = 0.4,
+              linetype = "22") +
+  geom_abline(slope = 1, intercept = -1, colour = "grey50", linewidth = 0.4,
+              linetype = "22") +
+  geom_point(data = hsc_genesets_df, aes(fill = band, size = max_rate),
+             colour = "white", shape = 21, alpha = 0.7) +
+  ggrepel::geom_text_repel(
+    data         = df_label_gs,
+    aes(label    = feature, colour = band),
+    size         = 2.3, max.overlaps = 30, show.legend = FALSE,
+    segment.size = 0.2,
+    segment.colour = scales::alpha("grey", alpha = 0.6),
+  ) +
+  scale_fill_manual(values = band_cols, name = "Gene group") +
+  scale_colour_manual(values = band_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = 0.2)) +
+  scale_y_continuous(expand = expansion(mult = 0.2)) +
+  scale_size_continuous(name = "Max expression\nrate", range = c(0.5, 4)) +
+  facet_wrap(~quadrant) +
+  labs(x = "log FC  (Het mCh− vs WT)", y = "log FC  (Het mCh⁺ vs WT)",
+       title = "CD41⁺ HSC — geneset membership",
+       caption = "Grey: all significant genes  |  Coloured: |log FC| ≥ 1  |  Bands: y = x ± 1") +
+  scatter_theme + scatter_guides
+```
+
+### Geneset over-representation analysis {.unnumbered}
+
+For each defined geneset, over-representation of MSigDB pathways (Hallmark, KEGG, Reactome, WikiPathways, GO:BP) is tested with `fgsea::fora()` (Fisher's exact test). The background is the union of all significant genes in the scatter, held constant across all geneset tests.
+
+```{r allvsall-hsc-ora-setup}
+tar_load(ora_results_hsc)
+hsc_ora_list <- ora_results_hsc
+rm(ora_results_hsc)
+```
+
+#### Significant pathways per geneset {.unnumbered}
+
+::: {.panel-tabset}
+
+```{r allvsall-hsc-ora-table, results="asis"}
+for (gs_name in names(hsc_ora_list)) {
+  cat("##", gs_name, "\n\n")
+  sig <- hsc_ora_list[[gs_name]] %>%
+    filter(padj < PADJ_THRESH) %>%
+    arrange(desc(foldEnrichment)) %>%
+    mutate(pathway          = abbreviate_pathway(pathway),
+           foldEnrichment   = round(foldEnrichment, 2),
+           overlap          = paste0(overlap, "/", size),
+           padj             = signif(padj, 3)) %>%
+    select(pathway, foldEnrichment, padj, overlap)
+  if (nrow(sig) == 0) { cat("No significant pathways.\n\n"); next }
+  print(htmltools::tagList(
+    DT::datatable(sig, rownames = FALSE, filter = "top",
+                  options = list(pageLength = 10, scrollX = TRUE))
+  ))
+  cat("\n\n")
+}
+```
+
+:::
+
+#### ORA bubble plot — top pathways {.unnumbered}
+
+```{r allvsall-hsc-ora-bubble}
+ora_all_hsc <- bind_rows(hsc_ora_list)
+top_paths_hsc <- filter(ora_all_hsc, padj < PADJ_THRESH) %>%
+  group_by(geneset) %>%
+  slice_min(padj, n = N_TOP_SETS) %>%
+  ungroup() %>%
+  pull(pathway) %>%
+  unique()
+```
+
+```{r allvsall-hsc-ora-bubble-plot}
+#| fig.height: !expr min(7.5, max(3, 0.22 * length(top_paths_hsc) + 1.2))
+#| fig.width: !expr min(8.5, max(4, 1.1 * length(hsc_ora_list) + 2.5))
+if (length(top_paths_hsc) > 0) {
+  bubble_df_hsc <- ora_all_hsc %>%
+    filter(pathway %in% top_paths_hsc) %>%
+    mutate(
+      pathway         = stringr::str_trunc(abbreviate_pathway(pathway), 55),
+      fold_enrichment = log2(foldEnrichment),
+      overlap_ratio   = overlap / size,
+      sig             = padj < PADJ_THRESH
+    )
+
+  pathway_order_hsc <- ora_all_hsc %>%
+    filter(pathway %in% top_paths_hsc) %>%
+    mutate(pathway = stringr::str_trunc(abbreviate_pathway(pathway), 55)) %>%
+    group_by(pathway) %>%
+    summarise(min_padj = min(padj, na.rm = TRUE)) %>%
+    arrange(min_padj) %>%
+    pull(pathway)
+
+  ggplot(bubble_df_hsc,
+         aes(x = geneset, y = factor(pathway, levels = rev(pathway_order_hsc)))) +
+    geom_point(data = ~filter(.x, !sig),
+               aes(size = overlap_ratio),
+               shape = 21, fill = "grey88", colour = "white", stroke = 0.3, alpha = 0.5) +
+    geom_point(data = ~filter(.x, sig),
+               aes(size = overlap_ratio, fill = fold_enrichment),
+               colour = "black", shape = 21, stroke = 0.3, alpha = 0.9) +
+    scale_fill_gradientn(colours = c("white", "#fc8d59", "#d73027"),
+                         na.value = "grey90", name = "log2 fold\nenrichment") +
+    scale_size_continuous(name = "Overlap\nratio", range = c(1, 8)) +
+    labs(x = NULL, y = NULL,
+         title    = "HSC genesets — ORA bubble plot",
+         caption  = "Filled: padj < 0.05  |  Grey: not significant  |  Colour: log2 fold enrichment  |  Size: overlap/pathway size") +
+    theme_bw(base_size = 10) +
+    scale_x_discrete(position = "top") +
+    theme(axis.text.x  = element_text(angle = 40, hjust = 0),
+          axis.text.y  = element_text(size = 7),
+          panel.grid   = element_line(colour = "grey93"),
+          legend.position = "right")
+} else {
+  message("No significant pathways found across HSC genesets.")
+}
+```
+
+### Module score on UMAP {.unnumbered}
+
+```{r allvsall-hsc-module-score, eval=FALSE}
+#| fig.height: !expr 4 * length(hsc_genesets)
+#| fig.width: 16
+genesets <- allvsall_genesets_hsc$genesets
+mpn_processed_hsc <- Seurat::AddModuleScore(mpn_processed_hsc, features = allvsall_genesets_hsc$genesets)
+rename_map <- setNames(paste0("Cluster", seq_along(genesets)), names(genesets))
+mpn_processed_hsc@meta.data <- mpn_processed_hsc@meta.data %>% dplyr::rename(all_of(rename_map))
+FeaturePlot(mpn_processed_hsc, names(genesets)) & scale_color_viridis_c(option = "turbo")
+```
+
+```{r allvsall-hsc-gsea-cleanup, eval=FALSE}
+rm(scatter_df, hsc_genesets_df, hsc_genesets,
+   volcano_df, het_clust_genesets, het_clust_gs_list, het_clust_ora_list,
+   hsc_ora_list, ora_all_hsc); gc()
+```
+
+## MNC
+
+```{r allvsall-mnc-gsea-data}
+tar_load(scatter_df_mnc)
+tar_load(genesets_mnc)
+mnc_genesets_df <- genesets_mnc$genesets_df
+mnc_genesets    <- genesets_mnc$genesets
+rm(genesets_mnc)
+```
+
+### Geneset definition {.unnumbered}
+
+Same band logic as HSC: genes with |log FC| ≥ 1 in at least one comparison, split by position relative to y = x ± 1.
+
+```{r allvsall-mnc-geneset-scatter, fig.height=9, fig.width=9}
+df_label_gs_mnc <- mnc_genesets_df %>%
+  group_by(geneset) %>%
+  slice_max(sqrt(log_fc_neg^2 + log_fc_pos^2), n = 8) %>%
+  ungroup()
+
+ggplot(mapping = aes(x = log_fc_neg, y = log_fc_pos)) +
+  geom_point(data = scatter_df_mnc, aes(size = max_rate),
+             fill = "grey88", colour = "white", shape = 21, alpha = 0.4) +
+  geom_hline(yintercept = 0, colour = "grey50", linewidth = 0.6) +
+  geom_vline(xintercept = 0, colour = "grey50", linewidth = 0.6) +
+  geom_abline(slope = 1, intercept =  0, colour = "grey50", linewidth = 0.55,
+              linetype = "solid") +
+  geom_abline(slope = 1, intercept =  1, colour = "grey50", linewidth = 0.4,
+              linetype = "22") +
+  geom_abline(slope = 1, intercept = -1, colour = "grey50", linewidth = 0.4,
+              linetype = "22") +
+  geom_point(data = mnc_genesets_df, aes(fill = band, size = max_rate),
+             colour = "white", shape = 21, alpha = 0.7) +
+  ggrepel::geom_text_repel(
+    data         = df_label_gs_mnc,
+    aes(label    = feature, colour = band),
+    size         = 2.3, max.overlaps = 30, show.legend = FALSE,
+    segment.size = logfc_allvsall, segment.colour = "grey60"
+  ) +
+  scale_fill_manual(values = band_cols, name = "Gene group") +
+  scale_colour_manual(values = band_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = 0.2)) +
+  scale_y_continuous(expand = expansion(mult = 0.2)) +
+  scale_size_continuous(name = "Max expression\nrate", range = c(0.5, 4)) +
+  facet_wrap(~quadrant) +
+  labs(x = "log FC  (mCh− vs WT)", y = "log FC  (mCh⁺ vs WT)",
+       title = "MNC — geneset membership",
+       caption = "Grey: all significant genes  |  Coloured: |log FC| ≥ 1  |  Bands: y = x ± 1") +
+  scatter_theme + scatter_guides
+```
+
+```{r allvsall-mnc-geneset-summary-table}
+mnc_genesets_df %>%
+  group_by(geneset, quadrant, band) %>%
+  summarise(n_genes = n_distinct(feature), .groups = "drop") %>%
+  arrange(quadrant, band) %>%
+  DT::datatable(
+    caption  = "MNC genesets — summary",
+    rownames = FALSE,
+    filter   = "top",
+    options  = list(pageLength = 10, scrollX = TRUE)
+  )
+```
+
+```{r allvsall-mnc-geneset-membership-table}
+mnc_genesets_df %>%
+  arrange(geneset, feature) %>%
+  select(geneset, quadrant, band, feature) %>%
+  DT::datatable(
+    caption  = "MNC geneset membership — genes with |log FC| ≥ 1 in at least one comparison",
+    rownames = FALSE,
+    filter   = "top",
+    options  = list(pageLength = 10, scrollX = TRUE)
+  )
+```
+
+### Geneset over-representation analysis {.unnumbered}
+
+```{r allvsall-mnc-ora-run}
+tar_load(ora_results_mnc)
+mnc_ora_list <- ora_results_mnc
+rm(ora_results_mnc)
+```
+
+#### Significant pathways per geneset {.unnumbered}
+
+::: {.panel-tabset}
+
+```{r allvsall-mnc-ora-table, results="asis"}
+for (gs_name in names(mnc_ora_list)) {
+  cat("##", gs_name, "\n\n")
+  sig <- mnc_ora_list[[gs_name]] %>%
+    filter(padj < PADJ_THRESH) %>%
+    arrange(desc(foldEnrichment)) %>%
+    mutate(pathway          = abbreviate_pathway(pathway),
+           foldEnrichment   = round(foldEnrichment, 2),
+           overlap          = paste0(overlap, "/", size),
+           padj             = signif(padj, 3)) %>%
+    select(pathway, foldEnrichment, padj, overlap)
+  if (nrow(sig) == 0) { cat("No significant pathways.\n\n"); next }
+  print(htmltools::tagList(
+    DT::datatable(sig, rownames = FALSE, filter = "top",
+                  options = list(pageLength = 10, scrollX = TRUE))
+  ))
+  cat("\n\n")
+}
+```
+
+:::
+
+#### ORA bubble plot — top pathways {.unnumbered}
+
+```{r allvsall-mnc-ora-bubble}
+ora_all_mnc <- bind_rows(mnc_ora_list)
+top_paths_mnc <- filter(ora_all_mnc, padj < PADJ_THRESH) %>%
+  group_by(geneset) %>%
+  slice_min(padj, n = N_TOP_SETS) %>%
+  ungroup() %>%
+  pull(pathway) %>%
+  unique()
+```
+
+```{r allvsall-mnc-ora-bubble-plot}
+#| fig.height: !expr min(7.5, max(3, 0.22 * length(top_paths_mnc) + 1.2))
+#| fig.width: !expr min(8.5, max(4, 1.1 * length(mnc_ora_list) + 2.5))
+if (length(top_paths_mnc) > 0) {
+  bubble_df_mnc <- ora_all_mnc %>%
+    filter(pathway %in% top_paths_mnc) %>%
+    mutate(
+      pathway         = stringr::str_trunc(abbreviate_pathway(pathway), 55),
+      fold_enrichment = log2(foldEnrichment),
+      overlap_ratio   = overlap / size,
+      sig             = padj < PADJ_THRESH
+    )
+
+  pathway_order_mnc <- ora_all_mnc %>%
+    filter(pathway %in% top_paths_mnc) %>%
+    mutate(pathway = stringr::str_trunc(abbreviate_pathway(pathway), 55)) %>%
+    group_by(pathway) %>%
+    summarise(min_padj = min(padj, na.rm = TRUE)) %>%
+    arrange(min_padj) %>%
+    pull(pathway)
+
+  ggplot(bubble_df_mnc,
+         aes(x = geneset, y = factor(pathway, levels = rev(pathway_order_mnc)))) +
+    geom_point(data = ~filter(.x, !sig),
+               aes(size = overlap_ratio),
+               shape = 21, fill = "grey88", colour = "white", stroke = 0.3, alpha = 0.5) +
+    geom_point(data = ~filter(.x, sig),
+               aes(size = overlap_ratio, fill = fold_enrichment),
+               colour = "black", shape = 21, stroke = 0.3, alpha = 0.9) +
+    scale_fill_gradientn(colours = c("white", "#fc8d59", "#d73027"),
+                         na.value = "grey90", name = "log2 fold\nenrichment") +
+    scale_size_continuous(name = "Overlap\nratio", range = c(1, 8)) +
+    labs(x = NULL, y = NULL,
+         title    = "MNC genesets — ORA bubble plot",
+         caption  = "Filled: padj < 0.05  |  Grey: not significant  |  Colour: log2 fold enrichment  |  Size: overlap/pathway size") +
+    theme_bw(base_size = 10) +
+    scale_x_discrete(position = "top") +
+    theme(axis.text.x  = element_text(angle = 40, hjust = 0),
+          axis.text.y  = element_text(size = 7),
+          panel.grid   = element_line(colour = "grey93"),
+          legend.position = "right")
+} else {
+  message("No significant pathways found across MNC genesets.")
+}
+```
+
+### Module score on UMAP {.unnumbered}
+
+```{r allvsall-mnc-module-score, eval=FALSE}
+#| fig.height: !expr 4 * length(mnc_genesets)
+#| fig.width: 16
+tar_load(module_scores_mnc)
+score_features_mnc <- colnames(module_scores_mnc)[1]
+ms_long_mnc <- tidyr::pivot_longer(module_scores_mnc,
+                                   cols      = dplyr::all_of(score_features_mnc),
+                                   names_to  = "gene",
+                                   values_to = "expr")
+plot_feature_expr(ms_long_mnc, genes = score_features_mnc, title = "MNC — module scores")
+rm(module_scores_mnc, ms_long_mnc); gc()
+```
+
+```{r allvsall-mnc-biased-expr-plot, fig.height=30, fig.width=16, eval=FALSE}
+tar_load(biased_feature_expr_mnc)
+for (gs_name in unique(biased_feature_expr_mnc$geneset)) {
+  feats <- unique(biased_feature_expr_mnc$gene[biased_feature_expr_mnc$geneset == gs_name])
+  p <- plot_feature_expr(biased_feature_expr_mnc, genes = feats) +
+    patchwork::plot_annotation(title = gs_name,
+                               theme = theme(plot.title = element_text(size = 13, face = "bold")))
+  print(p)
+}
+rm(biased_feature_expr_mnc); gc()
+```
+
+```{r allvsall-mnc-gsea-cleanup, eval=FALSE}
+rm(scatter_df_mnc, mnc_genesets_df, mnc_genesets, mnc_ora_list, ora_all_mnc); gc()
+```
+
+## Stroma
+
+```{r allvsall-stroma-gsea-data}
+tar_load(genesets_stroma)
+stroma_genesets_df <- genesets_stroma$genesets_df
+stroma_genesets    <- genesets_stroma$genesets
+rm(genesets_stroma)
+```
+
+### Geneset definition {.unnumbered}
+
+Stroma has a single comparison (Het vs WT), so genesets are defined by direction and effect size: up- and down-regulated genes with |log FC| ≥ 1.
+
+```{r allvsall-stroma-geneset-summary-table}
+stroma_genesets_df %>%
+  group_by(geneset) %>%
+  summarise(n_genes = n_distinct(feature), .groups = "drop") %>%
+  arrange(geneset) %>%
+  DT::datatable(
+    caption  = "Stroma genesets — summary",
+    rownames = FALSE,
+    filter   = "top",
+    options  = list(pageLength = 10, scrollX = TRUE)
+  )
+```
+
+```{r allvsall-stroma-geneset-membership-table}
+stroma_genesets_df %>%
+  arrange(geneset, feature) %>%
+  select(geneset, feature) %>%
+  DT::datatable(
+    caption  = "Stroma geneset membership — significant genes with |log FC| ≥ 1 (Het vs WT)",
+    rownames = FALSE,
+    filter   = "top",
+    options  = list(pageLength = 10, scrollX = TRUE)
+  )
+```
+
+### Geneset over-representation analysis {.unnumbered}
+
+```{r allvsall-stroma-ora-run}
+tar_load(ora_results_stroma)
+stroma_ora_list <- ora_results_stroma
+rm(ora_results_stroma)
+```
+
+#### Significant pathways per geneset {.unnumbered}
+
+::: {.panel-tabset}
+
+```{r allvsall-stroma-ora-table, results="asis"}
+for (gs_name in names(stroma_ora_list)) {
+  cat("##", gs_name, "\n\n")
+  sig <- stroma_ora_list[[gs_name]] %>%
+    filter(padj < PADJ_THRESH) %>%
+    arrange(desc(foldEnrichment)) %>%
+    mutate(pathway        = abbreviate_pathway(pathway),
+           foldEnrichment = round(foldEnrichment, 2),
+           overlap        = paste0(overlap, "/", size),
+           padj           = signif(padj, 3)) %>%
+    select(pathway, foldEnrichment, padj, overlap)
+  if (nrow(sig) == 0) { cat("No significant pathways.\n\n"); next }
+  print(htmltools::tagList(
+    DT::datatable(sig, rownames = FALSE, filter = "top",
+                  options = list(pageLength = 10, scrollX = TRUE))
+  ))
+  cat("\n\n")
+}
+```
+
+:::
+
+#### ORA bubble plot — top pathways {.unnumbered}
+
+```{r allvsall-stroma-ora-bubble}
+ora_all_stroma <- bind_rows(stroma_ora_list)
+top_paths_stroma <- filter(ora_all_stroma, padj < PADJ_THRESH) %>%
+  group_by(geneset) %>%
+  slice_min(padj, n = N_TOP_SETS) %>%
+  ungroup() %>%
+  pull(pathway) %>%
+  unique()
+```
+
+```{r allvsall-stroma-ora-bubble-plot}
+#| fig.height: !expr min(7.5, max(3, 0.22 * length(top_paths_stroma) + 1.2))
+#| fig.width: !expr min(8.5, max(4, 1.1 * length(stroma_ora_list) + 2.5))
+if (length(top_paths_stroma) > 0) {
+  bubble_df_stroma <- ora_all_stroma %>%
+    filter(pathway %in% top_paths_stroma) %>%
+    mutate(
+      pathway         = stringr::str_trunc(abbreviate_pathway(pathway), 55),
+      fold_enrichment = log2(foldEnrichment),
+      overlap_ratio   = overlap / size,
+      sig             = padj < PADJ_THRESH
+    )
+
+  pathway_order_stroma <- ora_all_stroma %>%
+    filter(pathway %in% top_paths_stroma) %>%
+    mutate(pathway = stringr::str_trunc(abbreviate_pathway(pathway), 55)) %>%
+    group_by(pathway) %>%
+    summarise(min_padj = min(padj, na.rm = TRUE)) %>%
+    arrange(min_padj) %>%
+    pull(pathway)
+
+  ggplot(bubble_df_stroma,
+         aes(x = geneset, y = factor(pathway, levels = rev(pathway_order_stroma)))) +
+    geom_point(data = ~filter(.x, !sig),
+               aes(size = overlap_ratio),
+               shape = 21, fill = "grey88", colour = "white", stroke = 0.3, alpha = 0.5) +
+    geom_point(data = ~filter(.x, sig),
+               aes(size = overlap_ratio, fill = fold_enrichment),
+               colour = "black", shape = 21, stroke = 0.3, alpha = 0.9) +
+    scale_fill_gradientn(colours = c("white", "#fc8d59", "#d73027"),
+                         na.value = "grey90", name = "log2 fold\nenrichment") +
+    scale_size_continuous(name = "Overlap\nratio", range = c(1, 8)) +
+    labs(x = NULL, y = NULL,
+         title    = "Stroma genesets — ORA bubble plot",
+         caption  = "Filled: padj < 0.05  |  Grey: not significant  |  Colour: log2 fold enrichment  |  Size: overlap/pathway size") +
+    theme_bw(base_size = 10) +
+    scale_x_discrete(position = "top") +
+    theme(axis.text.x  = element_text(angle = 40, hjust = 0),
+          axis.text.y  = element_text(size = 7),
+          panel.grid   = element_line(colour = "grey93"),
+          legend.position = "right")
+} else {
+  message("No significant pathways found across Stroma genesets.")
+}
+```
+
+### Module score on UMAP {.unnumbered}
+
+```{r allvsall-stroma-module-score-plot, eval=FALSE}
+#| fig.height: !expr 4 * length(stroma_genesets)
+#| fig.width: 16
+tar_load(module_scores_stroma)
+score_features_stroma <- grep("^score_", colnames(module_scores_stroma), value = TRUE)
+ms_long_stroma <- tidyr::pivot_longer(module_scores_stroma,
+                                      cols      = dplyr::all_of(score_features_stroma),
+                                      names_to  = "gene",
+                                      values_to = "expr")
+plot_feature_expr(ms_long_stroma, genes = score_features_stroma, title = "Stroma — module scores")
+rm(module_scores_stroma, ms_long_stroma); gc()
+```
+
+```{r allvsall-stroma-biased-expr-plot, fig.height=30, fig.width=16, eval=FALSE}
+tar_load(biased_feature_expr_stroma)
+for (gs_name in unique(biased_feature_expr_stroma$geneset)) {
+  feats <- unique(biased_feature_expr_stroma$gene[biased_feature_expr_stroma$geneset == gs_name])
+  p <- plot_feature_expr(biased_feature_expr_stroma, genes = feats) +
+    patchwork::plot_annotation(title = gs_name,
+                               theme = theme(plot.title = element_text(size = 13, face = "bold")))
+  print(p)
+}
+rm(biased_feature_expr_stroma); gc()
+```
+
+```{r allvsall-stroma-gsea-cleanup, eval=FALSE}
+rm(stroma_genesets_df, stroma_genesets, stroma_ora_list, ora_all_stroma); gc()
+```
+
+:::

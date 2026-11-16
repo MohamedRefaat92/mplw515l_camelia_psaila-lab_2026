@@ -1,0 +1,216 @@
+---
+title: "2026_05_15"
+format: html
+editor: visual
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+```{r}
+targets::tar_load(mpn_processed_hsc_fullcc)
+srt_sub <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.0.9 %in% c("6"))
+```
+
+```{r}
+srt_sub   <-ScaleData(srt_sub,assay = "SCT")
+srt_sub   <-FindVariableFeatures(srt_sub,nfeatures = 100,)
+x <- mpn_processed_hsc_fullcc@neighbors$neighbors_pca.SCT_30@nn.idx[ all_cells %in% sub_cells, ]
+data <- GetAssayData(str_sub,assay = "SCT",layer = "data")
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(sample.name = srt_sub$sample.name,
+                                              clust = srt_sub$kNN_pca.SCT_30_res.2,
+                                              col = list(sample.name = setNames( c( "red", "green","blue"),unique(srt_sub$sample.name)),
+                                                         clust = setNames( paletteer::paletteer_d("Polychrome::glasbey",n = 16) %>% c(),levels(srt_sub$kNN_pca.SCT_30_res.2))))
+mat_data <- data[c(VariableFeatures(srt_sub),"Cd14"),] %>% as.matrix() %>% t() %>% scale() %>% t()
+mat_data[mat_data>2] <- 2
+mat_data[mat_data<-2] <- -2
+
+ComplexHeatmap::Heatmap(mat_data,
+                        show_column_names = FALSE,
+                        top_annotation = column_ha,
+                        clustering_distance_rows = "pearson")
+```
+
+```{r}
+mat_data_minmax <- apply(data[c(VariableFeatures(srt_sub),"Cd14"),],1, function(x){
+  (x-min(x))/(max(x)-min(x))
+  }) %>% t()
+ComplexHeatmap::Heatmap(mat_data_minmax,
+                        show_column_names = FALSE,
+                        top_annotation = column_ha,
+                        clustering_distance_rows = "pearson")
+```
+
+```{r}
+mat_data_qr <- apply(data[c(VariableFeatures(srt_sub),"Cd14"),],1, function(x){
+  (x - median(x))/IQR(x)
+  }) %>% t()
+ComplexHeatmap::Heatmap(mat_data_minmax,
+                        show_column_names = FALSE,
+                        top_annotation = column_ha,
+                        clustering_distance_rows = "pearson")
+```
+
+```{r}
+feat <- "Cd14"
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+    full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+    bind_rows(data.frame(sample.name = "random",value = gene_rnd_avg[feat,] )) %>% 
+    group_by(sample.name)%>%
+    summarize(k = psych::skew(value))
+
+
+```
+
+```{r}
+srt_sub   <-SCTransform(srt_sub,va)
+srt_sub   <-FindVariableFeatures(srt_sub,nfeatures = 2000,assay = "SCT")
+HVFInfo(srt_sub,assay = "SCT")
+
+data <- GetAssayData(str_sub,assay = "SCT",layer = "data")
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(sample.name = srt_sub$sample.name,
+                                              clust = srt_sub$kNN_pca.SCT_30_res.2,
+                                              col = list(sample.name = setNames( c( "red", "green","blue"),unique(srt_sub$sample.name)),
+                                                         clust = setNames( paletteer::paletteer_d("Polychrome::glasbey",n = 16) %>% c(),levels(srt_sub$kNN_pca.SCT_30_res.2))))
+mat_data <- data[VariableFeatures(srt_sub),] %>% as.matrix() %>% t() %>% scale() %>% t()
+mat_data[mat_data>3] <- 3
+mat_data[mat_data<-3] <- -3
+
+ComplexHeatmap::Heatmap(mat_data,
+                        show_column_names = FALSE,
+                        top_annotation = column_ha,
+                        clustering_distance_rows = "pearson",
+                        clustering_distance_columns = "pearson")
+```
+
+```{r}
+srt_sub   <-FindVariableFeatures(srt_sub,nfeatures = 100,assay = "SCT",selection.method = "mean.var.plot")
+VariableFeaturePlot(srt_sub)
+```
+
+```{r}
+srt_sub   <-SCTransform(srt_sub)
+srt_sub   <-FindVariableFeatures(srt_sub,nfeatures = 2000,assay = "SCT")
+srt_sub <- FindClusters(srt_sub,resolution = 2,graph.name =  "kNN_pca.SCT_30")
+data <- GetAssayData(srt_sub,assay = "SCT",layer = "data")
+
+column_ha = ComplexHeatmap::HeatmapAnnotation(sample.name = srt_sub$sample.name,
+                                              clust = srt_sub$kNN_pca.SCT_30_res.2,
+                                              col = list(sample.name = setNames( c( "red", "green","blue"),unique(srt_sub$sample.name)),
+                                                         clust = setNames( paletteer::paletteer_d("Polychrome::glasbey",n = 16) %>% c(),levels(srt_sub$kNN_pca.SCT_30_res.2))))
+mat_data <- data[VariableFeatures(srt_sub),] %>% as.matrix() %>% t() %>% scale() %>% t()
+mat_data[mat_data>2] <- 2
+mat_data[mat_data<-2] <- -2
+
+ht_opt$fast_hclust = TRUE
+
+cor_dist_row <- as.dist(1 - cor(t(mat_data)))         
+rows_hc <- fastcluster::hclust(cor_dist_row)
+
+cor_dist_col<- as.dist(1 - cor(mat_data))         
+col_hc <- fastcluster::hclust(cor_dist_col)
+
+ComplexHeatmap::Heatmap(mat_data,
+                        show_column_names = FALSE,
+                        top_annotation = column_ha,
+                        cluster_rows = rows_hc, 
+                        cluster_columns = col_hc,
+                        row_names_gp = gpar(fontsize = 1))
+```
+
+```{r}
+cc_cor <- cor(t(mat_data), cbind(srt_sub$S.Score, srt_sub$G2M.Score))
+```
+
+```{r remove-high-cc}
+srt_sub <- SCTransform(srt_sub)
+srt_sub <- FindVariableFeatures(srt_sub, nfeatures = 2000, assay = "SCT")
+srt_sub <- FindClusters(srt_sub, resolution = 2, graph.name = "kNN_pca.SCT_30")
+
+# ── Gene exclusion ────────────────────────────────────────────────────────────
+# 1. Genes correlated with cell-cycle scores — computed on the full object
+#    for robust estimates (more cells → better correlations)
+CC_COR_THRESH <- 0.5  
+
+full_data <- GetAssayData(mpn_processed_hsc_fullcc, assay = "SCT", layer = "data")
+cc_scores  <- mpn_processed_hsc_fullcc@meta.data[, c("S.Score", "G2M.Score")]
+
+# Compute gene × {S.Score, G2M.Score} correlations efficiently via crossprod
+common_cells <- intersect(colnames(full_data), rownames(cc_scores))
+expr_t        <- t(full_data[, common_cells])          # cells × genes (dense slice)
+cc_cor        <- cor(as.matrix(expr_t), as.matrix(cc_scores[common_cells, ]))
+
+cc_genes <- rownames(cc_cor)[apply(cc_cor, 1, max) >= CC_COR_THRESH]
+cat("CC-correlated genes excluded:", length(cc_genes), "\n")
+
+# 2. Pattern-based exclusions
+pattern_genes <- grep("^Hsp|^Hspa|^Hsph|^Rps|^Rpl|^Malat1",
+                      rownames(full_data), value = TRUE)
+cat("Pattern-excluded genes:", length(pattern_genes), "\n")
+
+exclude <- union(cc_genes, pattern_genes)
+
+# ── Filter HVGs ───────────────────────────────────────────────────────────────
+hvg_filtered <- setdiff(VariableFeatures(srt_sub), exclude)
+cat("HVGs remaining:", length(hvg_filtered), "of", length(VariableFeatures(srt_sub)), "\n")
+
+# ── Heatmap ───────────────────────────────────────────────────────────────────
+data <- GetAssayData(srt_sub, assay = "SCT", layer = "data")
+
+column_ha <- ComplexHeatmap::HeatmapAnnotation(
+  sample.name = srt_sub$sample.name,
+  clust       = srt_sub$kNN_pca.SCT_30_res.2,
+  col = list(
+    sample.name = setNames(c("red", "green", "blue"), unique(srt_sub$sample.name)),
+    clust       = setNames(
+      paletteer::paletteer_d("Polychrome::glasbey", n = 16) %>% c(),
+      levels(srt_sub$kNN_pca.SCT_30_res.2)
+    )
+  )
+)
+
+mat_data <- data[hvg_filtered, ] %>%
+  as.matrix() %>% t() %>% scale() %>% t()
+mat_data[mat_data >  2] <-  2
+mat_data[mat_data < -2] <- -2
+
+ht_opt$fast_hclust <- TRUE
+
+cor_dist_row <- as.dist(1 - cor(t(mat_data)))
+rows_hc      <- fastcluster::hclust(cor_dist_row)
+
+cor_dist_col <- as.dist(1 - cor(mat_data))
+col_hc       <- fastcluster::hclust(cor_dist_col)
+
+ComplexHeatmap::Heatmap(mat_data,
+                        show_column_names = FALSE,
+                        top_annotation    = column_ha,
+                        cluster_rows      = rows_hc,
+                        cluster_columns   = col_hc,
+                        row_names_gp      = gpar(fontsize = 6))
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Cd14","Csf3", "Sorcs1", "Ptgs2","Csf3r", "Meg3"),split.by = "sample.name",order = T)
+
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Chrm3"),split.by = "sample.name",order = T)
+```
+
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Chrm3"),split.by = "sample.name",order = T)
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Alcam", "Vcam1"),split.by = "sample.name",order = T)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Pde7b", "Nav3", "Pdgfc"),split.by = "sample.name",order = T)
+
+```

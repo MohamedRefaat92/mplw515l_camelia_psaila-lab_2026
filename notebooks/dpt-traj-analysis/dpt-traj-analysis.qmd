@@ -1,0 +1,640 @@
+---
+title: "DPT Trajectory — Gene Expression Heatmaps"
+subtitle: "Binned expression along cluster-sequence branches"
+date: today
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup, include=FALSE}
+library(targets)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(tibble)
+library(Matrix)
+library(Seurat)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(patchwork)
+library(grid)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+CLUS_COL <- "sNN_pca.SCT_30_res.1.5"   # Seurat cluster column (dot notation)
+
+# Each branch is defined by two parallel vectors:
+#   SEQUENCES[[i]]      — cluster IDs that form the trajectory
+#   SAMPLE_FILTERS[[i]] — sample.name values to include (NULL = all samples)
+SEQUENCES <- list(
+  c("5", "1"),
+  # c("5", "15", "1"),
+  c("2", "15", "1")
+)
+
+ALL_SAMPLES <- c("HSC_Het_CD41+mCh-", "HSC_Het_CD41+mCh+", "HSC_WT_CD41+")
+SAMPLE_FILTERS <- list(
+  "HSC_Het_CD41+mCh-",
+  # ALL_SAMPLES,
+  "HSC_Het_CD41+mCh+"
+)
+
+SEQ_LABELS <- sapply(SEQUENCES, paste, collapse = " → ")
+
+N_BINS            <- 20     # equal-width intervals in standardised DPT space
+N_TOP_GENES       <- 15     # top markers per cluster
+MIN_CELLS_PER_BIN <- 1L    # bins with fewer cells than this are dropped
+SCALE_METHOD      <- "zscore"  # "zscore" | "minmax"
+SCALE_JOINTLY     <- TRUE      # share scale statistics across branches
+
+COND_ORDER <- c("WT", "mCh-", "mCh+")
+COND_PAL   <- c(WT = "#1f78b4", "mCh-" = "#a6cee3", "mCh+" = "#e31a1c")
+ZSCORE_CLIP <- c(-2, 2)    # only applied when SCALE_METHOD == "zscore"
+
+HM_COL <- if (SCALE_METHOD == "zscore") {
+  colorRamp2(c(ZSCORE_CLIP[1], 0, ZSCORE_CLIP[2]), c("#2166ac", "white", "#b2182b"))
+} else {
+  colorRamp2(c(0, 1), c("white", "black"))
+}
+SCALE_NAME <- if (SCALE_METHOD == "zscore") "Z-score" else "Min-max"
+```
+
+---
+
+# 1 · Load data
+
+```{r load-dpt}
+dpt_df <- read_csv(file.path("output/objects/dpt/dpt_cell_table.csv"),
+                   show_col_types = FALSE) %>%
+  dplyr::rename(
+    cell_id = 1,
+    dpt     = dpt_pseudotime
+  ) %>%
+  mutate(
+    condition = factor(condition, levels = COND_ORDER)
+  )
+
+cat("DPT table:", nrow(dpt_df), "cells\n")
+```
+
+```{r load-markers}
+top_genes <- c("Mecom","Pf4", "Vwf","Itga2","Gata1", "Eda2r", "Cdkn1a", "Cdkn2a", "Ccng1", "Meis2")
+```
+
+```{r load-expr}
+tar_load(mpn_processed_hsc_fullcc)
+
+genes_avail <- intersect(top_genes, rownames(mpn_processed_hsc_fullcc))
+cat("Genes in Seurat:", length(genes_avail), "/", length(top_genes), "\n")
+
+expr_mat  <- GetAssayData(mpn_processed_hsc_fullcc, assay = "SCT", layer = "data")[genes_avail, ]
+top_genes <- intersect(top_genes, genes_avail)
+
+cat("Expression matrix:", nrow(expr_mat), "genes ×", ncol(expr_mat), "cells\n")
+
+# Cluster labels come from Seurat metadata, not the DPT CSV — independent of CLUS_COL
+cluster_df <- tibble(
+  cell_id = colnames(mpn_processed_hsc_fullcc),
+  cluster = as.character(mpn_processed_hsc_fullcc@meta.data[[CLUS_COL]])
+)
+dpt_df <- dpt_df %>%
+  left_join(cluster_df, by = "cell_id") %>%
+  filter(!is.na(cluster))
+rm(cluster_df); gc()
+
+cat("Clusters (", CLUS_COL, "):", paste(sort(unique(dpt_df$cluster)), collapse = ", "), "\n")
+```
+
+---
+
+# 2 · UMAP overview {.tabset}
+
+```{r umap-load}
+tar_load(anno_meta_hsc)
+umap_df <- anno_meta_hsc %>%
+  select(cell_id = 1, UMAP1, UMAP2,
+         cluster = all_of(CLUS_COL)) %>%
+  mutate(cluster = as.character(cluster))
+rm(anno_meta_hsc); gc()
+
+clust_pal <- setNames(
+  scales::hue_pal()(length(unique(umap_df$cluster))),
+  sort(unique(umap_df$cluster))
+)
+```
+
+::: {.panel-tabset}
+
+```{r umap-tabs, results="asis"}
+for (i in seq_along(SEQUENCES)) {
+  seq_i <- SEQUENCES[[i]]
+  cat(sprintf("\n### %s\n\n", SEQ_LABELS[i]))
+  p <- ggplot() +
+    geom_point(data = filter(umap_df, !cluster %in% seq_i),
+               aes(UMAP1, UMAP2), colour = "#e0e0e0", size = 0.2, alpha = 0.3) +
+    geom_point(data = filter(umap_df, cluster %in% seq_i),
+               aes(UMAP1, UMAP2, colour = cluster), size = 0.5, alpha = 0.8) +
+    scale_colour_manual(values = clust_pal[seq_i], name = "Cluster") +
+    guides(colour = guide_legend(override.aes = list(size = 4))) +
+    ggtitle(SEQ_LABELS[i]) +
+    theme_void(base_size = 11) +
+    theme(plot.title = element_text(hjust = 0.5))
+  print(p)
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+# 3 · Data functions
+
+Each function performs a single transformation and returns a plain data structure.
+No plotting. No global state.
+
+```{r data-functions}
+# ── filter_branch ─────────────────────────────────────────────────────────────
+# Subset cells belonging to the given cluster sequence and sample set, sorted
+# by DPT.
+# Input:  dpt_df   (full cell table with sample.name column)
+#         seqs     (character vector of cluster IDs)
+#         samples  (character vector of sample.name values; NULL = all samples)
+# Output: data.frame with columns cell_id, cluster, dpt, condition, sample.name
+filter_branch <- function(dpt_df, seqs, samples = NULL) {
+  df <- dpt_df %>% filter(cluster %in% seqs)
+  if (!is.null(samples)) df <- df %>% filter(sample_name %in% samples)
+  df %>% arrange(dpt)
+}
+
+# ── standardize_dpt ───────────────────────────────────────────────────────────
+# Min-max scale DPT to [0, 1] within a branch.
+# Input:  branch_df from filter_branch()
+# Output: branch_df + std_dpt column
+standardize_dpt <- function(branch_df) {
+  lo <- min(branch_df$dpt, na.rm = TRUE)
+  hi <- max(branch_df$dpt, na.rm = TRUE)
+  branch_df %>% mutate(std_dpt = (dpt - lo) / (hi - lo))
+}
+
+# ── assign_bins ───────────────────────────────────────────────────────────────
+# Cut std_dpt into n_bins equal-width intervals; collapse empty intervals and
+# intervals with fewer than min_cells cells.
+# bin_raw: 1..n_bins with gaps where intervals are empty or sparse
+# bin:     1..n_occupied (renumbered contiguous surviving intervals)
+# Input:  branch_df with std_dpt column (from standardize_dpt)
+# Output: branch_df + bin_raw + bin columns (rows in dropped bins are removed)
+assign_bins <- function(branch_df, n_bins, min_cells = 1L) {
+  branch_df %>%
+    arrange(std_dpt) %>%
+    mutate(
+      bin_raw = as.integer(cut(std_dpt, breaks = n_bins,
+                               include.lowest = TRUE, labels = FALSE))
+    ) %>%
+    filter(!is.na(bin_raw)) %>%
+    group_by(bin_raw) %>%
+    filter(n() >= min_cells) %>%
+    ungroup() %>%
+    mutate(
+      bin = rep(seq_along(rle(bin_raw)$values), rle(bin_raw)$lengths)
+    )
+}
+
+# ── compute_bin_expr ──────────────────────────────────────────────────────────
+# Average expression per occupied bin.
+# Input:  binned (from assign_bins), expr_mat (genes × cells), genes (character)
+# Output: genes × n_occupied dense matrix of mean expression
+compute_bin_expr <- function(binned, expr_mat, genes) {
+  n_occ   <- max(binned$bin)
+  shared  <- intersect(binned$cell_id, colnames(expr_mat))
+  bin_vec <- setNames(binned$bin[match(shared, binned$cell_id)], shared)
+  sub_mat <- as.matrix(expr_mat[genes, shared, drop = FALSE])
+
+  mat <- do.call(cbind, lapply(seq_len(n_occ), function(b) {
+    cols <- names(bin_vec)[bin_vec == b]
+    if (!length(cols)) return(rep(NA_real_, length(genes)))
+    rowMeans(sub_mat[, cols, drop = FALSE], na.rm = TRUE)
+  }))
+  rownames(mat) <- genes
+  colnames(mat) <- as.character(seq_len(n_occ))
+  mat
+}
+
+# ── minmax_rows ───────────────────────────────────────────────────────────────
+# Min-max scale each gene (row) to [0, 1] across bins.
+# lo / hi: optional precomputed per-gene min/max (for joint scaling across branches).
+# Input:  genes × bins matrix (from compute_bin_expr)
+# Output: genes × bins matrix scaled to [0, 1]
+minmax_rows <- function(mat, lo = NULL, hi = NULL) {
+  out <- t(sapply(seq_len(nrow(mat)), function(i) {
+    x  <- mat[i, ]
+    mn <- if (is.null(lo)) min(x, na.rm = TRUE) else lo[i]
+    mx <- if (is.null(hi)) max(x, na.rm = TRUE) else hi[i]
+    if (is.na(mx - mn) || mx == mn) return(rep(0, length(x)))
+    (x - mn) / (mx - mn)
+  }))
+  rownames(out) <- rownames(mat)
+  colnames(out) <- colnames(mat)
+  out
+}
+
+# ── zscore_rows ───────────────────────────────────────────────────────────────
+# Z-score each gene (row) across bins with optional clipping.
+# mu / sd_vec: optional precomputed per-gene statistics (length == nrow(mat)).
+#   NULL (default) → compute from mat itself (per-branch mode).
+#   Providing external mu/sd_vec enables joint scaling across branches.
+# clip: length-2 numeric c(lo, hi); use c(-Inf, Inf) to skip clipping.
+# Input:  genes × bins matrix (from compute_bin_expr)
+# Output: genes × bins matrix of z-scores
+zscore_rows <- function(mat, mu = NULL, sd_vec = NULL,
+                        clip = c(-Inf, Inf)) {
+  out <- t(sapply(seq_len(nrow(mat)), function(i) {
+    x <- mat[i, ]
+    m <- if (is.null(mu))     mean(x, na.rm = TRUE) else mu[i]
+    s <- if (is.null(sd_vec)) sd(x,   na.rm = TRUE) else sd_vec[i]
+    z <- if (is.na(s) || s == 0) x - m else (x - m) / s
+    pmax(pmin(z, clip[2]), clip[1])
+  }))
+  rownames(out) <- rownames(mat)
+  colnames(out) <- colnames(mat)
+  out
+}
+
+# ── compute_bin_std_dpt ───────────────────────────────────────────────────────
+# Mean standardised DPT per occupied bin (for bottom barplot annotation).
+# Input:  binned from assign_bins()
+# Output: numeric vector length n_occupied in [0, 1]
+compute_bin_std_dpt <- function(binned) {
+  n_occ <- max(binned$bin)
+  vapply(seq_len(n_occ), function(b) {
+    mean(binned$std_dpt[binned$bin == b], na.rm = TRUE)
+  }, numeric(1L))
+}
+
+# ── compute_bin_cluster ───────────────────────────────────────────────────────
+# Dominant (modal) cluster per occupied bin.
+# Input:  binned from assign_bins()
+# Output: character vector length n_occupied
+compute_bin_cluster <- function(binned) {
+  n_occ <- max(binned$bin)
+  vapply(seq_len(n_occ), function(b) {
+    cells_b <- binned$cluster[binned$bin == b]
+    tbl <- sort(table(cells_b), decreasing = TRUE)
+    names(tbl)[1L]
+  }, character(1L))
+}
+
+# ── compute_bin_stats ─────────────────────────────────────────────────────────
+# Cell counts and condition proportions per occupied bin.
+# Input:  binned (from assign_bins), cond_order (character vector)
+# Output: list(n_cells, cond_prop, n_occupied)
+#   n_cells   — integer vector length n_occupied
+#   cond_prop — n_occupied × n_conditions matrix of proportions
+#   n_occupied — scalar
+compute_bin_stats <- function(binned, cond_order) {
+  n_occ <- max(binned$bin)
+
+  long <- binned %>%
+    count(bin, condition, .drop = FALSE) %>%
+    group_by(bin) %>%
+    mutate(n_total = sum(n), prop = n / n_total) %>%
+    ungroup() %>%
+    complete(bin       = seq_len(n_occ),
+             condition = factor(cond_order, levels = cond_order),
+             fill      = list(prop = 0, n_total = 0)) %>%
+    arrange(bin)
+
+  n_cells <- long %>%
+    distinct(bin, n_total) %>%
+    arrange(bin) %>%
+    pull(n_total)
+
+  cond_prop <- long %>%
+    pivot_wider(id_cols = bin, names_from = condition,
+                values_from = prop, values_fill = 0) %>%
+    select(all_of(cond_order)) %>%
+    as.matrix()
+
+  list(n_cells = n_cells, cond_prop = cond_prop, n_occupied = n_occ)
+}
+```
+
+---
+
+# 4 · Plot functions
+
+```{r plot-functions}
+# ── plot_dpt_diagnostics ──────────────────────────────────────────────────────
+# Visualise the three stages of the binning pipeline on the UMAP of branch
+# cells, one row per branch, three panels per row:
+#   (1) raw DPT   (2) standardised DPT [0, 1]   (3) discrete occupied bins
+# Non-branch cells are shown as a grey background for spatial context.
+#
+# Input:  binned_list — list of data.frames from assign_bins()
+#         umap_df     — data.frame with columns cell_id, UMAP1, UMAP2
+#         seq_labels  — character vector of branch names
+# Output: patchwork (n_branches rows × 3 columns)
+plot_dpt_diagnostics <- function(binned_list, umap_df, seq_labels) {
+  base_theme <- theme_void(base_size = 9) +
+    theme(
+      plot.title      = element_text(size = 8, hjust = 0.5, colour = "grey30"),
+      legend.title    = element_text(size = 7),
+      legend.text     = element_text(size = 6),
+      legend.key.size = unit(3, "mm"),
+      plot.margin     = margin(2, 2, 2, 2)
+    )
+
+  rows <- lapply(seq_along(binned_list), function(i) {
+    df    <- binned_list[[i]]
+    lbl   <- seq_labels[i]
+    n_occ <- max(df$bin)
+    n_raw <- max(df$bin_raw)
+
+    # join pseudotime values onto UMAP coordinates
+    joined <- umap_df %>%
+      left_join(select(df, cell_id, dpt, std_dpt, bin), by = "cell_id")
+    bg <- filter(joined, is.na(bin))
+    fg <- filter(joined, !is.na(bin))
+
+    p1 <- ggplot() +
+      geom_point(data = bg, aes(UMAP1, UMAP2),
+                 colour = "#d8d8d8", size = 0.15, alpha = 0.4) +
+      geom_point(data = fg, aes(UMAP1, UMAP2, colour = dpt),
+                 size = 0.4, alpha = 0.8) +
+      scale_colour_viridis_c(name = "Raw DPT", option = "plasma") +
+      labs(title = "Raw DPT") +
+      base_theme
+
+    p2 <- ggplot() +
+      geom_point(data = bg, aes(UMAP1, UMAP2),
+                 colour = "#d8d8d8", size = 0.15, alpha = 0.4) +
+      geom_point(data = fg, aes(UMAP1, UMAP2, colour = std_dpt),
+                 size = 0.4, alpha = 0.8) +
+      scale_colour_viridis_c(name = "Std DPT\n[0, 1]", option = "plasma",
+                              limits = c(0, 1)) +
+      labs(title = "Standardised DPT") +
+      base_theme
+
+    cycle_pal <- c("1" = "#e41a1c", "2" = "#377eb8", "3" = "#4daf4a")
+    fg_p3     <- fg %>% mutate(bin_cycle = factor(((bin - 1L) %% 3L) + 1L))
+
+    p3 <- ggplot() +
+      geom_point(data = bg, aes(UMAP1, UMAP2),
+                 colour = "#d8d8d8", size = 0.15, alpha = 0.4) +
+      geom_point(data = fg_p3, aes(UMAP1, UMAP2, colour = bin_cycle),
+                 size = 0.4, alpha = 0.8) +
+      scale_colour_manual(values = cycle_pal, guide = "none") +
+      labs(title = sprintf("Discrete bins (%d/%d)", n_occ, n_raw)) +
+      base_theme
+
+    (p1 | p2 | p3) +
+      plot_annotation(
+        title = lbl,
+        theme = theme(plot.title = element_text(face = "bold", size = 10,
+                                                 hjust = 0, margin = margin(b = 4)))
+      )
+  })
+
+  wrap_plots(rows, ncol = 1)
+}
+
+# ── make_branch_hm ────────────────────────────────────────────────────────────
+# Build one ComplexHeatmap panel for a single branch.
+# All data is pre-computed. This function only handles layout and rendering.
+#
+# bin_z      — genes × n_occupied z-score matrix (from zscore_rows)
+# bin_stats  — list from compute_bin_stats()
+# top_genes  — data.frame with columns $gene and $marker_cluster
+# label      — column title string
+# row_dend   — shared hclust / dendrogram for consistent gene ordering
+# show_row_names — show gene labels (right side; TRUE on last panel)
+# show_row_annot — show Cluster colour sidebar (TRUE on first panel)
+# show_legend    — show Z-score legend (TRUE on first panel)
+make_branch_hm <- function(bin_z, bin_stats, bin_cluster, bin_std_dpt,
+                            top_genes, label,
+                            cond_pal, cond_order, hm_col, clust_pal,
+                            scale_name  = "Z-score",
+                            show_legend = FALSE) {
+
+  n_cells   <- bin_stats$n_cells
+  cond_prop <- bin_stats$cond_prop
+
+  ha_top <- HeatmapAnnotation(
+    Cluster = bin_cluster,
+    col     = list(Cluster = clust_pal[sort(unique(bin_cluster))]),
+    show_legend          = show_legend,
+    simple_anno_size     = unit(4, "mm"),
+    `n cells` = anno_barplot(
+      n_cells,
+      gp         = gpar(fill = "grey35", col = NA),
+      height     = unit(1.8, "cm"),
+      axis_param = list(gp = gpar(fontsize = 6))
+    ),
+    Condition = anno_barplot(
+      cond_prop,
+      gp         = gpar(fill = cond_pal[cond_order], col = NA),
+      height     = unit(4, "mm"),
+      bar_width  = 1,
+      axis_param = list(gp = gpar(fontsize = 6))
+    ),
+    annotation_name_gp   = gpar(fontsize = 7),
+    annotation_name_side = "left"
+  )
+
+  bot_ha <- HeatmapAnnotation(
+    `Std DPT` = bin_std_dpt,
+    col       = list(`Std DPT` = colorRamp2(c(0, 0.5, 1),
+                                             c("#440154", "#21908c", "#fde725"))),
+    show_legend          = show_legend,
+    simple_anno_size     = unit(4, "mm"),
+    annotation_name_gp   = gpar(fontsize = 7),
+    annotation_name_side = "left"
+  )
+
+  Heatmap(
+    bin_z,
+    name                = scale_name,
+    col                 = hm_col,
+    cluster_columns     = FALSE,
+    cluster_rows        = FALSE,
+    show_row_dend       = FALSE,
+    show_row_names      = TRUE,
+    row_names_side      = "right",
+    row_names_gp        = gpar(fontsize = 10),
+    show_column_names   = TRUE,
+    column_names_rot    = 90,
+    column_names_gp     = gpar(fontsize = 5),
+    column_title        = label,
+    column_title_gp     = gpar(fontsize = 10, fontface = "bold"),
+    top_annotation      = ha_top,
+    bottom_annotation   = bot_ha,
+    show_heatmap_legend = show_legend,
+    border              = TRUE,
+    use_raster          = FALSE
+  )
+}
+```
+
+---
+
+# 5 · Process branches
+
+Each transformation step is run independently and stored so intermediate results
+are accessible for inspection or re-use.
+
+```{r process-branches}
+genes <- top_genes
+
+# Step 1 — filter: cells belonging to each branch (cluster sequence × sample set)
+branch_list <- lapply(seq_along(SEQUENCES), function(i) {
+  filter_branch(dpt_df, SEQUENCES[[i]], SAMPLE_FILTERS[[i]])
+})
+names(branch_list) <- SEQ_LABELS
+
+# Step 2 — standardise DPT to [0, 1] per branch
+branch_std_list <- lapply(branch_list, standardize_dpt)
+
+# Step 3 — assign discrete bins (collapse empty / sparse intervals)
+binned_list <- lapply(branch_std_list, assign_bins,
+                      n_bins = N_BINS, min_cells = MIN_CELLS_PER_BIN)
+
+# Step 4 — mean expression per bin
+bin_expr_list <- lapply(binned_list, compute_bin_expr,
+                        expr_mat = expr_mat, genes = genes)
+
+# Step 5 — scale across bins per gene (SCALE_METHOD: "zscore" | "minmax")
+if (SCALE_METHOD == "zscore") {
+  if (SCALE_JOINTLY) {
+    pool    <- do.call(cbind, bin_expr_list)
+    jt_mu   <- rowMeans(pool, na.rm = TRUE)
+    jt_sd   <- apply(pool, 1, sd, na.rm = TRUE)
+    bin_z_list <- lapply(bin_expr_list, zscore_rows,
+                         mu = jt_mu, sd_vec = jt_sd, clip = ZSCORE_CLIP)
+  } else {
+    bin_z_list <- lapply(bin_expr_list, zscore_rows, clip = ZSCORE_CLIP)
+  }
+} else {
+  if (SCALE_JOINTLY) {
+    pool   <- do.call(cbind, bin_expr_list)
+    jt_lo  <- apply(pool, 1, min, na.rm = TRUE)
+    jt_hi  <- apply(pool, 1, max, na.rm = TRUE)
+    bin_z_list <- lapply(bin_expr_list, minmax_rows, lo = jt_lo, hi = jt_hi)
+  } else {
+    bin_z_list <- lapply(bin_expr_list, minmax_rows)
+  }
+}
+
+# Step 6 — per-bin cell counts and condition proportions
+bin_stats_list <- lapply(binned_list, compute_bin_stats, cond_order = COND_ORDER)
+
+# Step 7 — dominant cluster per occupied bin (for top annotation colour bar)
+bin_cluster_list <- lapply(binned_list, compute_bin_cluster)
+
+# Step 8 — mean std_dpt per occupied bin (for bottom barplot annotation)
+bin_std_dpt_list <- lapply(binned_list, compute_bin_std_dpt)
+
+# Summary report
+for (i in seq_along(SEQUENCES)) {
+  s <- bin_stats_list[[i]]
+  cat(sprintf(
+    "%s: %d cells  |  %d / %d bins occupied  |  cells/bin [%d, %d]\n",
+    SEQ_LABELS[i], sum(s$n_cells),
+    s$n_occupied, N_BINS,
+    min(s$n_cells), max(s$n_cells)
+  ))
+}
+```
+
+---
+
+# 6 · Binning diagnostics
+
+Each row is one branch. The three UMAP panels show:
+
+1. **Raw DPT** — original pseudotime values from DPT; cells near the root
+   cluster at low values, late-trajectory cells are sparse at high values.
+2. **Standardised DPT [0, 1]** — per-branch min-max normalisation; the colour
+   scale now spans the full trajectory regardless of absolute DPT magnitude.
+3. **Discrete bins** — the `r N_BINS` equal-width intervals after collapsing
+   empty ones; each colour is one occupied bin, showing how bins map to UMAP
+   space.
+
+Non-branch cells shown in grey for spatial context.
+
+```{r dpt-diagnostics, fig.width=13, fig.height=13}
+plot_dpt_diagnostics(binned_list, umap_df, SEQ_LABELS)
+```
+
+---
+
+# 7 · Expression heatmaps
+
+Each column = one occupied bin (same width in standardised pseudotime space).
+Column height in the *n cells* bar varies — tall = many cells at that stage.
+Rows are genes clustered by the shared dendrogram from branch `r SEQ_LABELS[1]`.
+
+```{r heatmaps, fig.width=20, fig.height=13}
+n_seq   <- length(SEQUENCES)
+hm_list <- lapply(seq_along(SEQUENCES), function(i) {
+  make_branch_hm(
+    bin_z        = bin_z_list[[i]],
+    bin_stats    = bin_stats_list[[i]],
+    bin_cluster  = bin_cluster_list[[i]],
+    bin_std_dpt  = bin_std_dpt_list[[i]],
+    top_genes    = top_genes,
+    label        = SEQ_LABELS[i],
+    scale_name   = SCALE_NAME,
+    cond_pal     = COND_PAL,
+    cond_order   = COND_ORDER,
+    hm_col       = HM_COL,
+    clust_pal   = clust_pal,
+    show_legend = (i == 1L)
+  )
+})
+
+draw(
+  Reduce("+", hm_list),
+  column_title     = "DPT trajectory — binned gene expression",
+  column_title_gp  = gpar(fontsize = 13, fontface = "bold"),
+  merge_legends    = TRUE,
+  padding          = unit(c(4, 4, 4, 4), "mm")
+)
+```
+
+---
+
+# 8 · Per-sequence cell counts
+
+```{r summary-tables, results="asis"}
+for (i in seq_along(SEQUENCES)) {
+  cat(sprintf("\n## Sequence %d: %s\n\n", i, SEQ_LABELS[i]))
+  s   <- bin_stats_list[[i]]
+  tbl <- tibble(
+    Bin       = seq_along(s$n_cells),
+    `n cells` = s$n_cells
+  ) %>%
+    bind_cols(as_tibble(s$cond_prop)) %>%
+    mutate(across(any_of(COND_ORDER), ~ scales::percent(.x, accuracy = 0.1)))
+
+  print(knitr::kable(tbl, caption = SEQ_LABELS[i]))
+  cat("\n\n")
+}
+```
+
+{{< include ../_session-info.qmd >}}

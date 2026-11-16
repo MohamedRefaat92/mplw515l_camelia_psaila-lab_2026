@@ -1,0 +1,136 @@
+---
+title: "2026_05_17"
+format: html
+editor: visual
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(miloR)
+
+```
+
+```{r}
+targets::tar_load(mpn_processed_hsc_fullcc)
+```
+
+```{r}
+srt_sub <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.0.9 %in% c("6"))
+grp_vec <-  srt_sub@meta.data %>% with(setNames(rownames(.), sample.name))
+grp_list <- srt_sub@meta.data %>% with(split(rownames(.), sample.name))
+data <- GetAssayData(srt_sub,assay = "SCT",layer = "data")
+all_cells <- colnames(mpn_processed_hsc_fullcc)
+gene_data <- GetAssayData(srt_sub,assay = "SCT",layer = "data")["Cd14",] %>% sort
+cell_sample <- srt_sub@meta.data %>% with(set_names(sample.name, rownames(.)))
+sub_cells <- colnames(srt_sub)
+sub_graph <- mpn_processed_hsc_fullcc@neighbors$neighbors_pca.SCT_30@nn.idx[ all_cells %in% sub_cells, ]
+
+gene_ng_avg <- apply(sub_graph, 1, function(ng){
+  cells <- all_cells[ng]
+  cells <- cells[cells %in% colnames(data)]
+  Matrix::rowMeans(data[,cells])
+})
+colnames(gene_ng_avg) <- all_cells[ all_cells %in% sub_cells]
+
+gene_rnd_avg <- apply(sub_graph, 1, function(ng){
+    cells <- all_cells[ng]
+    cells <- cells[cells %in% colnames(data)]
+    s <- sample(sub_cells, length(cells))
+    Matrix::rowMeans(data[,s])
+})
+gene_grp_avg <- apply(sub_graph, 1, function(ng){
+    cells <- all_cells[ng]
+    cells <- cells[cells %in% colnames(data)]
+    s <- sample(sub_cells, length(cells))
+    mean(cell_sample[s] == "HSC_WT_CD41+")
+})
+
+feat <- "Cd14"
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+  full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+  bind_rows(data.frame(sample.name = "random",value = gene_rnd_avg[feat,] )) %>% 
+  ggplot(aes(sample.name, value))+
+  geom_boxplot()
+
+```
+
+Compute pure neighborhood average
+
+```{r}
+gene_ng_pure_avg <- apply(sub_graph, 1, function(ng){
+  cells <- all_cells[ng]
+  grp <- grp_vec[cells[1]]
+  cells <- cells[cells %in% grp_list[[grp]]]
+  Matrix::rowMeans(data[,cells])
+})
+colnames(gene_ng_avg) <- all_cells[ all_cells %in% sub_cells]
+
+feat <- "Cd14"
+enframe(gene_ng_pure_avg[feat,],name = "cell_id") %>% 
+  full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+  bind_rows(data.frame(sample.name = "random",value = gene_rnd_avg[feat,] )) %>% 
+  ggplot(aes(sample.name, value))+
+  geom_boxplot()
+
+```
+
+Bi-modality testing
+
+```{r}
+install.packages("diptest")
+install.packages("BimodalIndex")
+```
+
+```{r}
+feat <- "Cd14"
+
+enframe(gene_ng_avg[feat,],name = "cell_id") %>% 
+    full_join(srt_sub@meta.data %>% rownames_to_column("cell_id")) %>% 
+  with(split(value,sample.name))%>%
+  lapply( diptest::dip.test)
+
+
+sample_list <- split(names(cell_sample), cell_sample)
+
+lapply(sample_list, function(cells){
+  BimodalIndex::bimodalIndex(gene_ng_avg[feat,cells,drop = FALSE])
+
+})
+
+```
+
+Differential expression analysis on the neighbourhood graph
+
+```{r}
+devtools::install_github("MarioniLab/miloDE") 
+library(miloDE)
+```
+
+```{r}
+hood_annot <-     miloR::annotateNhoods(milo_hsc_obj,
+                                        da.res = milo_hsc_da$mChPos_vs_WT$da_results,
+                                        coldata_col = "sNN_pca.SCT_30_res.0.9")
+```
+
+```         
+```
+
+```{r}
+de_stat = de_test_neighbourhoods(milo_hsc_obj[1:10,] , 
+                                 sample_id = "dm2_class", 
+                                 design = ~sample.name,
+                                 covariates = c("sample.name"))
+
+
+```
+
+```{r}
+srt_sub <- FindVariableFeatures(srt_sub) %>%
+       ScaleData() %>%
+       RunPCA() %>%
+       FindNeighbors(dims = 1:20) %>%
+       FindClusters(resolution = 0.4) %>%
+       RunUMAP(dims = 1:20, min.dist = 0.05, n.neighbors = 15)
+```
+

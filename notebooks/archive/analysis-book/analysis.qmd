@@ -1,0 +1,128 @@
+---
+title: "Full Cohort"
+---
+
+```{r setup}
+#| include: false
+library(dplyr)
+library(knitr)
+library(DT)
+library(yaml)
+
+cfg        <- yaml::read_yaml(file.path("metadata/project_config.yaml"))
+output_dir <- file.path(getwd(), cfg$paths$output_dir, cfg$paths$run_label)
+subset_label <- "Full cohort"
+source(file.path("analysis/_chapter_template.R"))
+```
+
+---
+
+# Data Loading
+
+Raw 10x CellRanger output read and merged into a single object.
+Cell counts before any quality filtering.
+
+```{r raw-cell-table}
+raw_summary <- read.csv(chapter_table("raw_cell_summary.csv"),
+                        stringsAsFactors = FALSE)
+total_row <- data.frame(
+  sample  = "**Total**",
+  n_cells = sum(raw_summary$n_cells),
+  n_genes = raw_summary$n_genes[1]
+)
+DT::datatable(
+  rbind(raw_summary, total_row),
+  caption  = "Raw cell and gene counts per sample (pre-QC)",
+  rownames = FALSE,
+  colnames = c("Sample", "Cells (raw)", "Genes in matrix"),
+  options  = list(pageLength = 12, dom = "t")
+)
+```
+
+---
+
+# QC Metrics
+
+## Violin plots (pre-filter)
+
+```{r qc-violin}
+#| fig-cap: "QC distributions per sample before filtering."
+#| out-width: "100%"
+knitr::include_graphics(chapter_figure("qc_violin_prefilter.png"))
+```
+
+## Per-sample summary statistics
+
+```{r qc-stats-table}
+qc_stats <- read.csv(chapter_table("qc_stats_summary.csv"),
+                     stringsAsFactors = FALSE)
+DT::datatable(
+  qc_stats,
+  caption  = "Median (IQR) of QC metrics per sample, pre-filter",
+  rownames = FALSE,
+  options  = list(pageLength = 10, scrollX = TRUE, dom = "t")
+) |> DT::formatRound(columns = 2:ncol(qc_stats), digits = 2)
+```
+
+---
+
+# Filtering
+
+## Thresholds applied
+
+Cells were retained if they satisfied **all** of the following:
+
+- `percent.mt` ≤ `r cfg$qc$mito_percent_max`%
+- `nFeature_RNA` ∈ [`r cfg$qc$nFeature_min`, `r cfg$qc$nFeature_max`]
+- `percent.rp` ∈ [`r cfg$qc$ribo_percent_min`%, `r cfg$qc$ribo_percent_max`%]
+- `percent.hb` ≤ `r cfg$qc$hb_percent_max`%
+
+Genes expressed in fewer than `r cfg$qc$min_cells_per_gene` cells were removed.
+
+HTO classes removed (deMULTIplex2): **`r if (length(unlist(cfg$qc$remove_hto_classes)) > 0) paste(unlist(cfg$qc$remove_hto_classes), collapse = ", ") else "none"`**.
+
+scDblFinder doublets: **`r if (cfg$qc$remove_doublets) "removed" else "retained"`**.
+
+## Cell counts before and after filtering
+
+```{r filtering-table}
+qc_sum <- read.csv(chapter_table("qc_summary.csv"),
+                   stringsAsFactors = FALSE)
+qc_sum$pct_retained <- round(100 * qc_sum$cells_after / qc_sum$cells_before, 1)
+totals <- data.frame(
+  sample        = "**Total**",
+  cells_before  = sum(qc_sum$cells_before),
+  cells_after   = sum(qc_sum$cells_after),
+  cells_removed = sum(qc_sum$cells_removed),
+  pct_retained  = round(100 * sum(qc_sum$cells_after) / sum(qc_sum$cells_before), 1)
+)
+DT::datatable(
+  rbind(qc_sum, totals),
+  caption  = "Cell counts before and after QC filtering",
+  rownames = FALSE,
+  colnames = c("Sample", "Cells (raw)", "Cells (filtered)", "Removed", "% retained"),
+  options  = list(pageLength = 12, dom = "t")
+)
+```
+
+## Doublet detection
+
+```{r doublet-table}
+doublet_sum <- read.csv(chapter_table("doublet_summary.csv"),
+                        stringsAsFactors = FALSE)
+DT::datatable(
+  doublet_sum,
+  caption  = "Doublet calls per sample (scDblFinder, post-QC cells)",
+  rownames = FALSE,
+  colnames = c("Sample", "Singlets", "Doublets", "Doublet rate (%)"),
+  options  = list(pageLength = 12, dom = "t")
+) |> DT::formatRound(columns = "doublet_rate_pct", digits = 2)
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

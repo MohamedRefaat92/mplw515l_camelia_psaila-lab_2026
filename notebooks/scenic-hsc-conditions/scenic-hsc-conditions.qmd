@@ -1,0 +1,510 @@
+---
+title: "SCENIC — HSC Per-condition regulon comparison"
+subtitle: "pySCENIC run independently per condition · HSC compartment · mm10"
+date: today
+format:
+  html:
+    embed-resources: true
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-float: true
+    code-fold: true
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup, include=FALSE}
+library(targets)
+library(tidyverse)
+library(ComplexHeatmap)
+library(circlize)
+library(patchwork)
+library(DT)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+SUFFIXES    <- c("full", "mch_neg", "mch_pos", "wt_ctrl")
+COND_LABELS <- c(full = "Full cohort", mch_neg = "Het mCh−", mch_pos = "Het mCh+", wt_ctrl = "WT")
+COND_PAL    <- c(WT = "#1f78b4", "mCh-" = "#a6cee3", "mCh+" = "#e31a1c")
+COND_ORDER  <- c("WT", "mCh-", "mCh+")
+```
+
+```{r load}
+tar_load(scenic_agg_column)
+tar_load(scenic_meta_hsc)
+
+# Per-condition AUC matrices (cells × regulons — condition-specific cells & regulons)
+tar_load(scenic_auc_mat_hsc_full)
+tar_load(scenic_auc_mat_hsc_mch_neg)
+tar_load(scenic_auc_mat_hsc_mch_pos)
+tar_load(scenic_auc_mat_hsc_wt_ctrl)
+
+# Per-condition clean regulon tables (TF, target, weight)
+tar_load(scenic_reg_tidy_hsc_full)
+tar_load(scenic_reg_tidy_hsc_mch_neg)
+tar_load(scenic_reg_tidy_hsc_mch_pos)
+tar_load(scenic_reg_tidy_hsc_wt_ctrl)
+
+# Full-cohort aggregation targets (for shared-regulon heatmap in section 4)
+tar_load(scenic_agg_hsc_full)
+tar_load(scenic_prop_mat_hsc_full)
+tar_load(scenic_hclust_rows_hsc_full)
+tar_load(scenic_hclust_cols_hsc_full)
+tar_load(scenic_cutree_rows_hsc_full)
+
+auc_list <- list(
+  full     = scenic_auc_mat_hsc_full,
+  mch_neg  = scenic_auc_mat_hsc_mch_neg,
+  mch_pos  = scenic_auc_mat_hsc_mch_pos,
+  wt_ctrl  = scenic_auc_mat_hsc_wt_ctrl
+)
+reg_list <- list(
+  full     = scenic_reg_tidy_hsc_full,
+  mch_neg  = scenic_reg_tidy_hsc_mch_neg,
+  mch_pos  = scenic_reg_tidy_hsc_mch_pos,
+  wt_ctrl  = scenic_reg_tidy_hsc_wt_ctrl
+)
+```
+
+---
+
+# 1 · Regulon inventory
+
+Number of regulons, unique TFs, and target genes inferred per condition.
+
+```{r regulon-inventory}
+inv <- imap_dfr(reg_list, function(df, suf) {
+  tibble(
+    Condition     = COND_LABELS[suf],
+    Cells_AUCell  = nrow(auc_list[[suf]]),
+    Regulons      = ncol(auc_list[[suf]]),
+    Unique_TFs    = n_distinct(df$TF),
+    Target_genes  = n_distinct(df$target),
+    TF_target_pairs = nrow(df)
+  )
+})
+
+datatable(inv, rownames = FALSE,
+          caption = "Per-condition SCENIC output summary",
+          options = list(dom = "t", scrollX = TRUE))
+```
+
+---
+
+# 2 · Regulon overlap
+
+Regulon sets compared across the three condition-specific runs (excluding `full`).
+
+```{r regulon-sets}
+reg_sets <- list(
+  `Het mCh−` = colnames(auc_list$mch_neg),
+  `Het mCh+` = colnames(auc_list$mch_pos),
+  WT          = colnames(auc_list$wt_ctrl)
+)
+
+# Intersection summary table
+overlap_df <- bind_rows(
+  tibble(set = "mCh− ∩ mCh+ ∩ WT",  n = length(Reduce(intersect, reg_sets))),
+  tibble(set = "mCh− ∩ mCh+",        n = length(intersect(reg_sets[[1]], reg_sets[[2]]))),
+  tibble(set = "mCh− ∩ WT",          n = length(intersect(reg_sets[[1]], reg_sets[[3]]))),
+  tibble(set = "mCh+ ∩ WT",          n = length(intersect(reg_sets[[2]], reg_sets[[3]]))),
+  tibble(set = "mCh− only",          n = length(setdiff(reg_sets[[1]], union(reg_sets[[2]], reg_sets[[3]])))),
+  tibble(set = "mCh+ only",          n = length(setdiff(reg_sets[[2]], union(reg_sets[[1]], reg_sets[[3]])))),
+  tibble(set = "WT only",            n = length(setdiff(reg_sets[[3]], union(reg_sets[[1]], reg_sets[[2]]))))
+)
+datatable(overlap_df, rownames = FALSE, caption = "Regulon set intersections",
+          options = list(dom = "t"))
+```
+
+```{r condition-unique-tfs}
+all_shared <- Reduce(intersect, reg_sets)
+
+unique_tfs <- imap_dfr(reg_sets, function(regs, cond) {
+  uniq <- setdiff(regs, Reduce(union, reg_sets[names(reg_sets) != cond]))
+  tibble(condition = cond, regulon = uniq)
+})
+
+cat(sprintf("Shared across all 3 conditions: %d regulons\n", length(all_shared)))
+cat(sprintf("Condition-unique regulons: %d\n", nrow(unique_tfs)))
+
+if (nrow(unique_tfs) > 0) {
+  datatable(unique_tfs, rownames = FALSE, filter = "top",
+            caption = "Regulons unique to one condition",
+            options = list(pageLength = 15, scrollX = TRUE))
+}
+```
+
+---
+
+# 3 · Mean AUC comparison across conditions (shared regulons)
+
+For regulons present in all three per-condition AUC matrices, compare mean AUC.
+
+```{r shared-auc-comparison}
+common_regs <- Reduce(intersect, lapply(auc_list[c("mch_neg","mch_pos","wt_ctrl")], colnames))
+
+mean_auc <- imap_dfr(auc_list[c("mch_neg","mch_pos","wt_ctrl")], function(mat, suf) {
+  shared_cols <- intersect(common_regs, colnames(mat))
+  tibble(
+    regulon   = shared_cols,
+    condition = COND_LABELS[suf],
+    mean_auc  = colMeans(mat[, shared_cols, drop = FALSE])
+  )
+}) |>
+  pivot_wider(names_from = condition, values_from = mean_auc) |>
+  mutate(TF = sub("\\([+-]\\)$", "", regulon)) |>
+  arrange(desc(rowMeans(across(where(is.numeric)))))
+
+cat(sprintf("Shared regulons across mCh−, mCh+, WT: %d\n", length(common_regs)))
+
+datatable(
+  mean_auc |> mutate(across(where(is.numeric), \(x) round(x, 5))),
+  rownames = FALSE, filter = "top",
+  caption = sprintf("Mean AUC per regulon across conditions (%d shared regulons)", nrow(mean_auc)),
+  options = list(pageLength = 15, scrollX = TRUE)
+)
+```
+
+```{r auc-scatter-pairs, fig.width=12, fig.height=4}
+conds <- names(COND_LABELS)[2:4]   # mch_neg, mch_pos, wt_ctrl
+pairs <- list(c("mch_neg","mch_pos"), c("mch_neg","wt_ctrl"), c("mch_pos","wt_ctrl"))
+
+plots <- lapply(pairs, function(p) {
+  cx <- COND_LABELS[p[1]]; cy <- COND_LABELS[p[2]]
+  df <- mean_auc |> select(regulon, TF, x = all_of(cx), y = all_of(cy))
+  ggplot(df, aes(x, y)) +
+    geom_point(size = 0.8, alpha = 0.5, colour = "grey40") +
+    geom_abline(linetype = "dashed", colour = "firebrick", linewidth = 0.4) +
+    ggrepel::geom_text_repel(
+      data = df |> mutate(d = abs(x - y)) |> slice_max(d, n = 10),
+      aes(label = TF), size = 2.5, max.overlaps = 15, min.segment.length = 0
+    ) +
+    labs(x = cx, y = cy, title = paste(cx, "vs", cy)) +
+    theme_bw(base_size = 10)
+})
+wrap_plots(plots, nrow = 1)
+```
+
+---
+
+# 4 · RSS per condition (within-condition AUC)
+
+Regulon Specificity Score using each condition's own AUC matrix. Shows which TFs are most specific to each cluster *within* that condition.
+
+::: {.panel-tabset}
+
+## Het mCh−
+
+```{r rss-mch-neg, fig.width=10, fig.height=6}
+cells_neg  <- intersect(rownames(auc_list$mch_neg), scenic_meta_hsc$cell_id)
+clust_neg  <- setNames(scenic_meta_hsc[[scenic_agg_column]][match(cells_neg, scenic_meta_hsc$cell_id)], cells_neg)
+rss_neg    <- calc_rss(auc_list$mch_neg[cells_neg, ], clust_neg)
+plot_rss(rss_neg, top_n = 5) + labs(title = "Het mCh− — top 5 regulons per cluster")
+```
+
+## Het mCh+
+
+```{r rss-mch-pos, fig.width=10, fig.height=6}
+cells_pos  <- intersect(rownames(auc_list$mch_pos), scenic_meta_hsc$cell_id)
+clust_pos  <- setNames(scenic_meta_hsc[[scenic_agg_column]][match(cells_pos, scenic_meta_hsc$cell_id)], cells_pos)
+rss_pos    <- calc_rss(auc_list$mch_pos[cells_pos, ], clust_pos)
+plot_rss(rss_pos, top_n = 5) + labs(title = "Het mCh+ — top 5 regulons per cluster")
+```
+
+## WT
+
+```{r rss-wt, fig.width=10, fig.height=6}
+cells_wt   <- intersect(rownames(auc_list$wt_ctrl), scenic_meta_hsc$cell_id)
+clust_wt   <- setNames(scenic_meta_hsc[[scenic_agg_column]][match(cells_wt, scenic_meta_hsc$cell_id)], cells_wt)
+rss_wt     <- calc_rss(auc_list$wt_ctrl[cells_wt, ], clust_wt)
+plot_rss(rss_wt, top_n = 5) + labs(title = "WT — top 5 regulons per cluster")
+```
+
+## Full cohort
+
+```{r rss-full, fig.width=10, fig.height=6}
+cells_full <- intersect(rownames(auc_list$full), scenic_meta_hsc$cell_id)
+clust_full <- setNames(scenic_meta_hsc[[scenic_agg_column]][match(cells_full, scenic_meta_hsc$cell_id)], cells_full)
+rss_full   <- calc_rss(auc_list$full[cells_full, ], clust_full)
+plot_rss(rss_full, top_n = 5) + labs(title = "Full cohort — top 5 regulons per cluster")
+```
+
+:::
+
+---
+
+# 5 · AUC UMAPs — top RSS regulons per condition
+
+Top 9 regulons per condition by max RSS across clusters, projected on the global HSC UMAP (SCT embedding). Cells not in that condition's AUC matrix are shown in grey.
+
+```{r umap-prep}
+umap_base <- scenic_meta_hsc |>
+  select(cell_id, UMAP1, UMAP2, condition)
+```
+
+::: {.panel-tabset}
+
+## Het mCh−
+
+```{r umap-mch-neg, fig.width=14, fig.height=12}
+top9_neg <- names(sort(apply(rss_neg, 1, max), decreasing = TRUE))[seq_len(min(9, nrow(rss_neg)))]
+df_neg   <- umap_base |>
+  left_join(
+    as_tibble(auc_list$mch_neg[cells_neg, top9_neg, drop = FALSE], rownames = "cell_id"),
+    by = "cell_id"
+  )
+
+plots_neg <- lapply(top9_neg, function(reg) {
+  df_neg |> arrange(!is.na(.data[[reg]]), .data[[reg]]) |>
+    ggplot(aes(UMAP1, UMAP2, colour = .data[[reg]])) +
+    geom_point(size = 0.2, alpha = 0.7) +
+    scale_colour_gradientn(
+      colours  = c("grey88", "#feb24c", "#f03b20", "#bd0026"),
+      na.value = "grey92", name = "AUC"
+    ) +
+    labs(title = sub("\\([+-]\\)$", "", reg)) +
+    theme_void(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", size = 9, hjust = 0.5))
+})
+wrap_plots(plots_neg, ncol = 3)
+```
+
+## Het mCh+
+
+```{r umap-mch-pos, fig.width=14, fig.height=12}
+top9_pos <- names(sort(apply(rss_pos, 1, max), decreasing = TRUE))[seq_len(min(9, nrow(rss_pos)))]
+df_pos   <- umap_base |>
+  left_join(
+    as_tibble(auc_list$mch_pos[cells_pos, top9_pos, drop = FALSE], rownames = "cell_id"),
+    by = "cell_id"
+  )
+
+plots_pos <- lapply(top9_pos, function(reg) {
+  df_pos |> arrange(!is.na(.data[[reg]]), .data[[reg]]) |>
+    ggplot(aes(UMAP1, UMAP2, colour = .data[[reg]])) +
+    geom_point(size = 0.2, alpha = 0.7) +
+    scale_colour_gradientn(
+      colours  = c("grey88", "#feb24c", "#f03b20", "#bd0026"),
+      na.value = "grey92", name = "AUC"
+    ) +
+    labs(title = sub("\\([+-]\\)$", "", reg)) +
+    theme_void(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", size = 9, hjust = 0.5))
+})
+wrap_plots(plots_pos, ncol = 3)
+```
+
+## WT
+
+```{r umap-wt, fig.width=14, fig.height=12}
+top9_wt <- names(sort(apply(rss_wt, 1, max), decreasing = TRUE))[seq_len(min(9, nrow(rss_wt)))]
+df_wt   <- umap_base |>
+  left_join(
+    as_tibble(auc_list$wt_ctrl[cells_wt, top9_wt, drop = FALSE], rownames = "cell_id"),
+    by = "cell_id"
+  )
+
+plots_wt <- lapply(top9_wt, function(reg) {
+  df_wt |> arrange(!is.na(.data[[reg]]), .data[[reg]]) |>
+    ggplot(aes(UMAP1, UMAP2, colour = .data[[reg]])) +
+    geom_point(size = 0.2, alpha = 0.7) +
+    scale_colour_gradientn(
+      colours  = c("grey88", "#feb24c", "#f03b20", "#bd0026"),
+      na.value = "grey92", name = "AUC"
+    ) +
+    labs(title = sub("\\([+-]\\)$", "", reg)) +
+    theme_void(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", size = 9, hjust = 0.5))
+})
+wrap_plots(plots_wt, ncol = 3)
+```
+
+:::
+
+---
+
+# 6 · Per-condition AUC heatmaps
+
+Cluster-mean AUC z-scored per regulon. Each tab uses that condition's own SCENIC run (condition-specific regulon set and cells).
+
+::: {.panel-tabset}
+
+## Het mCh−
+
+```{r heatmap-mch-neg, fig.width=12, fig.height=14}
+agg_neg  <- scenic_aggregate_auc(auc_list$mch_neg, scenic_meta_hsc, scenic_agg_column)
+mat_neg  <- t(scale(agg_neg))
+hcr_neg  <- hclust(dist(mat_neg),   method = "ward.D2")
+hcc_neg  <- hclust(dist(t(mat_neg)), method = "ward.D2")
+
+draw(Heatmap(
+  mat_neg,
+  name                 = "z-score\nmean AUC",
+  col                  = colorRamp2(c(-2.5, 0, 2.5), c("#2166ac","white","#b2182b")),
+  cluster_rows         = as.dendrogram(hcr_neg),
+  cluster_columns      = as.dendrogram(hcc_neg),
+  column_names_gp      = gpar(fontsize = 7),
+  row_labels           = sub("\\([+-]\\)$", "", rownames(mat_neg)),
+  row_names_gp         = gpar(fontsize = 4),
+  border               = FALSE,
+  column_title         = sprintf("Het mCh− — %d clusters", ncol(mat_neg)),
+  column_title_gp      = gpar(fontsize = 9)
+))
+```
+
+## Het mCh+
+
+```{r heatmap-mch-pos, fig.width=12, fig.height=14}
+agg_pos  <- scenic_aggregate_auc(auc_list$mch_pos, scenic_meta_hsc, scenic_agg_column)
+mat_pos  <- t(scale(agg_pos))
+hcr_pos  <- hclust(dist(mat_pos),   method = "ward.D2")
+hcc_pos  <- hclust(dist(t(mat_pos)), method = "ward.D2")
+
+draw(Heatmap(
+  mat_pos,
+  name                 = "z-score\nmean AUC",
+  col                  = colorRamp2(c(-2.5, 0, 2.5), c("#2166ac","white","#b2182b")),
+  cluster_rows         = as.dendrogram(hcr_pos),
+  cluster_columns      = as.dendrogram(hcc_pos),
+  column_names_gp      = gpar(fontsize = 7),
+  row_labels           = sub("\\([+-]\\)$", "", rownames(mat_pos)),
+  row_names_gp         = gpar(fontsize = 4),
+  border               = FALSE,
+  column_title         = sprintf("Het mCh+ — %d clusters", ncol(mat_pos)),
+  column_title_gp      = gpar(fontsize = 9)
+))
+```
+
+## WT
+
+```{r heatmap-wt, fig.width=12, fig.height=14}
+agg_wt   <- scenic_aggregate_auc(auc_list$wt_ctrl, scenic_meta_hsc, scenic_agg_column)
+mat_wt   <- t(scale(agg_wt))
+hcr_wt   <- hclust(dist(mat_wt),   method = "ward.D2")
+hcc_wt   <- hclust(dist(t(mat_wt)), method = "ward.D2")
+
+draw(Heatmap(
+  mat_wt,
+  name                 = "z-score\nmean AUC",
+  col                  = colorRamp2(c(-2.5, 0, 2.5), c("#2166ac","white","#b2182b")),
+  cluster_rows         = as.dendrogram(hcr_wt),
+  cluster_columns      = as.dendrogram(hcc_wt),
+  column_names_gp      = gpar(fontsize = 7),
+  row_labels           = sub("\\([+-]\\)$", "", rownames(mat_wt)),
+  row_names_gp         = gpar(fontsize = 4),
+  border               = FALSE,
+  column_title         = sprintf("WT — %d clusters", ncol(mat_wt)),
+  column_title_gp      = gpar(fontsize = 9)
+))
+```
+
+## Full cohort
+
+```{r heatmap-full, fig.height=16, fig.width=14}
+heat_full <- t(scale(scenic_agg_hsc_full))
+col_ann <- HeatmapAnnotation(
+  `Condition mix` = anno_barplot(
+    scenic_prop_mat_hsc_full,
+    ylim = c(0, 1), bar_width = 0.9,
+    gp = gpar(fill = COND_PAL[COND_ORDER], col = NA),
+    axis_param = list(side = "left", gp = gpar(fontsize = 7))
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp   = gpar(fontsize = 8)
+)
+draw(Heatmap(
+  heat_full,
+  name                 = "z-score\nmean AUC",
+  col                  = colorRamp2(c(-2.5, 0, 2.5), c("#2166ac","white","#b2182b")),
+  top_annotation       = col_ann,
+  cluster_rows         = as.dendrogram(scenic_hclust_rows_hsc_full),
+  cluster_columns      = as.dendrogram(scenic_hclust_cols_hsc_full),
+  row_split            = length(unique(scenic_cutree_rows_hsc_full)),
+  column_names_gp      = gpar(fontsize = 7),
+  row_labels           = sub("\\([+-]\\)$", "", rownames(heat_full)),
+  row_names_gp         = gpar(fontsize = 4),
+  border               = FALSE,
+  column_title         = sprintf("Full cohort — %d clusters", ncol(heat_full)),
+  column_title_gp      = gpar(fontsize = 9),
+  row_title_gp         = gpar(fontsize = 8),
+  heatmap_legend_param = list(direction = "vertical")
+))
+```
+
+:::
+
+---
+
+# 7 · Regulon target gene tables
+
+Searchable tables of TF → target gene edges per condition.
+
+::: {.panel-tabset}
+
+## Het mCh−
+
+```{r reg-table-neg}
+datatable(
+  scenic_reg_tidy_hsc_mch_neg |> arrange(TF, desc(weight)),
+  rownames = FALSE, filter = "top",
+  caption = sprintf("Het mCh− — %d TF–target pairs (%d TFs)",
+                    nrow(scenic_reg_tidy_hsc_mch_neg),
+                    n_distinct(scenic_reg_tidy_hsc_mch_neg$TF)),
+  options = list(pageLength = 20, scrollX = TRUE)
+)
+```
+
+## Het mCh+
+
+```{r reg-table-pos}
+datatable(
+  scenic_reg_tidy_hsc_mch_pos |> arrange(TF, desc(weight)),
+  rownames = FALSE, filter = "top",
+  caption = sprintf("Het mCh+ — %d TF–target pairs (%d TFs)",
+                    nrow(scenic_reg_tidy_hsc_mch_pos),
+                    n_distinct(scenic_reg_tidy_hsc_mch_pos$TF)),
+  options = list(pageLength = 20, scrollX = TRUE)
+)
+```
+
+## WT
+
+```{r reg-table-wt}
+datatable(
+  scenic_reg_tidy_hsc_wt_ctrl |> arrange(TF, desc(weight)),
+  rownames = FALSE, filter = "top",
+  caption = sprintf("WT — %d TF–target pairs (%d TFs)",
+                    nrow(scenic_reg_tidy_hsc_wt_ctrl),
+                    n_distinct(scenic_reg_tidy_hsc_wt_ctrl$TF)),
+  options = list(pageLength = 20, scrollX = TRUE)
+)
+```
+
+## Full cohort
+
+```{r reg-table-full}
+datatable(
+  scenic_reg_tidy_hsc_full |> arrange(TF, desc(weight)),
+  rownames = FALSE, filter = "top",
+  caption = sprintf("Full cohort — %d TF–target pairs (%d TFs)",
+                    nrow(scenic_reg_tidy_hsc_full),
+                    n_distinct(scenic_reg_tidy_hsc_full$TF)),
+  options = list(pageLength = 20, scrollX = TRUE)
+)
+```
+
+:::
+
+```{r session-info}
+sessionInfo()
+```
+
+{{< include ../_session-info.qmd >}}

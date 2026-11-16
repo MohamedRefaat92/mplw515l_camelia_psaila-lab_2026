@@ -1,0 +1,490 @@
+---
+title: "HSC Trajectory — Slingshot c6/c8 → c4 (res 0.9)"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(slingshot)
+library(igraph)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(viridis)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+theme_set(theme_cowplot(font_size = 11))
+
+label_condition <- function(x) {
+  dplyr::case_when(
+    grepl("WT",      x) ~ "WT",
+    grepl("mCh-",   x) ~ "mCh-",
+    grepl("mCh\\+", x) ~ "mCh+",
+    TRUE                ~ x
+  )
+}
+```
+
+```{r config}
+INCLUDE_CLUSTERS <- c("6", "8", "2", "5", "1", "4")
+N_PCA_DIMS       <- 20L
+PCA_NAME         <- "pca.SCT"
+# Run with 4 as start so the MST topology is resolved correctly,
+# then reverse pseudotime so 0 = progenitor (c6/c8) and max = c4.
+START_CLUSTER    <- "4"
+END_CLUSTERS     <- c("6", "8")
+N_BINS_HM        <- 50L
+N_TOP_GENES_HM   <- 100L
+N_TOP_GENES_LINE <- 3L
+```
+
+# Load & subset
+
+```{r load}
+mpn_processed_hsc <- targets::tar_read(mpn_processed_hsc_fullcc)
+
+clus_col <- grep("sNN_pca\\..*_res\\.0\\.9$",
+                 colnames(mpn_processed_hsc@meta.data), value = TRUE)[1]
+cat("Cluster column:", clus_col, "\n")
+
+clus_all <- as.character(mpn_processed_hsc@meta.data[[clus_col]])
+names(clus_all) <- colnames(mpn_processed_hsc)
+
+sling_cells <- names(clus_all)[clus_all %in% INCLUDE_CLUSTERS]
+clus        <- clus_all[sling_cells]
+cat("Clusters:", paste(sort(unique(clus)), collapse = ", "), "\n")
+cat("Cells:", length(sling_cells), "\n")
+
+pca_emb <- Seurat::Embeddings(mpn_processed_hsc, PCA_NAME)[sling_cells, seq_len(N_PCA_DIMS)] |>
+  as.data.frame()
+
+# UMAP — full dataset as background, subset cells for trajectory overlay
+umap_red <- grep("^umap", names(mpn_processed_hsc@reductions), value = TRUE)[1]
+umap_full <- Seurat::Embeddings(mpn_processed_hsc, umap_red) |>
+  as.data.frame() |>
+  dplyr::rename(umap1 = 1, umap2 = 2) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::mutate(cluster = clus_all[cell_id])
+
+umap_df <- umap_full |> dplyr::filter(cell_id %in% sling_cells)
+
+centroids <- umap_df |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarise(x = median(umap1), y = median(umap2), .groups = "drop") |>
+  tibble::column_to_rownames("cluster")
+```
+
+# Run Slingshot
+
+```{r slingshot-run}
+set.seed(42)
+sling_obj <- slingshot::slingshot(
+  data          = pca_emb,
+  clusterLabels = clus,
+  start.clus    = START_CLUSTER,
+  end.clus      = END_CLUSTERS,
+  dist.method   = "scaled.diag",
+  extend        = "n",
+  allow.breaks  = FALSE
+)
+
+lin_paths  <- slingshot::slingLineages(sling_obj)
+n_lineages <- length(lin_paths)
+cat("Lineages detected:", n_lineages, "\n")
+for (i in seq_len(n_lineages))
+  cat("  Lineage", i, ":", paste(lin_paths[[i]], collapse = " → "), "\n")
+```
+
+# MST on full UMAP
+
+MST inferred by Slingshot overlaid on the full HSC UMAP (all cells as background).
+Each panel highlights cells assigned to that lineage, coloured by pseudotime.
+
+```{r mst-umap-setup}
+g_mst <- slingshot::slingMST(sling_obj)
+
+edges_umap <- igraph::as_data_frame(g_mst, what = "edges") |>
+  dplyr::left_join(centroids |> tibble::rownames_to_column("cluster") |>
+    dplyr::rename(from = cluster, x_from = x, y_from = y), by = "from") |>
+  dplyr::left_join(centroids |> tibble::rownames_to_column("cluster") |>
+    dplyr::rename(to   = cluster, x_to   = x, y_to   = y), by = "to")
+```
+
+```{r mst-umap-plot, fig.width=12, fig.height=6}
+# Will be updated with per-lineage pseudotime after pseudotime-extract;
+# here we show the MST + cluster labels on the full UMAP background.
+ggplot() +
+  geom_point(data = umap_full,
+             aes(umap1, umap2), colour = "grey88", size = 0.2, alpha = 0.35) +
+  geom_point(data = umap_df,
+             aes(umap1, umap2, colour = cluster),
+             size = 0.35, alpha = 0.6) +
+  geom_segment(data = edges_umap,
+               aes(x = x_from, y = y_from, xend = x_to, yend = y_to),
+               colour = "black", linewidth = 1.3, alpha = 0.8) +
+  geom_point(data = centroids |> tibble::rownames_to_column("cluster"),
+             aes(x, y), shape = 21, fill = "steelblue4", colour = "white",
+             size = 5, stroke = 0.8) +
+  ggrepel::geom_label_repel(
+    data = centroids |> tibble::rownames_to_column("cluster"),
+    aes(x, y, label = cluster),
+    size = 3, label.size = 0.2, fill = alpha("white", 0.8), max.overlaps = 30) +
+  labs(title = "Slingshot MST on full HSC UMAP",
+       x = NULL, y = NULL, colour = "Cluster") +
+  theme_void() +
+  theme(plot.title      = element_text(face = "bold", size = 12),
+        legend.position = "right")
+```
+
+# Extract pseudotime
+
+Pulled from `trajectory-slingshot.qmd`: `sling_cell_df()` returns raw + 0–100 scaled pseudotime
+columns (`pseudotime_Lineage*`) plus within-lineage ranks and summary columns.
+
+```{r sling-cell-df-fn}
+sling_cell_df <- function(sling_ctr) {
+  raw_pt <- slingshot::slingPseudotime(sling_ctr)
+
+  pseudotime_df <- apply(raw_pt, 2, function(x) {
+    x1 <- x[!is.na(x)]
+    x[!is.na(x)] <- (x1 - min(x1)) / (max(x1) - min(x1)) * 100
+    x
+  }) |>
+    as.data.frame() |>
+    dplyr::rename_with(~ paste0("pseudotime_", .)) |>
+    dplyr::mutate(
+      mean_pseudotime   = rowMeans(dplyr::pick(dplyr::everything()), na.rm = TRUE),
+      median_pseudotime = apply(dplyr::pick(dplyr::everything()), 1, median, na.rm = TRUE),
+      max_pseudotime    = apply(dplyr::pick(dplyr::everything()), 1, max,    na.rm = TRUE),
+      min_pseudotime    = apply(dplyr::pick(dplyr::everything()), 1, min,    na.rm = TRUE)
+    )
+
+  order_df <- apply(raw_pt, 2, function(x) {
+    x[!is.na(x)] <- rank(x[!is.na(x)])
+    x
+  }) |>
+    as.data.frame() |>
+    dplyr::rename_with(~ paste0("order_", .)) |>
+    dplyr::mutate(mean_order = rowMeans(dplyr::pick(dplyr::everything()), na.rm = TRUE))
+
+  dplyr::bind_cols(as.data.frame(raw_pt), pseudotime_df, order_df)
+}
+```
+
+```{r pseudotime-extract}
+sling_df             <- sling_cell_df(sling_obj)
+sling_df$cluster     <- clus[rownames(sling_df)]
+sling_df$condition   <- label_condition(mpn_processed_hsc$sample.name[rownames(sling_df)])
+sling_df$sample.name <- mpn_processed_hsc$sample.name[rownames(sling_df)]
+
+# Raw lineage cols (e.g. "Lineage1") — used for bin_expr_along_pseudotime
+raw_lin_cols <- grep("^Lineage[0-9]", colnames(sling_df), value = TRUE)
+# Scaled pseudotime cols (e.g. "pseudotime_Lineage1") — used for smooth expression
+pt_lin_cols  <- grep("^pseudotime_Lineage", colnames(sling_df), value = TRUE)
+
+cat("Raw lineage columns:", paste(raw_lin_cols, collapse = ", "), "\n")
+cat("Cells per lineage (non-NA):\n")
+for (lc in raw_lin_cols)
+  cat(" ", lc, ":", sum(!is.na(sling_df[[lc]])), "\n")
+
+# Identify 8→4 vs 6→4 lineages by which has more cluster-8 vs cluster-6 cells
+cells_8 <- rownames(sling_df)[sling_df$cluster == "8"]
+cells_6 <- rownames(sling_df)[sling_df$cluster == "6"]
+
+lin_bias <- sapply(raw_lin_cols, function(lc) {
+  sum(!is.na(sling_df[cells_8, lc])) - sum(!is.na(sling_df[cells_6, lc]))
+})
+names(lin_bias) <- raw_lin_cols
+
+lin_8to4_raw <- raw_lin_cols[which.max(lin_bias)]   # raw col for bin_mats
+lin_6to4_raw <- raw_lin_cols[which.min(lin_bias)]
+lin_8to4_pt  <- paste0("pseudotime_", lin_8to4_raw) # scaled col for smooth
+lin_6to4_pt  <- paste0("pseudotime_", lin_6to4_raw)
+
+cat("\nLineage bias (n_c8 - n_c6):\n"); print(lin_bias)
+cat("→ 8→4:", lin_8to4_raw, "| path:", paste(lin_paths[[lin_8to4_raw]], collapse=" → "), "\n")
+cat("→ 6→4:", lin_6to4_raw, "| path:", paste(lin_paths[[lin_6to4_raw]], collapse=" → "), "\n")
+
+# Reverse pseudotime: slingshot ran with start=4 so pt=0 at c4.
+# After reversal: pt=0 at c6/c8 (progenitor) and pt=max at c4 (end).
+for (lc in raw_lin_cols) {
+  m <- max(sling_df[[lc]], na.rm = TRUE)
+  sling_df[[lc]] <- ifelse(is.na(sling_df[[lc]]), NA_real_, m - sling_df[[lc]])
+}
+for (pt_col in pt_lin_cols) {
+  sling_df[[pt_col]] <- ifelse(is.na(sling_df[[pt_col]]), NA_real_,
+                               100 - sling_df[[pt_col]])
+}
+cat("Pseudotime reversed: 0 = progenitor (c6/c8), 100 = c4\n")
+```
+
+```{r lineage-umap, fig.width=12, fig.height=6}
+pt_umap_df <- umap_df |>
+  dplyr::left_join(
+    sling_df |>
+      tibble::rownames_to_column("cell_id") |>
+      dplyr::select(cell_id, dplyr::all_of(pt_lin_cols)),
+    by = "cell_id"
+  )
+
+plots_lin <- lapply(seq_along(raw_lin_cols), function(i) {
+  lc   <- pt_lin_cols[i]
+  lnm  <- raw_lin_cols[i]
+  traj_label <- if (lnm == lin_8to4_raw) "8→4" else "6→4"
+  lin  <- rev(lin_paths[[lnm]])   # reverse path label to match reversed pseudotime
+  ggplot(pt_umap_df |> dplyr::arrange(is.na(.data[[lc]]))) +
+    geom_point(data = umap_full, aes(umap1, umap2),
+               colour = "grey88", size = 0.2, alpha = 0.3) +
+    geom_point(aes(umap1, umap2), colour = "grey80", size = 0.3, alpha = 0.4) +
+    geom_point(aes(umap1, umap2, colour = .data[[lc]]),
+               size = 0.4, alpha = 0.8) +
+    geom_segment(data = edges_umap,
+                 aes(x = x_from, y = y_from, xend = x_to, yend = y_to),
+                 colour = "black", linewidth = 1, alpha = 0.7) +
+    geom_point(data = centroids |> tibble::rownames_to_column("cluster"),
+               aes(x, y), shape = 21, fill = "steelblue4", colour = "white",
+               size = 4, stroke = 0.7) +
+    ggrepel::geom_label_repel(
+      data = centroids |> tibble::rownames_to_column("cluster"),
+      aes(x, y, label = cluster), size = 2.5, label.size = 0.2,
+      fill = alpha("white", 0.8), max.overlaps = 30) +
+    scale_colour_viridis_c(option = "plasma", name = "Pseudotime", na.value = NA) +
+    labs(x = NULL, y = NULL,
+         title    = paste(lnm, "—", traj_label),
+         subtitle = paste(lin, collapse = " → ")) +
+    theme_void() +
+    theme(plot.title    = element_text(face = "bold", size = 10),
+          plot.subtitle = element_text(size = 7, colour = "grey40"),
+          legend.key.height = unit(0.4, "cm"))
+})
+
+patchwork::wrap_plots(plots_lin, ncol = 2) +
+  patchwork::plot_annotation(
+    title = "Per-lineage pseudotime on full HSC UMAP (reversed: 0 = progenitor)",
+    theme = theme(plot.title = element_text(face = "bold", size = 12))
+  )
+```
+
+# Binned expression heatmap
+
+50 pseudotime bins, top `r N_TOP_GENES_HM` genes by bin variance.
+Trajectory **6→4** displayed left-to-right; trajectory **8→4** displayed right-to-left (columns reversed).
+
+```{r bin-compute}
+bin_mats <- lapply(raw_lin_cols, function(lc) {
+    cat("Binning", lc, "...\n")
+    bin_expr_along_pseudotime(
+      srt         = mpn_processed_hsc,
+      sling_df    = sling_df,
+      lineage_col = lc,
+      n_bins      = N_BINS_HM,
+      assay       = "SCT",
+      layer       = "data",
+      smooth      = TRUE,
+      smooth_span = 0.3
+    )
+  }) %>%
+  setNames(.,raw_lin_cols)
+
+cat("Bin matrices:\n")
+for (nm in names(bin_mats))
+  cat(" ", nm, "—", nrow(bin_mats[[nm]]), "genes ×", ncol(bin_mats[[nm]]), "bins\n")
+```
+
+```{r bin-heatmap, fig.width=10}
+#| fig.height: !expr min(22, ceiling(N_TOP_GENES_HM / 5))
+
+# Reverse columns of 8→4 matrix for right-to-left display
+bin_mats_8rev <- bin_mats
+bin_mats_8rev[[lin_8to4_raw]] <- bin_mats_8rev[[lin_8to4_raw]][
+  , ncol(bin_mats_8rev[[lin_8to4_raw]]):1, drop = FALSE
+]
+
+# Gene order anchored to 6→4 (left-to-right, reference); display 6→4 then 8→4
+bin_mats_plot <- list(
+  `6→4  [L→R]` = bin_mats_8rev[[lin_6to4_raw]],
+  `8→4  [R→L]` = bin_mats_8rev[[lin_8to4_raw]]
+)
+
+ComplexHeatmap::draw(
+  plot_lineage_heatmap(
+    bin_mats_plot,
+    n_top          = N_TOP_GENES_HM,
+    gene_order     = "peak",
+    scale          = TRUE,
+    show_row_names = TRUE,
+    row_names_gp   = grid::gpar(fontsize = 6),
+    row_names_side = "left"
+  ),
+  merge_legend    = TRUE,
+  column_title    = paste("Top", N_TOP_GENES_HM, "variable genes — 50 bins, z-scored"),
+  column_title_gp = grid::gpar(fontsize = 12, fontface = "bold")
+)
+```
+
+# Top-3 gene expression by sample
+
+Top 3 genes per trajectory selected by bin variance.
+Lines coloured by `sample.name`, faceted by gene × trajectory.
+
+```{r smooth-by-sample-fn}
+# Pulled from trajectory-slingshot.qmd: get_smooth_expr_by_condition()
+# lins should be pseudotime_Lineage* column names (or raw — sub() is a no-op on raw names)
+get_smooth_expr_by_condition <- function(lins, lin_markers_lst, sling_df, srt,
+                                         condition_col = "condition",
+                                         n_bins = 50, loess_span = 0.75) {
+  lin_markers_df <- tibble::enframe(lin_markers_lst,
+                                    name  = "clust_marker",
+                                    value = "gene_symbol") |>
+    tidyr::unnest(cols = gene_symbol)
+
+  traj_long_df <- sling_df[, c(lins, condition_col), drop = FALSE] |>
+    tibble::rownames_to_column("cell_id") |>
+    tidyr::pivot_longer(dplyr::all_of(lins),
+                        names_to  = "lins",
+                        values_to = "pseudotime") |>
+    dplyr::mutate(lins = sub("pseudotime_", "", lins)) |>
+    dplyr::rename(condition = dplyr::all_of(condition_col)) |>
+    dplyr::group_by(lins) |>
+    dplyr::mutate(
+      pt_norm = (pseudotime - min(pseudotime, na.rm = TRUE)) /
+                (max(pseudotime, na.rm = TRUE) - min(pseudotime, na.rm = TRUE)) * 100
+    ) |>
+    dplyr::ungroup()
+
+  sct_norm_mat <- Seurat::GetAssayData(srt, assay = "SCT", layer = "data")
+  sct_norm_mat <- sct_norm_mat[
+    intersect(lin_markers_df$gene_symbol, rownames(sct_norm_mat)), , drop = FALSE
+  ]
+
+  sct_long_df <- sct_norm_mat |>
+    as.matrix() |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene_symbol") |>
+    tidyr::pivot_longer(-gene_symbol, names_to = "cell_id", values_to = "sct") |>
+    dplyr::left_join(lin_markers_df, by = "gene_symbol")
+
+  dplyr::full_join(traj_long_df, sct_long_df, by = "cell_id",
+                   relationship = "many-to-many") |>
+    dplyr::filter(!is.na(pseudotime)) |>
+    dplyr::mutate(pt_bin_id = cut(pt_norm, breaks = n_bins,
+                                  labels = FALSE, include.lowest = TRUE)) |>
+    dplyr::group_by(lins, gene_symbol, condition, pt_bin_id, clust_marker) |>
+    dplyr::summarise(mean_sct = mean(sct, na.rm = TRUE),
+                     pt_norm  = mean(pt_norm, na.rm = TRUE), .groups = "drop") |>
+    dplyr::group_by(lins, gene_symbol, condition) |>
+    dplyr::reframe({
+      d      <- dplyr::pick(dplyr::everything())
+      pt_seq <- seq(min(d$pt_norm), max(d$pt_norm), length.out = 100)
+      fit    <- loess(mean_sct ~ pt_norm, data = d, span = loess_span, degree = 1)
+      tibble::tibble(
+        pseudotime_bin   = pt_seq,
+        smooth_norm_expr = predict(fit, pt_seq),
+        clust_marker     = dplyr::first(d$clust_marker)
+      )
+    }) |>
+    dplyr::mutate(
+      clust_marker = factor(clust_marker, levels = names(lin_markers_lst)),
+      lineage      = lins
+    )
+}
+```
+
+```{r top-genes-select}
+top_8to4 <- names(sort(apply(bin_mats[[lin_8to4_raw]], 1, var, na.rm = TRUE),
+                        decreasing = TRUE))[seq_len(N_TOP_GENES_LINE)]
+top_6to4 <- names(sort(apply(bin_mats[[lin_6to4_raw]], 1, var, na.rm = TRUE),
+                        decreasing = TRUE))[seq_len(N_TOP_GENES_LINE)]
+cat("Top genes 8→4:", paste(top_8to4, collapse = ", "), "\n")
+cat("Top genes 6→4:", paste(top_6to4, collapse = ", "), "\n")
+```
+
+```{r smooth-compute}
+smooth_8to4 <- get_smooth_expr_by_condition(
+  lins            = lin_8to4_pt,
+  lin_markers_lst = setNames(as.list(top_8to4), top_8to4),
+  sling_df        = sling_df,
+  srt             = mpn_processed_hsc,
+  condition_col   = "sample.name",
+  n_bins          = N_BINS_HM
+) |>
+  dplyr::mutate(trajectory = paste0(lin_8to4_raw, ": 8→4"))
+
+smooth_6to4 <- get_smooth_expr_by_condition(
+  lins            = lin_6to4_pt,
+  lin_markers_lst = setNames(as.list(top_6to4), top_6to4),
+  sling_df        = sling_df,
+  srt             = mpn_processed_hsc,
+  condition_col   = "sample.name",
+  n_bins          = N_BINS_HM
+) |>
+  dplyr::mutate(trajectory = paste0(lin_6to4_raw, ": 6→4"))
+
+smooth_combined <- dplyr::bind_rows(smooth_8to4, smooth_6to4)
+```
+
+```{r line-plot, fig.width=12, fig.height=8}
+sample_pal <- setNames(
+  scales::hue_pal()(length(unique(smooth_combined$condition))),
+  sort(unique(smooth_combined$condition))
+)
+
+ggplot(smooth_combined,
+       aes(pseudotime_bin, smooth_norm_expr,
+           colour = condition,
+           group  = condition)) +
+  geom_line(linewidth = 0.9, alpha = 0.85) +
+  scale_colour_manual(values = sample_pal, name = "Sample") +
+  facet_grid(clust_marker ~ trajectory, scales = "free") +
+  labs(x     = "Pseudotime (0–100)",
+       y     = "Smoothed SCT expression",
+       title = paste("Top", N_TOP_GENES_LINE, "genes per trajectory — by sample")) +
+  theme(strip.text.x    = element_text(face = "bold", size = 10),
+        strip.text.y    = element_text(face = "bold", size = 10, angle = 0),
+        panel.spacing   = unit(0.6, "lines"),
+        legend.position = "right")
+```
+
+{{< include ../_session-info.qmd >}}

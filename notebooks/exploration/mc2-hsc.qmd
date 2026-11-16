@@ -1,0 +1,345 @@
+---
+title: "MC2 Metacells — HSC"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+execute:
+  echo: true
+  warning: false
+  message: false
+jupyter: mplw515l_camelia_psaila-lab_2026-py
+---
+
+## Overview
+
+Metacell-2 (MC2) constructs metacells by building a cell–cell similarity graph,
+grouping cells into dense local communities via a divide-and-conquer algorithm,
+and rejecting outlier cells that do not fit cleanly into any metacell.
+
+**Input:** `output/objects/hsc.h5ad`
+**Output:** `output/objects/metacells/mc2_hsc_metacells.h5ad` — metacell AnnData with:
+
+- `X` — summed raw counts per metacell
+- `obs` — metacell metadata (size, grouped cells, majority cluster/condition)
+- `obsm["X_umap"]` — median UMAP coordinates of constituent cells
+
+---
+
+## 1 — Setup
+
+```{python setup}
+import sys
+
+import numpy  as np
+import pandas as pd
+import anndata as ad
+import scanpy  as sc
+import metacells as mc
+import scipy.sparse as sp
+from pathlib import Path
+
+H5AD_IN  = Path('output/objects/hsc.h5ad')
+OUT_DIR  = Path('output/objects/metacells')
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+H5AD_OUT = OUT_DIR / 'mc2_hsc_metacells.h5ad'
+
+TARGET_METACELL_SIZE = 50   # target cells per metacell
+EXCLUDED_GENES = ['mCherry', 'DRE']
+
+print(f"metacells version: {mc.__version__}")
+```
+
+---
+
+## 2 — Load data
+
+```{python load}
+adata = ad.read_h5ad(H5AD_IN)
+print(adata)
+print("\nobs columns:", adata.obs.columns.tolist())
+```
+
+---
+
+## 3 — Preprocessing for MC2
+
+MC2 requires raw counts. SCT-normalised values are unsuitable — MC2 sums raw
+counts within each metacell and normalises internally.
+
+```{python preprocess}
+# MC2 expects raw integer counts in X
+if 'counts' in adata.layers:
+    adata.X = adata.layers['counts'].copy()
+    print("Using raw counts from layers['counts']")
+elif sp.issparse(adata.X) and np.allclose(adata.X.data, adata.X.data.astype(int)):
+    print("X already appears to be integer counts")
+else:
+    raise ValueError("No integer count layer found — check .layers keys: " +
+                     str(list(adata.layers.keys())))
+
+# Exclude reporter genes
+keep_genes = [g for g in adata.var_names if g not in EXCLUDED_GENES]
+adata = adata[:, keep_genes].copy()
+print(f"Genes after exclusion: {adata.n_vars}")
+```
+
+---
+
+## 4 — MC2 pipeline
+
+### 4.1 — Exclude noisy genes & mark lateral (cell-cycle) genes
+
+MC2 distinguishes two gene categories:
+
+- **Excluded genes** — removed entirely before metacell construction (reporters,
+  stress/housekeeping genes: heat-shock `Hsp*`, ribosomal `Rps*/Rpl*`, `Malat1`)
+- **Lateral genes** — kept in the matrix but down-weighted during graph
+  construction; these are cell-cycle genes that bias similarity without
+  reflecting stable cell identity
+
+```{python lateral-genes}
+# ── 1. Remove stress / housekeeping genes entirely ───────────────────────────
+noise_mask  = adata.var_names.str.match(r'^(Hsp|Rps|Rpl|Malat1)')
+noise_genes = adata.var_names[noise_mask].tolist()
+print(f"Noise genes removed: {len(noise_genes)}")
+adata = adata[:, ~noise_mask].copy()
+
+# ── 2. Mark cell-cycle genes as lateral ──────────────────────────────────────
+# Mouse S-phase and G2M gene lists (Tirosh et al. 2016, mm orthologues)
+s_genes_mm = [
+    'Mcm5','Pcna','Tyms','Fen1','Mcm7','Mcm4','Rrm1','Ung','Gins2',
+    'Mcm6','Cdca7','Dtl','Prim1','Uhrf1','Hells','Rfc2','Rpa2','Nasp',
+    'Rad51ap1','Gmnn','Wdr76','Slbp','Ccne2','Ubr7','Pold3','Msh2',
+    'Atad2','Rad51','Rrm2','Cdc45','Cdc6','Exo1','Tipin','Dscc1',
+    'Blm','Casp8ap2','Usp1','Clspn','Pola1','Chaf1b','Mrpl36','E2f8'
+]
+g2m_genes_mm = [
+    'Hmgb2','Cdk1','Nusap1','Ube2c','Birc5','Tpx2','Top2a','Ndc80',
+    'Cks2','Nuf2','Cks1b','Mki67','Tmpo','Cenpf','Tacc3','Pimreg',
+    'Smc4','Ccnb2','Ckap2l','Ckap2','Aurkb','Bub1','Kif11','Anp32e',
+    'Tubb4b','Gtse1','Kif20b','Hjurp','Cdca3','Jpt1','Cdc20','Ttk',
+    'Cdc25c','Kif2c','Rangap1','Ncapd2','Dlgap5','Cdca2','Cdca8',
+    'Ect2','Kif23','Hmmr','Aurka','Psrc1','Anln','Lbr','Ckap5',
+    'Cenpe','Ctcf','Nek2','G2e3','Gas2l3','Cbx5','Cenpa'
+]
+cc_genes = [g for g in s_genes_mm + g2m_genes_mm if g in adata.var_names]
+print(f"Cell-cycle lateral genes marked: {len(cc_genes)}")
+
+mc.pl.mark_lateral_genes(
+    adata,
+    lateral_gene_names = cc_genes
+)
+```
+
+### 4.2 — Compute metacells per sample
+
+MC2 should be run per group (sample) to avoid mixing cells from different
+conditions, then results are combined.
+
+```{python compute-mc2}
+#| output: asis
+
+if H5AD_OUT.exists():
+    print(f"Output already exists — loading {H5AD_OUT}")
+    mc_adata = ad.read_h5ad(H5AD_OUT)
+else:
+    mc_list = []
+    clust_col = [c for c in adata.obs.columns if 'res.0.9' in c and 'pca' in c][0]
+
+    for sample in adata.obs['sample.name'].unique():
+        print(f"\n── Processing {sample} ──")
+        sub = adata[adata.obs['sample.name'] == sample].copy()
+
+        # divide_and_conquer_pipeline is the one-pass MC2 entry point;
+        # results are written back into sub.obs['metacell'] (-1 = outlier)
+        mc.pl.divide_and_conquer_pipeline(
+            sub,
+            target_metacell_size = TARGET_METACELL_SIZE,
+            random_seed          = 42
+        )
+
+        # Collect metacell-level AnnData (summed raw counts per metacell)
+        mc_sub = mc.pl.collect_metacells(sub, name=sample)
+        mc_sub.obs['sample.name'] = sample
+
+        cell_to_mc = sub.obs['metacell'].values   # int, -1 = outlier
+
+        outlier_frac = (cell_to_mc == -1).mean()
+        print(f"  {mc_sub.n_obs} metacells | outlier fraction: {outlier_frac:.2%}")
+
+        # ── Majority cluster per metacell ─────────────────────────────────────
+        mc_cluster = (
+            pd.DataFrame({'mc': cell_to_mc, 'clust': sub.obs[clust_col].values})
+            .query('mc >= 0')
+            .groupby('mc')['clust']
+            .agg(lambda x: x.value_counts().idxmax())
+            .astype(str)
+        )
+        mc_sub.obs['majority_cluster'] = mc_cluster.reindex(
+            range(mc_sub.n_obs)
+        ).values
+
+        # ── Majority condition ────────────────────────────────────────────────
+        cond_col    = 'condition' if 'condition' in sub.obs.columns else 'sample.name'
+        mc_cond = (
+            pd.DataFrame({'mc': cell_to_mc, 'cond': sub.obs[cond_col].values})
+            .query('mc >= 0')
+            .groupby('mc')['cond']
+            .agg(lambda x: x.value_counts().idxmax())
+        )
+        mc_sub.obs['condition'] = mc_cond.reindex(range(mc_sub.n_obs)).values
+
+        # ── Median UMAP coordinates ───────────────────────────────────────────
+        if 'X_umap' in sub.obsm:
+            umap = pd.DataFrame(sub.obsm['X_umap'],
+                                columns=['UMAP1', 'UMAP2'],
+                                index=sub.obs_names)
+            umap['mc'] = cell_to_mc
+            mc_umap = umap.query('mc >= 0').groupby('mc')[['UMAP1','UMAP2']].median()
+            mc_sub.obsm['X_umap'] = mc_umap.reindex(range(mc_sub.n_obs)).values
+
+        mc_list.append(mc_sub)
+
+    mc_adata = ad.concat(mc_list, merge='same')
+    mc_adata.write_h5ad(H5AD_OUT)
+    print(f"\nSaved → {H5AD_OUT}")
+
+print(mc_adata)
+```
+
+---
+
+## 5 — Metacell size distribution
+
+```{python size-dist}
+import matplotlib.pyplot as plt
+
+sizes = mc_adata.obs['metacell_size'].astype(int) \
+        if 'metacell_size' in mc_adata.obs.columns \
+        else mc_adata.obs.get('grouped', pd.Series(dtype=str)).str.split(';').str.len()
+
+fig, ax = plt.subplots(figsize=(7, 3))
+ax.hist(sizes, bins=30, color='#4e79a7', edgecolor='white')
+ax.set_xlabel('Cells per metacell')
+ax.set_ylabel('Count')
+ax.set_title('MC2 — metacell size distribution')
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 6 — Metacell UMAP
+
+Metacells placed at median UMAP of constituent cells, coloured by majority
+cluster and sized by metacell size.
+
+```{python umap-plot}
+if 'X_umap' in mc_adata.obsm:
+    umap_df = pd.DataFrame(mc_adata.obsm['X_umap'],
+                           columns=['UMAP1','UMAP2'],
+                           index=mc_adata.obs_names)
+    umap_df = umap_df.join(mc_adata.obs[['majority_cluster','condition','sample.name']])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    for ax, col, title in zip(
+        axes,
+        ['majority_cluster', 'condition'],
+        ['Majority cluster', 'Condition']
+    ):
+        groups = umap_df[col].unique()
+        for g in groups:
+            sub = umap_df[umap_df[col] == g]
+            ax.scatter(sub['UMAP1'], sub['UMAP2'], s=8, alpha=0.7, label=str(g))
+        ax.set_title(title)
+        ax.set_xlabel('UMAP1'); ax.set_ylabel('UMAP2')
+        ax.legend(markerscale=2, fontsize=7, bbox_to_anchor=(1,1))
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No UMAP embedding in mc_adata.obsm — skipping plot")
+```
+
+---
+
+## 7 — Metacells per cluster × condition
+
+```{python counts-plot}
+counts = (mc_adata.obs
+          .groupby(['majority_cluster', 'condition'])
+          .size()
+          .reset_index(name='n'))
+
+cond_order = ['WT', 'mCh-', 'mCh+']
+cond_pal   = {'WT': '#888888', 'mCh-': '#2a9d8f', 'mCh+': '#e76f51'}
+
+fig, ax = plt.subplots(figsize=(10, 4))
+clusters = sorted(counts['majority_cluster'].unique(),
+                  key=lambda x: (int(x) if str(x).isdigit() else x))
+x        = np.arange(len(clusters))
+width    = 0.25
+
+for i, cond in enumerate(cond_order):
+    sub = counts[counts['condition'] == cond].set_index('majority_cluster')
+    vals = [sub.loc[c, 'n'] if c in sub.index else 0 for c in clusters]
+    ax.bar(x + i * width, vals, width, label=cond, color=cond_pal.get(cond, 'grey'))
+
+ax.set_xticks(x + width)
+ax.set_xticklabels(clusters)
+ax.set_xlabel('Cluster')
+ax.set_ylabel('Metacells')
+ax.set_title('MC2 metacells per cluster × condition')
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 8 — Save normalised expression for R comparison
+
+Export the metacell normalised expression matrix as CSV so it can be loaded
+directly in R for benchmarking against hdWGCNA metacells.
+
+```{python export-csv}
+import scipy.sparse as sp
+
+# Normalise metacell counts (log-normalised per-metacell)
+mc_norm = mc_adata.copy()
+sc.pp.normalize_total(mc_norm, target_sum=1e4)
+sc.pp.log1p(mc_norm)
+
+expr_df = pd.DataFrame(
+    mc_norm.X.toarray() if sp.issparse(mc_norm.X) else mc_norm.X,
+    index   = mc_norm.obs_names,
+    columns = mc_norm.var_names
+).T  # genes × metacells
+
+expr_df.to_csv(OUT_DIR / 'mc2_hsc_expr.csv.gz', compression='gzip')
+
+mc_adata.obs.to_csv(OUT_DIR / 'mc2_hsc_obs.csv')
+
+print("Exported:")
+print(f"  {OUT_DIR}/mc2_hsc_expr.csv.gz  — {expr_df.shape[0]} genes × {expr_df.shape[1]} metacells")
+print(f"  {OUT_DIR}/mc2_hsc_obs.csv      — metacell metadata")
+```
+
+---
+
+## Session info
+
+```{python session}
+import importlib, sys
+for pkg in ['metacells', 'scanpy', 'anndata', 'numpy', 'pandas', 'scipy']:
+    try:
+        mod = importlib.import_module(pkg)
+        print(f"{pkg}: {mod.__version__}")
+    except Exception as e:
+        print(f"{pkg}: {e}")
+print(f"Python: {sys.version}")
+```

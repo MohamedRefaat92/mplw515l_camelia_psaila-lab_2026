@@ -1,0 +1,185 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+
+ig <- igraph::graph_from_adjacency_matrix(mpn_processed_hsc_fullcc@graphs$sNN_pca.SCT_30,
+                                          mode = "undirected",
+                                          weighted = TRUE)
+
+sample_name_diffusion <- sccore::propagateLabelsDiffusion(
+  ig,
+  mpn_processed_hsc_fullcc$sample.name,
+  max.iters = 100,
+  diffusion.fading = 10,# lower values increases the smoothing
+  diffusion.fading.const = 0.1,
+  tol = 0.025,
+  verbose = TRUE,
+  fixed.initial.labels = FALSE
+  
+)
+
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc,sample_name_diffusion)
+
+FeaturePlot(mpn_processed_hsc_fullcc,c( "HSC_Het_CD41+mCh+") ,reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+```
+
+```{r}
+sample_name_diffusion <- sccore::propagateLabelsDiffusion(
+  ig,
+  mpn_processed_hsc_fullcc$sample.name,
+  max.iters = 100,
+  diffusion.fading = 1,
+  diffusion.fading.const = 0.1,
+  tol = 0.025,
+  verbose = TRUE,
+  fixed.initial.labels = FALSE
+  
+)
+
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc,sample_name_diffusion)
+
+FeaturePlot(mpn_processed_hsc_fullcc,c( "HSC_Het_CD41+mCh+") ,reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Hif1a_detection <- ifelse(mpn_processed_hsc_fullcc[["SCT"]]@data["Hif1a",]>2, 
+                                            "Hif1a_on",
+                                            "Hif1a_off")
+Hif1a_detection_diffusion <- sccore::propagateLabelsDiffusion(
+  ig,
+  mpn_processed_hsc_fullcc$Hif1a_detection,
+  max.iters = 100,
+  diffusion.fading = 1,
+  diffusion.fading.const = 0.1,
+  tol = 0.025,
+  verbose = TRUE,
+  fixed.initial.labels = FALSE
+  
+)
+
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc,Hif1a_detection_diffusion)
+
+FeaturePlot(mpn_processed_hsc_fullcc,c( "Hif1a_on") ,reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "magma")&RestoreLegend()
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Glis1_detection <- ifelse(mpn_processed_hsc_fullcc[["SCT"]]@data["Glis1",]>1, 
+                                            "Glis1_on",
+                                            "Glis1_off")
+glis_on_diffusion <- sccore::propagateLabelsDiffusion(
+  ig,
+  mpn_processed_hsc_fullcc$Glis1_detection,
+  max.iters = 100,
+  diffusion.fading = 5,
+  diffusion.fading.const = 0.1,
+  tol = 0.025,
+  verbose = TRUE,
+  fixed.initial.labels = FALSE
+  
+)
+
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc,glis_on_diffusion)
+
+FeaturePlot(mpn_processed_hsc_fullcc,c( "Glis1_on") ,reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "magma")&RestoreLegend()
+```
+
+```{r smooth_count_matrix}
+ig <- igraph::graph_from_adjacency_matrix(mpn_processed_hsc_fullcc@graphs$sNN_pca.SCT_30,
+                                          mode = "undirected",
+                                          weighted = TRUE)
+
+Glis1_smooth <- sccore::smoothSignalOnGraph(signal = mpn_processed_hsc_fullcc[["SCT"]]@data["Glis1",],
+                            graph = ig,
+                            filter = sccore::heatFilter,
+                            order = 3,
+                            m = 50)
+mpn_processed_hsc_fullcc$Glis1_smooth <- Glis1_smooth
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c( "Glis1_smooth") ,
+            reduction = "umap.nn",
+            pt.size = 0.1,
+            order = T,
+            split.by = "sample.name")&
+  scale_color_viridis_c(option = "magma", limit = c(0,0.1))&RestoreLegend()
+
+```
+
+```{r}
+plt4 <- DimPlot(mpn_processed_hsc_fullcc,
+                label = FALSE, split.by = "sample.name",
+                cells.highlight = colnames(mpn_processed_hsc_fullcc)[mpn_processed_hsc_fullcc$Glis1_detection=="Glis1_on"],sizes.highlight = 1)&
+  NoLegend()
+
+plt1 <- FeaturePlot(mpn_processed_hsc_fullcc,c( "Glis1_on") ,
+                    reduction = "umap.nn",
+                    pt.size = 0.1, 
+                    order = T,
+                    split.by = "sample.name")&
+  scale_color_viridis_c(option = "magma")&
+  RestoreLegend()
+plt2 <- FeaturePlot(mpn_processed_hsc_fullcc,c( "Glis1_smooth") ,
+                    reduction = "umap.nn",
+                    pt.size = 0.1, 
+                    order = T,split.by = "sample.name")&
+  scale_color_viridis_c(option = "magma", limit = c(0,0.1))&
+  RestoreLegend()
+plt3 <- FeaturePlot(mpn_processed_hsc_fullcc,c( "Glis1"),
+                   reduction = "umap.nn",
+                   pt.size = 0.1, order = T,split.by = "sample.name")&
+  scale_color_viridis_c(option = "magma")&
+  RestoreLegend()
+
+plt4/plt1/plt2/plt3
+```
+
+```{r}
+hypoxia_gs <- list(HALLMARK_HYPOXIA = msig_gs$Hallmark$HALLMARK_HYPOXIA,
+                   BUFFA_HYPOXIA_METAGENE = msig_gs$C2_all$BUFFA_HYPOXIA_METAGENE,
+                   HARRIS_HYPOXIA = msig_gs$C2_all$HARRIS_HYPOXIA,
+                  BIOCARTA_P53HYPOXIA_PATHWAY =  msig_gs$C2_all$BIOCARTA_P53HYPOXIA_PATHWAY,
+                  gross_hypoxia_via_hif1a_up = msig_gs$C2$GROSS_HIF1A_TARGETS_UP,
+                  gross_hypoxia_via_hif1a_up = msig_gs$C2$GROSS_HIF1A_TARGETS_DN
+                   )
+mpn_processed_hsc_fullcc <- AddModuleScore(mpn_processed_hsc_fullcc,hypoxia_gs)
+
+
+FeaturePlot(mpn_processed_hsc_fullcc,paste0("Cluster",1:6) ,reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Egr1", "Hif1a", "Mmp16", "Glis1") ,reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Rbm47"),max.cutoff = "q99",reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+top_gs <- list(HALLMARK_HYPOXIA = msig_gs$Hallmark$HALLMARK_TNFA_SIGNALING_VIA_NFKB,
+                   BUFFA_HYPOXIA_METAGENE = msig_gs$Hallmark$HALLMARK_ANGIOGENESIS,
+                   HARRIS_HYPOXIA = msig_gs$Hallmark$HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION	,
+               HALLMARK = msig_gs$Hallmark$HALLMARK_HYPOXIA,
+                  BIOCARTA_P53HYPOXIA_PATHWAY =  msig_gs$Hallmark$HALLMARK_ESTROGEN_RESPONSE_EARLY,
+                  gross_hypoxia_via_hif1a_up = msig_gs$Hallmark$HALLMARK_IL6_JAK_STAT3_SIGNALING
+                   )
+mpn_processed_hsc_fullcc <- AddModuleScore(mpn_processed_hsc_fullcc,top_gs)
+
+
+FeaturePlot(mpn_processed_hsc_fullcc,paste0("Cluster",1:5) ,reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Syk", "Tnf", "Cd14", "Irak2"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Ppbp", "Csf3"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```

@@ -1,0 +1,466 @@
+---
+title: "Reference Annotation — HSC"
+author:
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+library(dplyr)
+library(targets)
+library(mclust)
+library(ComplexHeatmap)
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+RESOLUTIONS <- c(0.1, 0.2, 0.3, 0.5, 0.6, 0.7)
+
+get_type_legend <- function(p) {
+  cowplot::get_legend(
+    p + theme(legend.position = "right", legend.text = element_text(size = 7)) +
+      guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1), ncol = 1)))
+}
+```
+
+```{r data-load}
+tar_load(anno_meta_hsc)
+tar_load(annotation_recluster_hsc)
+hsc_df <- anno_merge_recluster(anno_meta_hsc, annotation_recluster_hsc)
+rm(anno_meta_hsc, annotation_recluster_hsc)
+gc()
+```
+
+Reference-based label transfer for the HSC compartment. Each section loads its reference and projection independently, plots all panels, then cleans up before the next.
+
+------------------------------------------------------------------------
+
+## Ferchen 2026 BM (mm)
+
+```{r ferchen-load}
+ref_df   <- tar_read(ferchen_26_mm_bm_umap)
+proj     <- inner_join(hsc_df, tar_read(proj_ferchen_26_mm_bm_hsc))
+type_pal <- anno_make_type_pal(ref_df, proj$predicted.Level2, "Level2")
+```
+
+```{r ferchen-labels, fig.width=11, fig.height=4.5}
+p_ref  <- plot_ref_umap(ref_df, type_pal, "Ferchen 2026 BM", "Level2", "UMAP")
+p_proj <- plot_ref_proj_umap(proj, ref_df, type_pal, "Level2", "UMAP_", "UMAP")
+cowplot::plot_grid(cowplot::plot_grid(p_ref, p_proj), get_type_legend(p_ref),
+                  rel_widths = c(1, 0.22))
+```
+
+```{r ferchen-density, fig.width=16, fig.height=4}
+proj %>% split(.$sample.name) %>%
+  lapply(plot_query_density_umap, ref_df = ref_df, proj_key = "UMAP_", ref_key = "UMAP") %>%
+  patchwork::wrap_plots(nrow = 1)
+```
+
+```{r ferchen-mapping, fig.width=11, fig.height=4.5}
+cowplot::plot_grid(plot_query_label_umap(proj, type_pal, "Level2"),
+                  plot_mapping_score_umap(proj))
+```
+
+```{r ferchen-ari, fig.width=6, fig.height=3.5}
+compute_ari_table(proj, RESOLUTIONS, "Level2") |>
+  plot_ari_line("ARI — Ferchen 2026 × HSC")
+```
+
+```{r ferchen-heatmap, fig.width=9, fig.height=5}
+ht <- plot_resolution_heatmap(proj, "predicted.Level2", RESOLUTIONS, "Ferchen 2026 × HSC")
+if (!is.null(ht)) ComplexHeatmap::draw(ht)
+```
+
+```{r ferchen-cleanup}
+rm(ref_df, proj, type_pal); gc()
+```
+
+------------------------------------------------------------------------
+
+## HemAtlas BM (mm)
+
+```{r hematlas-bm-load}
+ref_df   <- tar_read(hematlas_mm_bm)
+proj     <- inner_join(hsc_df, tar_read(proj_hematlas_mm_bm_hsc))
+type_pal <- anno_make_type_pal(ref_df, proj$predicted.Cell_type, "Cell_type")
+```
+
+```{r hematlas-bm-labels, fig.width=11, fig.height=4.5}
+p_ref  <- plot_ref_umap(ref_df, type_pal, "HemAtlas BM", "Cell_type", "UMAP")
+p_proj <- plot_ref_proj_umap(proj, ref_df, type_pal, "Cell_type", "UMAP_", "UMAP")
+cowplot::plot_grid(cowplot::plot_grid(p_ref, p_proj), get_type_legend(p_ref),
+                  rel_widths = c(1, 0.22))
+```
+
+```{r hematlas-bm-density, fig.width=16, fig.height=4}
+proj %>% split(.$sample.name) %>%
+  lapply(plot_query_density_umap, ref_df = ref_df, proj_key = "UMAP_", ref_key = "UMAP") %>%
+  patchwork::wrap_plots(nrow = 1)
+```
+
+```{r hematlas-bm-mapping, fig.width=11, fig.height=4.5}
+cowplot::plot_grid(plot_query_label_umap(proj, type_pal, "Cell_type"),
+                  plot_mapping_score_umap(proj))
+```
+
+```{r hematlas-bm-ari, fig.width=6, fig.height=3.5}
+compute_ari_table(proj, RESOLUTIONS, "Cell_type") |>
+  plot_ari_line("ARI — HemAtlas BM × HSC")
+```
+
+```{r hematlas-bm-heatmap, fig.width=9, fig.height=5}
+ht <- plot_resolution_heatmap(proj, "predicted.Cell_type", RESOLUTIONS, "HemAtlas BM × HSC")
+if (!is.null(ht)) ComplexHeatmap::draw(ht)
+```
+
+```{r hematlas-bm-cleanup}
+rm(ref_df, proj, type_pal); gc()
+```
+
+------------------------------------------------------------------------
+
+## HemAtlas Fetal Liver (mm)
+
+```{r hematlas-fl-load}
+ref_df   <- tar_read(hematlas_mm_fl)
+proj     <- inner_join(hsc_df, tar_read(proj_hematlas_mm_fl_hsc))
+type_pal <- anno_make_type_pal(ref_df, proj$predicted.Cell_type, "Cell_type")
+```
+
+```{r hematlas-fl-labels, fig.width=11, fig.height=4.5}
+p_ref  <- plot_ref_umap(ref_df, type_pal, "HemAtlas FL", "Cell_type", "UMAP")
+p_proj <- plot_ref_proj_umap(proj, ref_df, type_pal, "Cell_type", "UMAP_", "UMAP")
+cowplot::plot_grid(cowplot::plot_grid(p_ref, p_proj), get_type_legend(p_ref),
+                  rel_widths = c(1, 0.22))
+```
+
+```{r hematlas-fl-density, fig.width=16, fig.height=4}
+proj %>% split(.$sample.name) %>%
+  lapply(plot_query_density_umap, ref_df = ref_df, proj_key = "UMAP_", ref_key = "UMAP") %>%
+  patchwork::wrap_plots(nrow = 1)
+```
+
+```{r hematlas-fl-mapping, fig.width=11, fig.height=4.5}
+cowplot::plot_grid(plot_query_label_umap(proj, type_pal, "Cell_type"),
+                  plot_mapping_score_umap(proj))
+```
+
+```{r hematlas-fl-ari, fig.width=6, fig.height=3.5}
+compute_ari_table(proj, RESOLUTIONS, "Cell_type") |>
+  plot_ari_line("ARI — HemAtlas FL × HSC")
+```
+
+```{r hematlas-fl-heatmap, fig.width=9, fig.height=5}
+ht <- plot_resolution_heatmap(proj, "predicted.Cell_type", RESOLUTIONS, "HemAtlas FL × HSC")
+if (!is.null(ht)) ComplexHeatmap::draw(ht)
+```
+
+```{r hematlas-fl-cleanup}
+rm(ref_df, proj, type_pal); gc()
+```
+
+------------------------------------------------------------------------
+
+## MCA BM c-Kit (mm)
+
+```{r mca-ckit-load}
+ref_df   <- tar_read(mca_mm_bm_ckit_umap)
+proj     <- inner_join(hsc_df, tar_read(proj_mca_mm_bm_ckit_hsc))
+type_pal <- anno_make_type_pal(ref_df, proj$predicted.cell_type, "cell_type")
+```
+
+```{r mca-ckit-labels, fig.width=11, fig.height=4.5}
+p_ref  <- plot_ref_umap(ref_df, type_pal, "MCA BM c-Kit", "cell_type", "UMAP")
+p_proj <- plot_ref_proj_umap(proj, ref_df, type_pal, "cell_type", "UMAP_", "UMAP")
+cowplot::plot_grid(cowplot::plot_grid(p_ref, p_proj), get_type_legend(p_ref),
+                  rel_widths = c(1, 0.22))
+```
+
+```{r mca-ckit-density, fig.width=16, fig.height=4}
+proj %>% split(.$sample.name) %>%
+  lapply(plot_query_density_umap, ref_df = ref_df, proj_key = "UMAP_", ref_key = "UMAP") %>%
+  patchwork::wrap_plots(nrow = 1)
+```
+
+```{r mca-ckit-mapping, fig.width=11, fig.height=4.5}
+cowplot::plot_grid(plot_query_label_umap(proj, type_pal, "cell_type"),
+                  plot_mapping_score_umap(proj))
+```
+
+```{r mca-ckit-ari, fig.width=6, fig.height=3.5}
+compute_ari_table(proj, RESOLUTIONS, "cell_type") |>
+  plot_ari_line("ARI — MCA c-Kit × HSC")
+```
+
+```{r mca-ckit-heatmap, fig.width=9, fig.height=5}
+ht <- plot_resolution_heatmap(proj, "predicted.cell_type", RESOLUTIONS, "MCA c-Kit × HSC")
+if (!is.null(ht)) ComplexHeatmap::draw(ht)
+```
+
+```{r mca-ckit-cleanup}
+rm(ref_df, proj, type_pal); gc()
+```
+
+------------------------------------------------------------------------
+
+## MCA BM Mesenchyme (mm)
+
+```{r mca-mes-load}
+ref_df   <- tar_read(mca_mm_bm_mesench_umap)
+proj     <- inner_join(hsc_df, tar_read(proj_mca_mm_bm_mesench_hsc))
+type_pal <- anno_make_type_pal(ref_df, proj$predicted.cell_type, "cell_type")
+```
+
+```{r mca-mes-labels, fig.width=11, fig.height=4.5}
+p_ref  <- plot_ref_umap(ref_df, type_pal, "MCA BM Mesenchyme", "cell_type", "UMAP")
+p_proj <- plot_ref_proj_umap(proj, ref_df, type_pal, "cell_type", "UMAP_", "UMAP")
+cowplot::plot_grid(cowplot::plot_grid(p_ref, p_proj), get_type_legend(p_ref),
+                  rel_widths = c(1, 0.22))
+```
+
+```{r mca-mes-density, fig.width=16, fig.height=4}
+proj %>% split(.$sample.name) %>%
+  lapply(plot_query_density_umap, ref_df = ref_df, proj_key = "UMAP_", ref_key = "UMAP") %>%
+  patchwork::wrap_plots(nrow = 1)
+```
+
+```{r mca-mes-mapping, fig.width=11, fig.height=4.5}
+cowplot::plot_grid(plot_query_label_umap(proj, type_pal, "cell_type"),
+                  plot_mapping_score_umap(proj))
+```
+
+```{r mca-mes-ari, fig.width=6, fig.height=3.5}
+compute_ari_table(proj, RESOLUTIONS, "cell_type") |>
+  plot_ari_line("ARI — MCA Mesenchyme × HSC")
+```
+
+```{r mca-mes-heatmap, fig.width=9, fig.height=5}
+ht <- plot_resolution_heatmap(proj, "predicted.cell_type", RESOLUTIONS, "MCA Mesenchyme × HSC")
+if (!is.null(ht)) ComplexHeatmap::draw(ht)
+```
+
+```{r mca-mes-cleanup}
+rm(ref_df, proj, type_pal); gc()
+```
+
+------------------------------------------------------------------------
+
+## MCA Peripheral Blood (mm)
+
+```{r mca-pbmc-load}
+ref_df   <- tar_read(mca_mm_pbmc_umap)
+proj     <- inner_join(hsc_df, tar_read(proj_mca_mm_pbmc_hsc))
+type_pal <- anno_make_type_pal(ref_df, proj$predicted.cell_type, "cell_type")
+```
+
+```{r mca-pbmc-labels, fig.width=11, fig.height=4.5}
+p_ref  <- plot_ref_umap(ref_df, type_pal, "MCA Peripheral Blood", "cell_type", "UMAP")
+p_proj <- plot_ref_proj_umap(proj, ref_df, type_pal, "cell_type", "UMAP_", "UMAP")
+cowplot::plot_grid(cowplot::plot_grid(p_ref, p_proj), get_type_legend(p_ref),
+                  rel_widths = c(1, 0.22))
+```
+
+```{r mca-pbmc-density, fig.width=16, fig.height=4}
+proj %>% split(.$sample.name) %>%
+  lapply(plot_query_density_umap, ref_df = ref_df, proj_key = "UMAP_", ref_key = "UMAP") %>%
+  patchwork::wrap_plots(nrow = 1)
+```
+
+```{r mca-pbmc-mapping, fig.width=11, fig.height=4.5}
+cowplot::plot_grid(plot_query_label_umap(proj, type_pal, "cell_type"),
+                  plot_mapping_score_umap(proj))
+```
+
+```{r mca-pbmc-ari, fig.width=6, fig.height=3.5}
+compute_ari_table(proj, RESOLUTIONS, "cell_type") |>
+  plot_ari_line("ARI — MCA PBMC × HSC")
+```
+
+```{r mca-pbmc-heatmap, fig.width=9, fig.height=5}
+ht <- plot_resolution_heatmap(proj, "predicted.cell_type", RESOLUTIONS, "MCA PBMC × HSC")
+if (!is.null(ht)) ComplexHeatmap::draw(ht)
+```
+
+```{r mca-pbmc-cleanup}
+rm(ref_df, proj, type_pal); gc()
+```
+
+------------------------------------------------------------------------
+
+## Zeng 2025 BM (hs→mm)
+
+Cross-species projection onto the human BoneMarrowMap via PCA anchors. Query coordinates sit in the reference PCA/UMAP space (`refUMAP_1`/`refUMAP_2`); the reference itself uses `UMAP_1`/`UMAP_2`. No per-condition density panel (projection space is shared across all conditions).
+
+```{r zeng-load}
+ref_df   <- tar_read(zeng_25_hs_bm_umap)
+proj     <- inner_join(hsc_df, tar_read(proj_zeng_25_hs_bm_hsc))
+type_pal <- anno_make_type_pal(ref_df, proj$predicted.CellType_Broad, "CellType_Broad")
+```
+
+```{r zeng-labels, fig.width=11, fig.height=4.5}
+p_ref  <- plot_ref_umap(ref_df, type_pal, "Zeng 2025 BM", "CellType_Broad", "UMAP_")
+p_proj <- plot_ref_proj_umap(proj, ref_df, type_pal, "CellType_Broad", "refUMAP_", "UMAP_")
+cowplot::plot_grid(cowplot::plot_grid(p_ref, p_proj), get_type_legend(p_ref),
+                  rel_widths = c(1, 0.22))
+```
+
+```{r zeng-mapping, fig.width=11, fig.height=4.5}
+cowplot::plot_grid(plot_query_label_umap(proj, type_pal, "CellType_Broad"),
+                  plot_mapping_score_umap(proj))
+```
+
+```{r zeng-ari, fig.width=6, fig.height=3.5}
+compute_ari_table(proj, RESOLUTIONS, "CellType_Broad") |>
+  plot_ari_line("ARI — Zeng 2025 × HSC")
+```
+
+```{r zeng-heatmap, fig.width=9, fig.height=5}
+ht <- plot_resolution_heatmap(proj, "predicted.CellType_Broad", RESOLUTIONS, "Zeng 2025 × HSC")
+if (!is.null(ht)) ComplexHeatmap::draw(ht)
+```
+
+```{r zeng-cleanup}
+rm(ref_df, proj, type_pal); gc()
+```
+
+------------------------------------------------------------------------
+
+## SingleR
+
+Automated label transfer using bulk RNA-seq references from `celldex`. Three references: Novershtern Haematopoietic (human, mapped to mouse orthologs), ImmGen (mouse immune atlas), Mouse RNAseq (broad types).
+
+```{r singler-setup, message=FALSE}
+library(SingleR)
+library(celldex)
+library(BiocParallel)
+
+tar_load(mm_hs_ortho_long)
+ref_nov  <- celldex::NovershternHematopoieticData()
+ref_ig   <- celldex::ImmGenData()
+ref_mrna <- celldex::MouseRNAseqData()
+
+ortho_1to1 <- mm_hs_ortho_long |>
+  dplyr::filter(human_ortho %in% rownames(ref_nov)) |>
+  dplyr::group_by(human_ortho)     |> dplyr::filter(dplyr::n() == 1) |> dplyr::ungroup() |>
+  dplyr::group_by(Mouse.gene.name) |> dplyr::filter(dplyr::n() == 1) |> dplyr::ungroup()
+ref_nov_mm <- ref_nov[ortho_1to1$human_ortho, ]
+rownames(ref_nov_mm) <- ortho_1to1$Mouse.gene.name
+rm(mm_hs_ortho_long)
+```
+
+```{r singler-run, message=FALSE}
+tar_load(mpn_processed_data_hsc)
+expr_mat <- SeuratObject::GetAssayData(mpn_processed_data_hsc, assay = "SCT", layer = "data")
+rm(mpn_processed_data_hsc); gc()
+singler_nov  <- SingleR(test = expr_mat, ref = ref_nov_mm, labels = ref_nov_mm$label.main,
+                        BPPARAM = SerialParam())
+singler_ig   <- SingleR(test = expr_mat, ref = ref_ig,     labels = ref_ig$label.main,
+                        BPPARAM = SerialParam())
+singler_mrna <- SingleR(test = expr_mat, ref = ref_mrna,   labels = ref_mrna$label.main,
+                        BPPARAM = SerialParam())
+rm(expr_mat, ref_nov, ref_ig, ref_mrna, ref_nov_mm); gc()
+```
+
+```{r singler-helpers, include=FALSE}
+umap_cols <- hsc_df[, c("cell_id", "UMAP1", "UMAP2")]
+
+singler_umap <- function(pred, title) {
+  pred_df <- data.frame(cell_id = rownames(pred), label = pred$labels)
+  df      <- inner_join(umap_cols, pred_df, by = "cell_id")
+  lvls    <- sort(unique(df$label))
+  pal     <- setNames(colorRampPalette(
+    RColorBrewer::brewer.pal(max(3, min(length(lvls), 12)), "Paired"))(length(lvls)), lvls)
+  cents   <- df %>%
+    group_by(label) %>%
+    summarise(UMAP1 = mean(UMAP1), UMAP2 = mean(UMAP2), .groups = "drop")
+  ggplot(df, aes(UMAP1, UMAP2, colour = label)) +
+    geom_point(size = 0.3, alpha = 0.5) +
+    ggrepel::geom_label_repel(
+      data = cents, aes(label = label),
+      size = 3, fontface = "bold",
+      label.size = 0.2, label.padding = unit(0.15, "lines"),
+      fill = alpha("white", 0.75), max.overlaps = Inf, show.legend = FALSE) +
+    scale_colour_manual(values = pal, name = NULL) +
+    labs(title = title) +
+    theme_void(base_size = 11) +
+    theme(legend.position = "none")
+}
+
+singler_bar <- function(pred, title) {
+  as.data.frame(table(label = pred$labels)) |>
+    mutate(prop = Freq / sum(Freq)) |> arrange(desc(prop)) |>
+    mutate(label = factor(label, levels = label)) |>
+    ggplot(aes(x = label, y = prop)) +
+    geom_col(fill = "#4393c3") +
+    geom_text(aes(label = scales::percent(prop, accuracy = 0.1)), hjust = -0.1, size = 3) +
+    coord_flip() +
+    scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.25))) +
+    labs(x = NULL, y = "Proportion", title = title) +
+    theme_classic(base_size = 10)
+}
+```
+
+### Novershtern Haematopoietic
+
+```{r singler-nov-umap, fig.width=10, fig.height=6}
+singler_umap(singler_nov, "HSC — Novershtern")
+```
+
+```{r singler-nov-bar, fig.width=7, fig.height=5}
+singler_bar(singler_nov, "Label distribution — Novershtern")
+```
+
+```{r singler-nov-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_nov, ncol = 4)
+```
+
+### ImmGen (mouse)
+
+```{r singler-ig-umap, fig.width=10, fig.height=6}
+singler_umap(singler_ig, "HSC — ImmGen")
+```
+
+```{r singler-ig-bar, fig.width=7, fig.height=5}
+singler_bar(singler_ig, "Label distribution — ImmGen")
+```
+
+```{r singler-ig-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_ig, ncol = 4)
+```
+
+### Mouse RNAseq (broad)
+
+```{r singler-mrna-umap, fig.width=10, fig.height=6}
+singler_umap(singler_mrna, "HSC — Mouse RNAseq")
+```
+
+```{r singler-mrna-bar, fig.width=7, fig.height=5}
+singler_bar(singler_mrna, "Label distribution — Mouse RNAseq")
+```
+
+```{r singler-mrna-delta, fig.width=9, fig.height=5}
+SingleR::plotDeltaDistribution(singler_mrna, ncol = 4)
+```
+
+```{r singler-cleanup}
+rm(singler_nov, singler_ig, singler_mrna, hsc_df); gc()
+```
+
+{{< include ../_session-info.qmd >}}

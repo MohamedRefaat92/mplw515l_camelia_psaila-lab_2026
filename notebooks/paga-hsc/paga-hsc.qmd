@@ -1,0 +1,556 @@
+---
+title: "HSC PAGA Analysis"
+format:
+  html:
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r r-setup}
+#| include: false
+library(Seurat)
+library(reticulate)
+
+# The Python chunks run in the project's Python environment (.venv, from uv)
+reticulate::use_virtualenv(".venv", required = TRUE)
+```
+
+```{r r-export}
+#| include: false
+# ── Parameters ────────────────────────────────────────────────────────────────
+CLUS_COL   <- "sNN_pca.SCT_30_res.0.9"
+N_PCA_DIMS <- 30L
+OUT_DIR    <- "/tmp/paga_hsc"
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+label_condition <- function(x) {
+  dplyr::case_when(
+    grepl("WT",      x) ~ "WT",
+    grepl("mCh-",   x) ~ "mCh-",
+    grepl("mCh\\+", x) ~ "mCh+",
+    TRUE                ~ x
+  )
+}
+
+# ── Load full-cohort object (source of cluster labels + background UMAP) ──────
+cat("Loading mpn_processed_hsc_fullcc ...\n")
+mpn_full <- targets::tar_read(mpn_processed_hsc_fullcc)
+
+full_umap_raw  <- as.data.frame(mpn_full@reductions$umap@cell.embeddings)
+clus_meta_full <- data.frame(
+  cluster   = as.character(mpn_full@meta.data[[CLUS_COL]]),
+  row.names = colnames(mpn_full)
+)
+
+# Save full-cohort UMAP as grey background reference for all condition plots
+write.csv(full_umap_raw, file.path(OUT_DIR, "bg_umap.csv"))
+
+cat(sprintf("Full cohort: %d cells, %d clusters\n",
+            nrow(clus_meta_full), length(unique(clus_meta_full$cluster))))
+
+rm(mpn_full); invisible(gc())
+
+# ── Helper: export one condition-specific object ──────────────────────────────
+export_condition <- function(target_name, name) {
+  cat(sprintf("Loading %s ...\n", target_name))
+  srt <- targets::tar_read_raw(target_name)
+
+  shared <- intersect(colnames(srt), rownames(clus_meta_full))
+  obs <- data.frame(
+    cluster   = clus_meta_full[shared, "cluster"],
+    condition = label_condition(srt$sample.name[shared]),
+    sample    = srt$sample.name[shared],
+    row.names = shared
+  )
+  pca  <- as.data.frame(
+    Seurat::Embeddings(srt, "pca.SCT")[shared, seq_len(N_PCA_DIMS)])
+  umap_own  <- as.data.frame(srt@reductions$umap@cell.embeddings[shared, ])
+  umap_full <- full_umap_raw[shared, ]
+
+  write.csv(obs,       file.path(OUT_DIR, paste0(name, "_obs.csv")))
+  write.csv(pca,       file.path(OUT_DIR, paste0(name, "_pca.csv")))
+  write.csv(umap_own,  file.path(OUT_DIR, paste0(name, "_umap.csv")))
+  write.csv(umap_full, file.path(OUT_DIR, paste0(name, "_umap_full.csv")))
+
+  cat(sprintf("  %s: %d cells, clusters: %s\n",
+              name, nrow(obs), paste(sort(unique(obs$cluster)), collapse = " ")))
+  rm(srt, pca, umap_own, umap_full); invisible(gc())
+}
+
+export_condition("mpn_processed_hsc_wt_fullcc",    "wt")
+export_condition("mpn_processed_hsc_mchneg_fullcc", "mchneg")
+export_condition("mpn_processed_hsc_mchpos_fullcc", "mchpos")
+
+cat("Data export complete →", OUT_DIR, "\n")
+```
+
+```{python py-setup}
+import sys, os
+
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.colors as mcolors
+import seaborn as sns
+import scanpy as sc
+import anndata as ad
+
+sc.settings.verbosity = 1
+DATA_DIR  = "/tmp/paga_hsc"
+N_NEIGH   = 20    # kNN neighbours (matches Seurat k_neighbors)
+CLUS_COL  = "cluster"
+THRESHOLD        = 0.15  # minimum PAGA connectivity weight to draw an edge
+EXCLUDE_CLUSTERS = ["16", "17", "20"]
+
+cond_pal = {"WT": "#888888", "mCh-": "#2a9d8f", "mCh+": "#e76f51"}
+```
+
+```{python py-helpers}
+def load_adata(name, data_dir=DATA_DIR):
+    """Assemble AnnData from exported CSVs."""
+    obs  = pd.read_csv(f"{data_dir}/{name}_obs.csv",  index_col=0)
+    pca  = pd.read_csv(f"{data_dir}/{name}_pca.csv",  index_col=0)
+    umap = pd.read_csv(f"{data_dir}/{name}_umap.csv", index_col=0)
+
+    adata = ad.AnnData(
+        X   = sp.csr_matrix((len(obs), 1)),   # dummy; PAGA only needs the graph
+        obs = obs
+    )
+    adata.obsm["X_pca"]  = pca.values.astype("float32")
+    adata.obsm["X_umap"] = umap.values.astype("float32")
+
+    full_path = f"{data_dir}/{name}_umap_full.csv"
+    if os.path.exists(full_path):
+        umap_full = pd.read_csv(full_path, index_col=0)
+        adata.obsm["X_umap_full"] = umap_full.values.astype("float32")
+
+    adata.obs[CLUS_COL] = adata.obs[CLUS_COL].astype(str).astype("category")
+    return adata
+
+
+def run_paga(adata, cluster_col=CLUS_COL, n_neighbors=N_NEIGH):
+    sc.pp.neighbors(adata, use_rep="X_pca", n_neighbors=n_neighbors,
+                    random_state=42)
+    sc.tl.paga(adata, groups=cluster_col)
+    return adata
+
+
+def cluster_centroids(adata, umap_key="X_umap"):
+    """Return DataFrame of cluster centroid UMAP coordinates."""
+    umap     = adata.obsm[umap_key]
+    clusters = adata.obs[CLUS_COL].values
+    cats     = adata.obs[CLUS_COL].cat.categories.tolist()
+    coords   = np.array([umap[clusters == c].mean(axis=0) for c in cats])
+    return pd.DataFrame(coords, index=cats, columns=["x", "y"])
+
+
+def plot_paga_on_ax(adata, ax, umap_key="X_umap",
+                    bg_umap=None, title="",
+                    threshold=THRESHOLD, node_size_max=400,
+                    edge_color="steelblue"):
+    """Draw PAGA graph overlaid on UMAP scatter.
+
+    bg_umap : (n, 2) array for the grey background; defaults to adata.obsm[umap_key].
+    """
+    clusters = adata.obs[CLUS_COL].values
+    cats     = adata.obs[CLUS_COL].cat.categories.tolist()
+    conn     = adata.uns["paga"]["connectivities"].toarray()
+    umap_bg  = adata.obsm[umap_key] if bg_umap is None else bg_umap
+    cents    = cluster_centroids(adata, umap_key)
+
+    sizes = np.array([np.sum(clusters == c) for c in cats], dtype=float)
+
+    # Grey background
+    ax.scatter(umap_bg[:, 0], umap_bg[:, 1],
+               c="#e0e0e0", s=0.4, alpha=0.5, linewidths=0, rasterized=True)
+
+    # Edges
+    for i in range(len(cats)):
+        for j in range(i + 1, len(cats)):
+            w = conn[i, j]
+            if w > threshold:
+                ax.plot([cents.iloc[i]["x"], cents.iloc[j]["x"]],
+                        [cents.iloc[i]["y"], cents.iloc[j]["y"]],
+                        lw=w * 6, color=edge_color, alpha=0.75,
+                        solid_capstyle="round", zorder=2)
+
+    # Nodes — tab20 colours, area ∝ sqrt(n_cells)
+    node_s = (np.sqrt(sizes) / np.sqrt(sizes).max()) * node_size_max
+    cmap   = plt.cm.get_cmap("tab20", len(cats))
+    for k, (c, s) in enumerate(zip(cats, node_s)):
+        ax.scatter(cents.loc[c, "x"], cents.loc[c, "y"],
+                   s=s, color=cmap(k), edgecolors="white",
+                   linewidths=0.6, zorder=3)
+        ax.annotate(str(c), (cents.loc[c, "x"], cents.loc[c, "y"]),
+                    fontsize=6, ha="center", va="center",
+                    fontweight="bold", color="white", zorder=4)
+
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=4)
+    ax.axis("off")
+```
+
+---
+
+# 1  Load & compute PAGA
+
+```{python load-and-run}
+adata_wt     = load_adata("wt")
+adata_mchneg = load_adata("mchneg")
+adata_mchpos = load_adata("mchpos")
+
+# Full-cohort background UMAP (grey backdrop for all condition plots)
+bg_umap_arr = pd.read_csv(f"{DATA_DIR}/bg_umap.csv", index_col=0).values.astype("float32")
+
+# Drop excluded clusters before any graph computation
+for adata in [adata_wt, adata_mchneg, adata_mchpos]:
+    keep = ~adata.obs[CLUS_COL].isin(EXCLUDE_CLUSTERS)
+    adata._inplace_subset_obs(keep)
+    adata.obs[CLUS_COL] = adata.obs[CLUS_COL].cat.remove_unused_categories()
+
+print("Running PAGA — WT ...")
+adata_wt     = run_paga(adata_wt)
+
+print("Running PAGA — mCh− ...")
+adata_mchneg = run_paga(adata_mchneg)
+
+print("Running PAGA — mCh+ ...")
+adata_mchpos = run_paga(adata_mchpos)
+
+print("Done.")
+for name, adata in [("WT", adata_wt), ("mCh−", adata_mchneg), ("mCh+", adata_mchpos)]:
+    conn = adata.uns["paga"]["connectivities"]
+    above = (conn > THRESHOLD).nnz // 2
+    print(f"  {name:6s} — {adata.n_obs:5d} cells, "
+          f"{len(adata.obs[CLUS_COL].cat.categories):2d} clusters, "
+          f"{above} PAGA edges (threshold {THRESHOLD})")
+```
+
+---
+
+# 2  PAGA on respective UMAP
+
+Each dataset visualised in its own embedding.
+
+```{python plot-own-umap, fig.width=14, fig.height=5}
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+
+plot_paga_on_ax(adata_wt,     axes[0], umap_key="X_umap", title="WT (own UMAP)")
+plot_paga_on_ax(adata_mchneg, axes[1], umap_key="X_umap", title="mCh− (own UMAP)")
+plot_paga_on_ax(adata_mchpos, axes[2], umap_key="X_umap", title="mCh+ (own UMAP)")
+
+fig.suptitle("PAGA — condition-specific UMAP embedding",
+             fontsize=13, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+# 3  PAGA projected on full-cohort UMAP
+
+All three datasets projected onto the full-cohort UMAP coordinate system.
+Grey background = all full-cohort cells.
+
+```{python plot-full-umap, fig.width=14, fig.height=5}
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+
+plot_paga_on_ax(adata_wt, axes[0],
+                umap_key="X_umap_full",
+                bg_umap=bg_umap_arr,
+                title="WT (full-cohort UMAP)")
+
+plot_paga_on_ax(adata_mchneg, axes[1],
+                umap_key="X_umap_full",
+                bg_umap=bg_umap_arr,
+                title="mCh− (full-cohort UMAP)")
+
+plot_paga_on_ax(adata_mchpos, axes[2],
+                umap_key="X_umap_full",
+                bg_umap=bg_umap_arr,
+                title="mCh+ (full-cohort UMAP)")
+
+fig.suptitle("PAGA projected on full-cohort UMAP",
+             fontsize=13, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+# 4  Side-by-side on a shared canvas
+
+All three overlaid on the full-cohort background (all cells grey), drawn on three axes sharing the same coordinate range.
+
+```{python plot-shared-canvas, fig.width=15, fig.height=5}
+def axis_limits(umap_arr, pad=0.5):
+    return (umap_arr[:, 0].min() - pad, umap_arr[:, 0].max() + pad,
+            umap_arr[:, 1].min() - pad, umap_arr[:, 1].max() + pad)
+
+xlim = axis_limits(bg_umap_arr)[:2]
+ylim = axis_limits(bg_umap_arr)[2:]
+
+datasets = [
+    (adata_wt,     "X_umap_full", "WT",   "#888888"),
+    (adata_mchneg, "X_umap_full", "mCh−", "#2a9d8f"),
+    (adata_mchpos, "X_umap_full", "mCh+", "#e76f51"),
+]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+for ax, (adata, umap_k, title, ecol) in zip(axes, datasets):
+    # Grey full-cohort background
+    ax.scatter(bg_umap_arr[:, 0], bg_umap_arr[:, 1],
+               c="#e0e0e0", s=0.3, alpha=0.4, linewidths=0, rasterized=True)
+
+    conn  = adata.uns["paga"]["connectivities"].toarray()
+    cats  = adata.obs[CLUS_COL].cat.categories.tolist()
+    cents = cluster_centroids(adata, umap_k)
+    clusters = adata.obs[CLUS_COL].values
+    sizes = np.array([np.sum(clusters == c) for c in cats], dtype=float)
+
+    for i in range(len(cats)):
+        for j in range(i + 1, len(cats)):
+            w = conn[i, j]
+            if w > THRESHOLD:
+                ax.plot([cents.iloc[i]["x"], cents.iloc[j]["x"]],
+                        [cents.iloc[i]["y"], cents.iloc[j]["y"]],
+                        lw=w * 6, color=ecol, alpha=0.75,
+                        solid_capstyle="round", zorder=2)
+
+    node_s = (np.sqrt(sizes) / np.sqrt(sizes).max()) * 350
+    cmap   = plt.cm.get_cmap("tab20", len(cats))
+    for k, c in enumerate(cats):
+        ax.scatter(cents.loc[c, "x"], cents.loc[c, "y"],
+                   s=node_s[k], color=cmap(k),
+                   edgecolors="white", linewidths=0.6, zorder=3)
+        ax.annotate(str(c), (cents.loc[c, "x"], cents.loc[c, "y"]),
+                    fontsize=6, ha="center", va="center",
+                    fontweight="bold", color="white", zorder=4)
+
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.axis("off")
+
+fig.suptitle("PAGA on shared full-cohort canvas (grey = all cells)",
+             fontsize=13, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+# 5  PAGA connectivity matrices
+
+Inter-cluster connectivity weights (PAGA score) for each dataset.
+
+```{python connectivity-heatmaps, fig.width=15, fig.height=5}
+def paga_conn_df(adata):
+    cats = adata.obs[CLUS_COL].cat.categories.tolist()
+    mat  = adata.uns["paga"]["connectivities"].toarray()
+    df   = pd.DataFrame(mat, index=cats, columns=cats)
+    cats_sorted = sorted(cats, key=lambda x: int(x) if x.isdigit() else x)
+    return df.loc[cats_sorted, cats_sorted]
+
+datasets_hm = [
+    (adata_wt,     "WT"),
+    (adata_mchneg, "mCh−"),
+    (adata_mchpos, "mCh+"),
+]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+for ax, (adata, title) in zip(axes, datasets_hm):
+    df = paga_conn_df(adata)
+    sns.heatmap(df, ax=ax, cmap="Blues", vmin=0, vmax=1,
+                linewidths=0.3, linecolor="#f0f0f0",
+                xticklabels=True, yticklabels=True,
+                cbar_kws={"shrink": 0.7, "label": "connectivity"})
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=6)
+    ax.tick_params(axis="both", labelsize=7)
+
+fig.suptitle("PAGA cluster connectivity matrices",
+             fontsize=13, fontweight="bold", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+# 6  Binary connectivity heatmaps
+
+A pair of clusters is marked **1** if their PAGA connectivity weight exceeds the
+threshold (`THRESHOLD = 0.15`), otherwise **0**.
+
+## 6.1  Symmetric — all clusters
+
+```{python binary-hm-symmetric, fig.width=15, fig.height=5}
+def binary_conn_df(adata, threshold=THRESHOLD):
+    cats = adata.obs[CLUS_COL].cat.categories.tolist()
+    mat  = adata.uns["paga"]["connectivities"].toarray()
+    df   = pd.DataFrame((mat > threshold).astype(int), index=cats, columns=cats)
+    cats_sorted = sorted(cats, key=lambda x: int(x) if x.isdigit() else x)
+    return df.loc[cats_sorted, cats_sorted]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+for ax, (adata, title) in zip(axes, datasets_hm):
+    df = binary_conn_df(adata)
+    sns.heatmap(df, ax=ax, cmap=["#f7f7f7", "#2166ac"], vmin=0, vmax=1,
+                linewidths=0.3, linecolor="#e0e0e0",
+                xticklabels=True, yticklabels=True,
+                cbar=False)
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=6)
+    ax.tick_params(axis="both", labelsize=7)
+
+fig.suptitle(f"Binary PAGA connectivity (threshold {THRESHOLD}) — all clusters",
+             fontsize=13, fontweight="bold", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+## 6.2  Asymmetric — clusters 5, 21, 2 as columns
+
+```{python binary-hm-asymmetric, fig.width=9, fig.height=9}
+COL_CLUSTERS = ["5", "21", "2"]
+
+def binary_conn_asym(adata, col_clusters, threshold=THRESHOLD):
+    cats     = adata.obs[CLUS_COL].cat.categories.tolist()
+    mat      = adata.uns["paga"]["connectivities"].toarray()
+    df_full  = pd.DataFrame((mat > threshold).astype(int), index=cats, columns=cats)
+    rows_sorted = sorted(cats, key=lambda x: int(x) if x.isdigit() else x)
+    cols_valid  = [c for c in col_clusters if c in df_full.columns]
+    return df_full.loc[rows_sorted, cols_valid]
+
+fig, axes = plt.subplots(1, 3, figsize=(9, 9))
+
+for ax, (adata, title) in zip(axes, datasets_hm):
+    df = binary_conn_asym(adata, COL_CLUSTERS)
+    sns.heatmap(df, ax=ax, cmap=["#f7f7f7", "#2166ac"], vmin=0, vmax=1,
+                linewidths=0.3, linecolor="#e0e0e0",
+                xticklabels=True, yticklabels=True,
+                cbar=False)
+    ax.set_title(title, fontsize=11, fontweight="bold", pad=6)
+    ax.tick_params(axis="both", labelsize=7)
+
+fig.suptitle(f"Binary PAGA connectivity — columns: {', '.join(COL_CLUSTERS)}",
+             fontsize=13, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+# 7  Connectivity matrix subtraction
+
+Pairwise differences highlight rewiring between conditions.
+Positive (red) = stronger in the first condition; negative (blue) = stronger in the second.
+
+```{python conn-diff-helpers}
+def aligned_conn_df(adata):
+    """Connectivity matrix with a globally-aligned cluster index."""
+    cats = adata.obs[CLUS_COL].cat.categories.tolist()
+    mat  = adata.uns["paga"]["connectivities"].toarray()
+    return pd.DataFrame(mat, index=cats, columns=cats)
+
+def subtract_conn(df_a, df_b, label_a, label_b):
+    """Align two connectivity DataFrames on the union of clusters, subtract."""
+    all_cats = sorted(
+        set(df_a.index) | set(df_b.index),
+        key=lambda x: int(x) if x.isdigit() else x
+    )
+    a = df_a.reindex(index=all_cats, columns=all_cats, fill_value=0.0)
+    b = df_b.reindex(index=all_cats, columns=all_cats, fill_value=0.0)
+    diff = a - b
+    diff.attrs["label"] = f"{label_a} − {label_b}"
+    return diff
+
+def plot_diff_heatmap(diff_df, ax, vabs=0.5):
+    sns.heatmap(diff_df, ax=ax, cmap="RdBu_r",
+                vmin=-vabs, vmax=vabs, center=0,
+                linewidths=0.3, linecolor="#f0f0f0",
+                xticklabels=True, yticklabels=True,
+                cbar_kws={"shrink": 0.7, "label": "Δ connectivity"})
+    ax.set_title(diff_df.attrs.get("label", ""), fontsize=11,
+                 fontweight="bold", pad=6)
+    ax.tick_params(axis="both", labelsize=7)
+```
+
+```{python conn-diff-plot, fig.width=15, fig.height=5}
+df_wt  = aligned_conn_df(adata_wt)
+df_neg = aligned_conn_df(adata_mchneg)
+df_pos = aligned_conn_df(adata_mchpos)
+
+contrasts = [
+    subtract_conn(df_pos, df_wt,  "mCh+", "WT"),
+    subtract_conn(df_pos, df_neg, "mCh+", "mCh−"),
+    subtract_conn(df_neg, df_wt,  "mCh−", "WT"),
+]
+
+# Use a shared colour scale across all three panels
+vabs = max(abs(d.values).max() for d in contrasts)
+vabs = round(min(vabs, 1.0), 2)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+for ax, diff in zip(axes, contrasts):
+    plot_diff_heatmap(diff, ax, vabs=vabs)
+
+fig.suptitle(f"PAGA connectivity differences (colour scale ±{vabs})",
+             fontsize=13, fontweight="bold", y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+# 8  Strong connections table
+
+Edges above threshold, sorted by connectivity weight.
+
+```{python conn-table}
+rows = []
+for label, adata in [("WT", adata_wt), ("mCh-", adata_mchneg), ("mCh+", adata_mchpos)]:
+    df   = paga_conn_df(adata)
+    cats = df.index.tolist()
+    for i, c1 in enumerate(cats):
+        for j, c2 in enumerate(cats):
+            if j <= i:
+                continue
+            w = df.loc[c1, c2]
+            if w > THRESHOLD:
+                rows.append({"dataset": label, "cluster_A": c1,
+                             "cluster_B": c2, "connectivity": round(w, 3)})
+
+conn_tbl = (pd.DataFrame(rows)
+              .sort_values(["dataset", "connectivity"], ascending=[True, False])
+              .reset_index(drop=True))
+print(conn_tbl.to_string(index=False))
+```
+
+---
+
+# 9  Session info
+
+```{python session}
+print(f"scanpy  {sc.__version__}")
+print(f"anndata {ad.__version__}")
+import numpy, pandas, scipy
+print(f"numpy   {numpy.__version__}")
+print(f"pandas  {pandas.__version__}")
+print(f"scipy   {scipy.__version__}")
+```
+
+{{< include ../_session-info.qmd >}}

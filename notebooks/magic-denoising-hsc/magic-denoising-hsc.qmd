@@ -1,0 +1,473 @@
+---
+title: "MAGIC Denoising — HSC"
+subtitle: "Markov Affinity-based Graph Imputation of Cells · HSC compartment"
+date: today
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(targets)
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(cowplot)
+library(dplyr)
+library(tidyr)
+library(viridis)
+library(DT)
+
+theme_set(theme_cowplot(font_size = 11))
+```
+
+# Overview
+
+MAGIC (Markov Affinity-based Graph Imputation of Cells) smooths single-cell
+expression data by diffusing signals across a cell–cell affinity graph built
+from the transcriptome neighbourhood. Because scRNA-seq data are extremely
+sparse, many biologically relevant co-expression patterns are masked by
+dropout. MAGIC recovers these patterns by sharing information between
+transcriptionally similar cells.
+
+**Key parameters used here**
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `t` | 3 | Diffusion steps (higher = more smoothing) |
+| `knn` | 5 | Neighbours for affinity graph |
+| Gene set | 2,000 HVGs | Highly variable genes from SCTransform |
+| Input data | SCT `data` layer | Log-normalised, scaled counts |
+
+> **Reference:** van Dijk et al., *Cell* 2018. <https://doi.org/10.1016/j.cell.2018.05.061>
+
+---
+
+```{r load}
+#| cache: false
+targets::tar_load(mpn_processed_hsc_fullcc)
+targets::tar_load(magic_hsc)
+
+# UMAP coordinates from processed object
+umap_df <- as.data.frame(mpn_processed_hsc_fullcc@reductions$umap@cell.embeddings)
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+umap_df$cell_id <- rownames(umap_df)
+
+# Cluster and condition metadata
+clus_col <- grep("sNN_pca.*_res\\.0\\.9$",
+                 colnames(mpn_processed_hsc_fullcc@meta.data), value = TRUE)[1]
+meta_df <- mpn_processed_hsc_fullcc@meta.data |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::select(cell_id, sample.name, dm2_class,
+                cluster = dplyr::all_of(clus_col)) |>
+  dplyr::mutate(
+    condition = dplyr::case_when(
+      grepl("WT",     sample.name) ~ "WT",
+      grepl("mCh-",  sample.name) ~ "mCh-",
+      grepl("mCh\\+",sample.name) ~ "mCh+",
+      TRUE ~ sample.name
+    )
+  )
+
+umap_meta <- dplyr::left_join(umap_df, meta_df, by = "cell_id")
+
+rm(mpn_processed_hsc_fullcc); invisible(gc())
+
+cat("Cells:", nrow(magic_hsc$raw),
+    "| HVGs:", ncol(magic_hsc$raw),
+    "| Glis1 present:", "Glis1" %in% colnames(magic_hsc$raw), "\n")
+```
+
+# 1  Sparsity before and after MAGIC
+
+```{r sparsity-stats}
+n_cells <- nrow(magic_hsc$raw)
+n_genes <- ncol(magic_hsc$raw)
+
+pct_zero_raw   <- mean(magic_hsc$raw   == 0) * 100
+pct_zero_magic <- mean(magic_hsc$magic == 0) * 100
+
+tibble::tibble(
+  Metric  = c("Cells", "HVGs", "% zeros (raw)", "% zeros (MAGIC)"),
+  Value   = c(
+    formatC(n_cells, format = "d", big.mark = ","),
+    formatC(n_genes, format = "d", big.mark = ","),
+    sprintf("%.1f%%", pct_zero_raw),
+    sprintf("%.1f%%", pct_zero_magic)
+  )
+) |>
+  knitr::kable(align = "lr")
+```
+
+```{r sparsity-plot, fig.height=4, fig.width=10}
+#| fig-cap: "Left: distribution of per-gene % zero cells before and after MAGIC (2,000 HVGs). Right: distribution of per-cell mean expression before and after MAGIC."
+gene_zero_raw   <- colMeans(magic_hsc$raw   == 0) * 100
+gene_zero_magic <- colMeans(magic_hsc$magic == 0) * 100
+cell_mean_raw   <- rowMeans(magic_hsc$raw)
+cell_mean_magic <- rowMeans(magic_hsc$magic)
+
+p1 <- tibble::tibble(
+  pct   = c(gene_zero_raw, gene_zero_magic),
+  layer = rep(c("Raw SCT", "MAGIC"), each = n_genes)
+) |>
+  ggplot(aes(pct, fill = layer, colour = layer)) +
+  geom_density(alpha = 0.4, linewidth = 0.6) +
+  scale_fill_manual(values  = c("Raw SCT" = "#d73027", "MAGIC" = "#4575b4")) +
+  scale_colour_manual(values = c("Raw SCT" = "#d73027", "MAGIC" = "#4575b4")) +
+  labs(x = "% zero cells per gene", y = "Density", fill = NULL, colour = NULL) +
+  theme(legend.position = "top")
+
+p2 <- tibble::tibble(
+  mean  = c(cell_mean_raw, cell_mean_magic),
+  layer = rep(c("Raw SCT", "MAGIC"), each = n_cells)
+) |>
+  ggplot(aes(mean, fill = layer, colour = layer)) +
+  geom_density(alpha = 0.4, linewidth = 0.6) +
+  scale_fill_manual(values  = c("Raw SCT" = "#d73027", "MAGIC" = "#4575b4")) +
+  scale_colour_manual(values = c("Raw SCT" = "#d73027", "MAGIC" = "#4575b4")) +
+  labs(x = "Mean expression per cell", y = "Density", fill = NULL, colour = NULL) +
+  theme(legend.position = "top")
+
+p1 | p2
+```
+
+---
+
+# 2  Glis1 — raw vs MAGIC
+
+*Glis1* (GLI-Similar 1) is a transcription factor expressed in primitive HSCs
+and implicated in cellular reprogramming and maintenance of the
+undifferentiated state. Because it is lowly expressed and therefore heavily
+affected by dropout, it is an informative test case for imputation.
+
+```{r glis1-setup}
+gene <- "Glis1"
+if (!gene %in% colnames(magic_hsc$raw)) {
+  cat(gene, "is not in the HVG set — showing a representative HVG instead.\n")
+  # Pick gene with similar sparsity to Glis1 for illustration
+  gene <- names(sort(gene_zero_raw, decreasing = FALSE))[
+    which.min(abs(sort(gene_zero_raw, decreasing = FALSE) - 90))[1]]
+  cat("Using:", gene, "\n")
+}
+
+glis1_df <- umap_meta |>
+  dplyr::mutate(
+    raw   = as.numeric(magic_hsc$raw[cell_id,   gene]),
+    magic = as.numeric(magic_hsc$magic[cell_id, gene])
+  )
+```
+
+## 2.1  UMAP — raw vs MAGIC
+
+```{r glis1-umap, fig.height=5, fig.width=11}
+#| fig-cap: "UMAP coloured by Glis1 expression. Left: raw SCT (log-normalised). Right: MAGIC-imputed. Grey = zero / near-zero."
+
+make_umap <- function(df, col, title, pal = "viridis") {
+  df_plot <- df |> dplyr::arrange(.data[[col]])
+  ggplot(df_plot, aes(UMAP_1, UMAP_2, colour = .data[[col]])) +
+    geom_point(size = 0.15, alpha = 0.7) +
+    scale_colour_viridis_c(option = pal, name = "expr") +
+    labs(title = title) +
+    theme_void(base_size = 10) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          legend.position = "right")
+}
+
+p_raw   <- make_umap(glis1_df, "raw",   paste0(gene, " — Raw SCT"))
+p_magic <- make_umap(glis1_df, "magic", paste0(gene, " — MAGIC"))
+p_raw | p_magic
+```
+
+## 2.2  Violin — expression by cluster
+
+```{r glis1-violin, fig.height=5, fig.width=12}
+#| fig-cap: "Violin plots of Glis1 expression per cluster (res 0.9), before and after MAGIC."
+
+glis1_long <- glis1_df |>
+  tidyr::pivot_longer(c(raw, magic), names_to = "layer", values_to = "expr") |>
+  dplyr::mutate(layer = factor(layer, levels = c("raw", "magic"),
+                               labels = c("Raw SCT", "MAGIC")))
+
+ggplot(glis1_long, aes(cluster, expr, fill = layer)) +
+  geom_violin(scale = "width", trim = TRUE, linewidth = 0.3, alpha = 0.8) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, position = position_dodge(0.9),
+               colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = c("Raw SCT" = "#d73027", "MAGIC" = "#4575b4")) +
+  facet_wrap(~layer, ncol = 2) +
+  labs(x = "Cluster (res 0.9)", y = "Expression",
+       title = paste0(gene, " — raw vs MAGIC by cluster")) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 7))
+```
+
+## 2.3  Violin — expression by condition
+
+```{r glis1-condition, fig.height=4, fig.width=7}
+#| fig-cap: "Glis1 expression by genotype condition, before and after MAGIC."
+
+glis1_long |>
+  ggplot(aes(condition, expr, fill = layer)) +
+  geom_violin(scale = "width", trim = TRUE, alpha = 0.8, linewidth = 0.3) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, position = position_dodge(0.9),
+               colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = c("Raw SCT" = "#d73027", "MAGIC" = "#4575b4")) +
+  labs(x = "Condition", y = "Expression",
+       title = paste0(gene, " — raw vs MAGIC by condition"), fill = NULL) +
+  theme(legend.position = "top")
+```
+
+## 2.4  Scatter — raw vs MAGIC per cell
+
+```{r glis1-scatter, fig.height=5, fig.width=6}
+#| fig-cap: "Scatter plot of raw vs MAGIC expression for Glis1 across all HSC cells. Colour = cluster."
+
+ggplot(glis1_df, aes(raw, magic, colour = cluster)) +
+  geom_point(size = 0.2, alpha = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black", linewidth = 0.5) +
+  scale_colour_viridis_d(option = "turbo") +
+  labs(x = paste0(gene, " raw SCT"),
+       y = paste0(gene, " MAGIC"),
+       colour = "Cluster") +
+  guides(colour = guide_legend(override.aes = list(size = 2, alpha = 1))) +
+  theme(legend.position = "right")
+```
+
+---
+
+# 3  Co-expression rescue — Glis1 × key HSC genes
+
+A key motivation for MAGIC is recovering co-expression structure that is lost
+to dropout. Here we compare scatter plots of *Glis1* against canonical HSC
+markers before and after imputation.
+
+```{r coexpr-setup}
+partners <- c("Kit", "Slamf1", "Cd34", "Mpl", "Gata1", "Pf4")
+partners <- intersect(partners, colnames(magic_hsc$raw))
+cat("Co-expression partners found:", paste(partners, collapse = ", "), "\n")
+```
+
+```{r coexpr-scatter, fig.height=4, fig.width=14}
+#| fig-cap: "Scatter plots of Glis1 vs key HSC/lineage markers. Each panel shows raw SCT (left, most points at zero) and MAGIC (right, continuous co-expression recovered)."
+#| fig-height: !expr 4 * ceiling(length(partners) / 3)
+
+plot_pair <- function(raw_g, magic_g, partner_r, partner_m, label) {
+  df_r <- data.frame(x = raw_g,   y = partner_r, layer = "Raw SCT")
+  df_m <- data.frame(x = magic_g, y = partner_m, layer = "MAGIC")
+  df   <- rbind(df_r, df_m) |>
+    dplyr::mutate(layer = factor(layer, levels = c("Raw SCT", "MAGIC")))
+
+  ggplot(df, aes(x, y)) +
+    geom_point(size = 0.15, alpha = 0.3, colour = "steelblue") +
+    geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+                colour = "#d73027", linewidth = 0.7) +
+    facet_wrap(~layer, scales = "free") +
+    labs(x = gene, y = label) +
+    theme(strip.background = element_blank(),
+          strip.text = element_text(face = "bold", size = 9))
+}
+
+raw_g   <- magic_hsc$raw[,   gene]
+magic_g <- magic_hsc$magic[, gene]
+
+plots <- lapply(partners, function(g) {
+  plot_pair(raw_g, magic_g, magic_hsc$raw[, g], magic_hsc$magic[, g], g)
+})
+
+wrap_plots(plots, ncol = min(3, length(plots)))
+```
+
+---
+
+# 4  Global smoothing quality — top variable genes
+
+```{r global-var, fig.height=4.5, fig.width=9}
+#| fig-cap: "Gene-level variance before (x) vs after (y) MAGIC. Points above the diagonal gained variance (unexpected for smoothing — may reflect rescued structure). Points below lost variance (dropout noise removed). Colour = mean expression in raw data."
+
+gene_var_raw   <- matrixStats::colVars(as.matrix(magic_hsc$raw))
+gene_var_magic <- matrixStats::colVars(as.matrix(magic_hsc$magic))
+gene_mean_raw  <- colMeans(magic_hsc$raw)
+
+var_df <- data.frame(
+  gene       = colnames(magic_hsc$raw),
+  var_raw    = gene_var_raw,
+  var_magic  = gene_var_magic,
+  mean_raw   = gene_mean_raw
+)
+
+top_changed <- var_df |>
+  dplyr::mutate(delta = var_magic - var_raw) |>
+  dplyr::slice_max(abs(delta), n = 20) |>
+  dplyr::pull(gene)
+
+ggplot(var_df, aes(var_raw, var_magic, colour = log1p(mean_raw))) +
+  geom_point(size = 0.5, alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "black") +
+  ggrepel::geom_text_repel(
+    data = var_df |> dplyr::filter(gene %in% c(gene, top_changed[1:10])),
+    aes(label = gene), size = 2.5, max.overlaps = 20,
+    colour = "black", box.padding = 0.3
+  ) +
+  scale_colour_viridis_c(option = "plasma", name = "log1p\n(mean)") +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "Variance (raw SCT, log scale)",
+       y = "Variance (MAGIC, log scale)",
+       title = "Gene-level variance: raw vs MAGIC") +
+  annotation_logticks(sides = "bl", size = 0.3)
+```
+
+---
+
+# 5  Heatmap — top Glis1-correlated genes (MAGIC)
+
+After imputation, gene–gene correlations become interpretable. Here we show
+the top genes most strongly correlated with *Glis1* in the MAGIC space and
+visualise their MAGIC expression as a heatmap.
+
+```{r glis1-corr-genes}
+#| fig-cap: "Top 30 genes most correlated with Glis1 in MAGIC space."
+
+if (gene %in% colnames(magic_hsc$magic)) {
+  # Compute correlations of all HVGs with Glis1 (Pearson on MAGIC values)
+  glis1_vec <- magic_hsc$magic[, gene]
+  cors <- cor(glis1_vec, magic_hsc$magic, method = "pearson")[1, ]
+  cors <- sort(cors, decreasing = TRUE)
+  top_corr_genes <- names(cors)[2:31]  # skip self (rank 1)
+
+  corr_df <- data.frame(
+    gene = top_corr_genes,
+    r    = cors[top_corr_genes]
+  ) |>
+    dplyr::arrange(dplyr::desc(r))
+
+  corr_df_display <- corr_df
+  corr_df_display$r <- round(corr_df_display$r, 3)
+  DT::datatable(
+    corr_df_display,
+    rownames = FALSE,
+    caption  = paste0("Top 30 genes correlated with ", gene, " (MAGIC Pearson r)."),
+    options  = list(pageLength = 15, dom = "t", scrollX = TRUE)
+  ) |>
+    DT::formatStyle("r",
+      background = DT::styleColorBar(c(0, 1), "#4575b4"),
+      backgroundSize = "90% 70%", backgroundRepeat = "no-repeat",
+      backgroundPosition = "center")
+} else {
+  cat(gene, "not in MAGIC output.\n")
+}
+```
+
+```{r glis1-corr-heatmap, fig.height=6, fig.width=10}
+#| fig-cap: "Heatmap of MAGIC expression for top 30 genes correlated with Glis1 (columns = genes, rows = cells sampled by cluster, ordered by Glis1 MAGIC within each cluster)."
+
+if (gene %in% colnames(magic_hsc$magic) && exists("top_corr_genes")) {
+  show_genes <- c(gene, top_corr_genes)
+  show_genes <- intersect(show_genes, colnames(magic_hsc$magic))
+
+  # Sample ≤200 cells per cluster, ordered by Glis1 MAGIC within each cluster
+  set.seed(42)
+  cell_order <- umap_meta |>
+    dplyr::mutate(glis1_magic = glis1_df$magic[match(cell_id, glis1_df$cell_id)]) |>
+    dplyr::group_by(cluster) |>
+    dplyr::slice_sample(n = 200) |>
+    dplyr::arrange(cluster, glis1_magic) |>
+    dplyr::pull(cell_id)
+
+  hm_mat <- t(magic_hsc$magic[cell_order, show_genes])
+
+  # Row-scale for visibility
+  hm_scaled <- t(scale(t(hm_mat)))
+  hm_scaled[hm_scaled >  3] <-  3
+  hm_scaled[hm_scaled < -3] <- -3
+
+  cluster_anno <- umap_meta$cluster[match(cell_order, umap_meta$cell_id)]
+  n_cl  <- length(unique(cluster_anno))
+  cl_pal <- setNames(
+    scales::hue_pal()(n_cl),
+    sort(unique(as.character(cluster_anno)))
+  )
+
+  top_anno <- ComplexHeatmap::HeatmapAnnotation(
+    cluster   = cluster_anno,
+    col       = list(cluster = cl_pal),
+    show_annotation_name = TRUE,
+    annotation_name_gp   = grid::gpar(fontsize = 8)
+  )
+
+  ComplexHeatmap::Heatmap(
+    hm_scaled,
+    col                  = circlize::colorRamp2(c(-3, 0, 3),
+                             c("#2166ac", "white", "#d73027")),
+    name                 = "scaled\nexpr",
+    top_annotation       = top_anno,
+    cluster_rows         = TRUE,
+    cluster_columns      = FALSE,
+    show_column_names    = FALSE,
+    row_names_gp         = grid::gpar(fontsize = 7),
+    row_names_side       = "left",
+    column_title         = paste0("Top genes correlated with ", gene, " (MAGIC, sampled cells)"),
+    column_title_gp      = grid::gpar(fontsize = 10, fontface = "bold"),
+    use_raster           = TRUE,
+    raster_quality       = 3
+  )
+}
+```
+
+---
+
+# Methods
+
+**MAGIC algorithm.** MAGIC builds a cell–cell affinity graph using the $k$
+nearest neighbours in gene-expression space ($k$ = `r 5`). Affinity weights
+are computed from the $\ell_2$ distance via a Gaussian kernel with
+bandwidth chosen per cell. The resulting stochastic (row-normalised) affinity
+matrix is raised to the power $t$ = `r 3` (diffusion steps) and used to
+smooth each gene's expression vector across the neighbourhood. Higher $t$
+increases the radius of information sharing; the optimal $t$ can be chosen by
+the knee of the MAGIC optimal transport distance curve.
+
+**Input data.** The SCT `data` layer (Pearson residuals normalised by
+Seurat's `SCTransform`) was used as input rather than raw counts, providing a
+variance-stabilised, approximately log-normal starting point.
+
+**Implementation.** Rmagic R package (KrishnaswamyLab/MAGIC, CRAN/GitHub)
+calling the `magic-impute` Python backend via `reticulate`. Computation
+performed on the top 2,000 highly variable genes selected by SCTransform.
+
+{{< include ../_session-info.qmd >}}

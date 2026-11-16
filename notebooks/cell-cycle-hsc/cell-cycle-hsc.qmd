@@ -1,0 +1,256 @@
+---
+output: html_document
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+# Cell-Cycle Bias in HSC Clustering
+
+Quantifies how much each CC-regression strategy removes cell-cycle bias from
+the HSC clustering. ARI(clusters, Phase) is bounded below by random cluster
+assignment and above by perfectly phase-homogeneous clusters of the same size.
+
+```{r setup}
+library(targets)
+library(dplyr)
+library(ggplot2)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r params}
+N_SIM     <- 200   # simulations per bound
+SET_SEED  <- 42
+PHASE_COL <- "Phase"
+PHASE_PAL <- c(G1 = "#4daf4a", S = "#225ea8", G2M = "#e41a1c")
+STRAT_PAL <- c(none = "#999999", diff = "#4393c3", full = "#d6604d")
+
+clust_col_from <- function(meta)
+  grep("sNN_pca.*_res\\.0\\.1$", colnames(meta), value = TRUE)[1]
+```
+
+---
+
+## Load metadata
+
+Each Seurat object is loaded, its metadata extracted, then discarded
+immediately to keep peak memory low.
+
+```{r load-meta}
+targets::tar_load(mpn_processed_hsc)
+meta_none <- mpn_processed_hsc@meta.data
+rm(mpn_processed_hsc); gc()
+
+targets::tar_load(mpn_processed_hsc_fullcc)
+meta_full <- mpn_processed_hsc_fullcc@meta.data
+rm(mpn_processed_hsc_fullcc); gc()
+
+targets::tar_load(mpn_processed_hsc_diffcc)
+meta_diff <- mpn_processed_hsc_diffcc@meta.data
+rm(mpn_processed_hsc_diffcc); gc()
+
+# Named list for iteration
+metas <- list(none = meta_none, full = meta_full, diff = meta_diff)
+```
+
+---
+
+## ARI bounds simulations
+
+### Lower bound — random shuffle
+
+Cluster labels are shuffled randomly while preserving the total number of
+clusters, breaking any association with Phase. Repeated `N_SIM` times to
+obtain a distribution.
+
+```{r sim-lower}
+#' Simulate ARI lower bound by randomly shuffling compare_col labels.
+#' Returns a data.frame: compare_col, sim, ari.
+sim_ari_lower <- function(meta, ref_col, compare_cols, n_sim = 200, seed = 42) {
+  ref_vec <- meta[[ref_col]]
+  do.call(rbind, lapply(compare_cols, function(cc) {
+    cmp_vec <- as.character(meta[[cc]])
+    keep    <- !is.na(cmp_vec) & !is.na(ref_vec)
+    ref_sub <- ref_vec[keep]
+    cmp_sub <- cmp_vec[keep]
+    set.seed(seed)
+    data.frame(
+      compare_col = cc,
+      sim         = seq_len(n_sim),
+      ari         = replicate(n_sim,
+        mclust::adjustedRandIndex(ref_sub, sample(cmp_sub))
+      )
+    )
+  }))
+}
+```
+
+### Upper bound — phase-homogeneous clusters
+
+Cluster labels are generated so that every cluster contains cells of only one
+Phase. The number of clusters is kept identical to the actual clustering, with
+clusters distributed across Phase levels in proportion to cell counts. Cells
+within each Phase level are randomly split into that level's allocated
+sub-clusters. Repeated `N_SIM` times.
+
+```{r sim-upper}
+#' Simulate ARI upper bound with phase-homogeneous clusters.
+#' Returns a data.frame: compare_col, sim, ari.
+sim_ari_upper <- function(meta, ref_col, compare_cols, n_sim = 200, seed = 42) {
+  ref_vec <- meta[[ref_col]]
+  do.call(rbind, lapply(compare_cols, function(cc) {
+    cmp_vec <- as.character(meta[[cc]])
+    keep    <- !is.na(cmp_vec) & !is.na(ref_vec)
+    ref_sub <- ref_vec[keep]
+    k       <- length(unique(cmp_vec[keep]))
+
+    # Distribute k clusters proportionally among Phase levels
+    counts      <- table(ref_sub)
+    k_per_level <- pmax(1L, round(counts / sum(counts) * k))
+    # Correct rounding error so total == k
+    delta <- k - sum(k_per_level)
+    if (delta != 0L)
+      k_per_level[which.max(k_per_level)] <-
+        k_per_level[which.max(k_per_level)] + delta
+
+    set.seed(seed)
+    data.frame(
+      compare_col = cc,
+      sim         = seq_len(n_sim),
+      ari = replicate(n_sim, {
+        sim_clust  <- character(sum(keep))
+        cluster_id <- 0L
+        for (lv in names(k_per_level)) {
+          idx  <- which(ref_sub == lv)
+          k_lv <- k_per_level[[lv]]
+          sim_clust[idx] <- paste0("c", cluster_id + sample(rep(seq_len(k_lv),
+                                                                length.out = length(idx))))
+          cluster_id <- cluster_id + k_lv
+        }
+        mclust::adjustedRandIndex(ref_sub, sim_clust)
+      })
+    )
+  }))
+}
+```
+
+### Run simulations
+
+```{r run-sims}
+bound_dfs <- lapply(names(metas), function(s) {
+  meta      <- metas[[s]]
+  cc        <- clust_col_from(meta)
+  lower     <- sim_ari_lower(meta, PHASE_COL, cc, n_sim = N_SIM, seed = SET_SEED) |>
+                 dplyr::mutate(bound = "lower", strategy = s)
+  upper     <- sim_ari_upper(meta, PHASE_COL, cc, n_sim = N_SIM, seed = SET_SEED) |>
+                 dplyr::mutate(bound = "upper", strategy = s)
+  dplyr::bind_rows(lower, upper)
+})
+
+sim_df <- dplyr::bind_rows(bound_dfs) |>
+  dplyr::group_by(strategy, bound) |>
+  dplyr::summarise(
+    mean_ari = mean(ari),
+    lo_ari   = quantile(ari, 0.025),
+    hi_ari   = quantile(ari, 0.975),
+    .groups  = "drop"
+  )
+```
+
+---
+
+## Actual ARI
+
+```{r actual-ari}
+actual_df <- dplyr::bind_rows(lapply(names(metas), function(s) {
+  meta <- metas[[s]]
+  cc   <- clust_col_from(meta)
+  compute_ari(meta, PHASE_COL, cc) |> dplyr::mutate(strategy = s)
+}))
+
+actual_df
+```
+
+---
+
+## Plot
+
+```{r plot, fig.width=6, fig.height=5}
+strat_order <- c("none", "diff", "full")
+
+# Join n_levels from actual ARI into bounds so x-axis is shared
+ari_df <- actual_df |>
+  dplyr::mutate(strategy = factor(strategy, levels = strat_order))
+
+bounds_wide <- sim_df |>
+  tidyr::pivot_wider(names_from = bound,
+                     values_from = c(mean_ari, lo_ari, hi_ari)) |>
+  dplyr::left_join(dplyr::select(ari_df, strategy, n_levels), by = "strategy") |>
+  dplyr::mutate(strategy = factor(strategy, levels = strat_order))
+
+y_max <- max(bounds_wide$hi_ari_upper) * 1.12
+
+ggplot(mapping = aes(x = n_levels)) +
+  # Upper bound ribbon + line
+  geom_ribbon(
+    data = bounds_wide,
+    aes(ymin = lo_ari_upper, ymax = hi_ari_upper),
+    fill = "#2ca25f", alpha = 0.15
+  ) +
+  geom_line(
+    data = bounds_wide,
+    aes(y = mean_ari_upper),
+    colour = "#2ca25f", linetype = "dashed", linewidth = 0.7
+  ) +
+  # Lower bound ribbon + line
+  geom_ribbon(
+    data = bounds_wide,
+    aes(ymin = lo_ari_lower, ymax = hi_ari_lower),
+    fill = "#d95f02", alpha = 0.15
+  ) +
+  geom_line(
+    data = bounds_wide,
+    aes(y = mean_ari_lower),
+    colour = "#d95f02", linetype = "dashed", linewidth = 0.7
+  ) +
+  # Actual ARI: line + labelled points coloured by strategy
+  geom_line(
+    data = ari_df,
+    aes(y = ari),
+    colour = "grey40", linewidth = 0.6
+  ) +
+  geom_point(
+    data = ari_df,
+    aes(y = ari, colour = strategy),
+    size = 4
+  ) +
+  geom_text(
+    data = ari_df,
+    aes(y = ari, label = strategy),
+    vjust = -1, size = 3.2, colour = "grey30"
+  ) +
+  scale_colour_manual(values = c(none = "#999999", diff = "#4393c3", full = "#d6604d"),
+                      name = "Strategy") +
+  scale_x_continuous(breaks = scales::breaks_pretty()) +
+  labs(
+    x        = "Number of clusters",
+    y        = "Adjusted Rand Index\n(clusters vs Phase)",
+    title    = "Cell-cycle bias in HSC clustering",
+    subtitle = paste0("Dashed bands: 95% CI over ", N_SIM, " simulations")
+  ) +
+  ylim(0, y_max) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "bottom")
+```
+
+{{< include ../_session-info.qmd >}}

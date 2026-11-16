@@ -1,0 +1,203 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+markers_canonical_long <- c("Cd74", "Cd79a", "Cd14",# B-cells,
+       "Prss34", "Mcpt8",#Baso_E late
+       "Gypa","Tfrc","Hba−a1",#Baso_E late
+       "Prg2", "Epx", #Eosino
+       "Irf8","Batf3",#cDC1
+       "Irf4",#cDC2
+       "Csf1r","Cd68",#cDC2
+       "Cpa3", "Fcer1a", #Mast,
+       "Vwf", "Clu", "Mpl", #Mk Biased
+       "Pf4", #Mk
+       "Lyz2", "Ccr2", #Monocyte
+       "Ifit1", "Isg15",
+       "Klrk1", #NK
+       "S100a8", "S100a9", "Lcn2", "Csf3r", "Pglyrp1",#Neut
+       "Vwf", "Itga2b", "Mpl", "Procr",#MPP2_MkE
+       "Slamf1", "Ly6a","Cd34",#ST_HSC_MPP1
+       "Mecom",
+       "Trbc1", "Trbc2", "Lck", "Tcf7", #T-cell
+       "Klf1","Itga4" # ProE
+       )
+
+```
+
+```{r}
+tcell_clusts <- c("16", "15", "24", "22")
+tcell_tbl <- mpn_processed_mnc@meta.data %>% 
+  dplyr::count(sample.name, sNN_pca.SCT_30_res.0.9) %>%
+  group_by(sample.name)%>%
+  mutate(n = n/sum(n))%>%
+  ungroup()%>%
+  filter(sNN_pca.SCT_30_res.0.9 %in% tcell_clusts) %>%
+  pivot_wider(names_from = sample.name, values_from = n) %>%
+  mutate(mch_neg = (`MNC_mCh-`-MNC_WT)/MNC_WT,
+         mch_pos = (`MNC_mCh+`-MNC_WT)/MNC_WT) %>%
+    arrange(desc(mch_neg))%>%
+  mutate(sNN_pca.SCT_30_res.0.9 = factor(sNN_pca.SCT_30_res.0.9, levels = unique(sNN_pca.SCT_30_res.0.9)))%>%
+
+  pivot_longer(cols = c(mch_neg, mch_pos),names_to = "grp")
+  
+tcell_tbl %>%
+  ggplot(aes(sNN_pca.SCT_30_res.0.9, value, fill = grp))+
+  geom_col(position = position_dodge(), color = "black")+
+  scale_x_discrete(labels = c("24"="NK_24",
+                              "16"="CD4_16",
+                              "15"="CD8_15",
+                              "22" = "DC_22"),
+                   name = "")+
+  scale_y_continuous(name = "Relative abundance \n (Fold change)")+
+  coord_flip()
+```
+
+```{r}
+bcell_clusts <- c("3", "5", "0", "23", "25", "12", "18", "31","20")
+bcell_tbl <- mpn_processed_mnc@meta.data %>% 
+  dplyr::count(sample.name, sNN_pca.SCT_30_res.0.9) %>%
+  group_by(sample.name)%>%
+  mutate(n = n/sum(n))%>%
+  ungroup()%>%
+  filter(sNN_pca.SCT_30_res.0.9 %in% bcell_clusts) %>%
+  pivot_wider(names_from = sample.name, values_from = n) %>%
+  mutate(mch_neg = (`MNC_mCh-`-MNC_WT)/MNC_WT,
+         mch_pos = (`MNC_mCh+`-MNC_WT)/MNC_WT) %>%
+  arrange(desc(mch_neg))%>%
+  mutate(sNN_pca.SCT_30_res.0.9 = factor(sNN_pca.SCT_30_res.0.9, levels = unique(sNN_pca.SCT_30_res.0.9)))%>%
+  pivot_longer(cols = c(mch_neg, mch_pos),names_to = "grp")
+  
+bcell_tbl %>%
+  ggplot(aes(sNN_pca.SCT_30_res.0.9, value, fill = grp))+
+  geom_col(position = position_dodge(), color = "black")+
+    scale_x_discrete(labels = c("3"="B_3",
+                              "5"="B_5",
+                              "0"="B_0",
+                              "23" = "B_23",
+                              "25" = "B_25",
+                              "12" = "B_12",
+                              "18" = "B_18",
+                              "31" = "B_31",
+                              "20" = "Mast_20"),
+                     name = "")+
+  scale_y_continuous(name = "Relative abundance \n (Fold change)")+
+  coord_flip()
+
+```
+
+
+```{r}
+neut_cycle_clusts <- c("8", "21", "27")
+neut_clusts <- c("11", "4", "14", "30", "2", "26", "1", "9")
+neut_olfm_clusts <- c("10")
+
+
+neut_tbl <- mpn_processed_mnc@meta.data %>% 
+  mutate(sNN_pca.SCT_30_res.0.9 = case_when(sNN_pca.SCT_30_res.0.9 %in% neut_cycle_clusts ~ "neut_cycle",
+                                            sNN_pca.SCT_30_res.0.9 %in% neut_clusts ~ "neut",
+                                            sNN_pca.SCT_30_res.0.9 %in% neut_olfm_clusts ~ "neut_olfm",
+                                            .default = sNN_pca.SCT_30_res.0.9))%>%
+  dplyr::count(sample.name, sNN_pca.SCT_30_res.0.9) %>%
+  group_by(sample.name)%>%
+  mutate(n = n/sum(n))%>%
+  ungroup()%>%
+  filter(sNN_pca.SCT_30_res.0.9 %in% c("neut_cycle", "neut", "neut_olfm")) %>%
+  pivot_wider(names_from = sample.name, values_from = n) %>%
+  mutate(mch_neg = (`MNC_mCh-`-MNC_WT)/MNC_WT,
+         mch_pos = (`MNC_mCh+`-MNC_WT)/MNC_WT) %>%
+  arrange(desc(mch_neg))%>%
+  mutate(sNN_pca.SCT_30_res.0.9 = factor(sNN_pca.SCT_30_res.0.9, levels = unique(sNN_pca.SCT_30_res.0.9)))%>%
+  pivot_longer(cols = c(mch_neg, mch_pos),names_to = "grp")
+  
+neut_tbl %>%
+  ggplot(aes(sNN_pca.SCT_30_res.0.9, value, fill = grp))+
+  geom_col(position = position_dodge(), color = "black")+
+    scale_x_discrete(
+                     name = "")+
+  scale_y_continuous(name = "Relative abundance \n (Fold change)")+
+  coord_flip()
+```
+
+
+
+```{r}
+DimPlot(mpn_processed_stroma,group.by = "sNN_pca.SCT_30_res.0.9",  label = TRUE,split.by = "sample.name",pt.size = 0.1)
+```
+
+```{r}
+FeaturePlot(mpn_processed_stroma,c("Kel", "Cxcl14", "Cldn11","Col12a1","Npy","Ifit1"), order = TRUE,pt.size = 0.1, ncol = 2)&RestoreLegend()&viridis::scale_color_viridis(option = "turbo")
+```
+
+```{r}
+FeaturePlot(mpn_processed_stroma,c("Kel", "Ppbp", "Hemgn"), order = TRUE,pt.size = 0.1, ncol = 2)&RestoreLegend()&viridis::scale_color_viridis(option = "turbo")
+```
+
+
+```{r}
+gs_lst <-msigdbr::msigdbr(species = "Mus musculus",
+                 collection = "H",
+                 subcollection = NULL) %>%
+    with(.,split(gene_symbol, gs_name))
+
+mpn_processed_hsc_fullcc <- Seurat::AddModuleScore(mpn_processed_hsc_fullcc,gs_lst["HALLMARK_P53_PATHWAY"])
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c("Cluster1"), 
+            order = TRUE,
+            pt.size = 0.1,
+            ncol = 1,
+            split.by = "sample.name")&
+  RestoreLegend()&
+  viridis::scale_color_viridis(option = "turbo", limit = c(-0.2, 0.36))
+```
+
+```{r}
+gs_lst <-msigdbr::msigdbr(species = "Mus musculus",
+                 collection = "C5",
+                 subcollection = NULL) %>%
+    with(.,split(gene_symbol, gs_name))
+
+mpn_processed_hsc_fullcc <- Seurat::AddModuleScore(mpn_processed_hsc_fullcc,gs_lst[names(gs_lst)[str_detect(names(gs_lst), "SENESCENCE")]])
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            paste0("Cluster",c(6)), 
+            order = TRUE,
+            pt.size = 0.1,
+            ncol = 1,
+            split.by = "sample.name")&
+    RestoreLegend()&
+    viridis::scale_color_viridis(option = "turbo", limit = c(-0.5, 0.9))
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            paste0("Cluster",c(7)), 
+            order = TRUE,
+            pt.size = 0.1,
+            ncol = 1,
+            split.by = "sample.name")&
+    RestoreLegend()&
+    viridis::scale_color_viridis(option = "turbo", limit = c(-1, 1.4))
+```
+
+```{r}
+gs_lst <-msigdbr::msigdbr(species = "Mus musculus",
+                 subcollection = NULL) %>%
+    with(.,split(gene_symbol, gs_name))
+
+mpn_processed_hsc_fullcc <- Seurat::AddModuleScore(mpn_processed_hsc_fullcc,gs_lst[c("TANG_SENESCENCE_TP53_TARGETS_UP", "TANG_SENESCENCE_TP53_TARGETS_DN")])
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            paste0("Cluster",c(1)), 
+            order = TRUE,
+            pt.size = 0.1,
+            ncol = 1,
+            split.by = "sample.name")&
+    RestoreLegend()&
+    viridis::scale_color_viridis(option = "turbo", limit = c(-0.8, 1.2))
+
+```
+
+

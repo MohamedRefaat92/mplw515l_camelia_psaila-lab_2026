@@ -1,0 +1,611 @@
+---
+title: "PAGA Trajectory — Condition Graphs (res 1.5)"
+subtitle: "R-side visualization of per-condition PAGA connectivity with edge specificity"
+date: today
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup, include=FALSE}
+library(targets)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(ggraph)
+library(tidygraph)
+library(igraph)
+library(patchwork)
+library(scales)
+
+```
+
+```{r params}
+# ── Cluster column ─────────────────────────────────────────────────────────────
+CLUS_COL    <- "sNN_pca.SCT_30_res.1.5"
+
+# ── Edge thresholds ────────────────────────────────────────────────────────────
+GLOBAL_THR  <- 0.10   # minimum global PAGA weight to include an edge
+COND_THR    <- 0.10   # minimum per-condition weight to show edge in per-condition panels
+
+# ── Clusters to drop ──────────────────────────────────────────────────────────
+EXCLUDE_CLUSTERS  <- c()    # cluster IDs to drop regardless of size
+MIN_CLUSTER_SIZE  <- 0L    # drop clusters with fewer cells than this (0 = keep all)
+
+# ── Conditions ────────────────────────────────────────────────────────────────
+COND_ORDER <- c("WT", "mCh-", "mCh+")
+COND_PAL   <- c(WT = "#888888", "mCh-" = "#2a9d8f", "mCh+" = "#e76f51")
+
+# ── File paths ─────────────────────────────────────────────────────────────────
+GLOBAL_EDGES_CSV <- file.path(
+  "output/objects/paga/paga_edges_sNN_pca.SCT_30_res.1.5.csv")
+COND_EDGES_CSV   <- file.path(
+  "output/objects/paga_conditions/paga_edge_comparison_sNN_pca.SCT_30_res.1.5.csv")
+
+# ── Plot aesthetics ────────────────────────────────────────────────────────────
+NODE_MAX_SIZE  <- 12    # largest node diameter (pt); area ∝ sqrt(n_cells)
+EDGE_MAX_WIDTH <-  3    # widest edge (pt); width ∝ connectivity weight
+BG_ALPHA       <-  0.25 # opacity of grey background cells
+BG_SIZE        <-  0.3  # point size of background cells
+FG_SIZE        <-  0.5  # point size of foreground cells
+```
+
+---
+
+# 1 · Load data
+
+```{r load-meta}
+tar_load(anno_meta_hsc)
+
+# Cell-level metadata: cluster, condition, UMAP coords
+meta <- anno_meta_hsc %>%
+  rename(cell_id = 1) %>%
+  mutate(
+    cluster = as.character(.data[[CLUS_COL]]),
+    condition = case_when(
+      grepl("WT",     sample.name) ~ "WT",
+      grepl("mCh-",  sample.name) ~ "mCh-",
+      grepl("mCh\\+", sample.name) ~ "mCh+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!cluster %in% EXCLUDE_CLUSTERS, !is.na(condition)) %>%
+  select(cell_id, UMAP1, UMAP2, cluster, condition, sample.name)
+
+rm(anno_meta_hsc); gc()
+
+cat("Cells after filter:", nrow(meta), "\n")
+cat("Clusters:", paste(sort(unique(meta$cluster)), collapse = ", "), "\n")
+cat("Conditions:", paste(sort(unique(meta$condition)), collapse = ", "), "\n")
+```
+
+```{r load-edges}
+global_edges <- read_csv(GLOBAL_EDGES_CSV, show_col_types = FALSE) %>%
+  mutate(across(c(cluster_A, cluster_B), as.character)) %>%
+  filter(!cluster_A %in% EXCLUDE_CLUSTERS,
+         !cluster_B %in% EXCLUDE_CLUSTERS,
+         weight >= GLOBAL_THR)
+
+cond_edges_raw <- read_csv(COND_EDGES_CSV, show_col_types = FALSE)
+
+# Parse "A-B" pair column → cluster_A, cluster_B
+# Pairs are stored as "A-B" with A < B numerically (both non-negative)
+cond_edges <- cond_edges_raw %>%
+  mutate(
+    cluster_A = str_extract(pair, "^[^-]+"),
+    cluster_B = str_extract(pair, "[^-]+$")
+  ) %>%
+  filter(!cluster_A %in% EXCLUDE_CLUSTERS,
+         !cluster_B %in% EXCLUDE_CLUSTERS) %>%
+  rename(wt = WT, mchneg = `mCh-`, mchpos = `mCh+`) %>%
+  select(cluster_A, cluster_B, wt, mchneg, mchpos, max_weight)
+
+cat("Global edges (≥ threshold):", nrow(global_edges), "\n")
+cat("Condition-specific edge pairs:", nrow(cond_edges), "\n")
+```
+
+---
+
+# 2 · Cluster layout and sizes
+
+```{r cluster-attrs}
+# UMAP centroid per cluster
+centroids <- meta %>%
+  group_by(cluster) %>%
+  summarise(x = mean(UMAP1), y = mean(UMAP2), .groups = "drop")
+
+# Cell counts — total and per condition
+cluster_total <- meta %>% count(cluster, name = "n_cells")
+
+# Drop clusters below minimum size threshold
+if (MIN_CLUSTER_SIZE > 0L) {
+  small_clusters <- cluster_total %>%
+    filter(n_cells < MIN_CLUSTER_SIZE) %>%
+    pull(cluster)
+  if (length(small_clusters) > 0) {
+    cat("Dropping", length(small_clusters),
+        "cluster(s) with < MIN_CLUSTER_SIZE =", MIN_CLUSTER_SIZE, "cells:",
+        paste(sort(small_clusters), collapse = ", "), "\n")
+    meta          <- meta %>% filter(!cluster %in% small_clusters)
+    cluster_total <- meta %>% count(cluster, name = "n_cells")
+    centroids     <- meta %>%
+      group_by(cluster) %>%
+      summarise(x = mean(UMAP1), y = mean(UMAP2), .groups = "drop")
+  }
+}
+
+cluster_cond <- meta %>%
+  count(cluster, condition) %>%
+  pivot_wider(names_from = condition, values_from = n, values_fill = 0L)
+
+node_attrs <- centroids %>%
+  left_join(cluster_total, by = "cluster") %>%
+  left_join(cluster_cond,  by = "cluster") %>%
+  mutate(
+    node_size = sqrt(n_cells) / max(sqrt(n_cells)) * NODE_MAX_SIZE,
+    cluster   = as.character(cluster)
+  ) %>%
+  arrange(as.integer(cluster))
+
+# Discrete cluster colour palette (tab20-like)
+clust_ids  <- sort(as.integer(unique(meta$cluster)))
+clust_cols <- setNames(
+  hue_pal()(length(clust_ids)),
+  as.character(clust_ids)
+)
+
+cat("Nodes in layout:\n")
+print(node_attrs[, c("cluster", "n_cells", "x", "y")])
+```
+
+```{r umap-overview, fig.width=7, fig.height=5.5}
+ggplot(meta, aes(UMAP1, UMAP2, colour = cluster)) +
+  geom_point(size = 0.4, alpha = 0.6, shape = 16) +
+  scale_colour_manual(values = clust_cols) +
+  ggrepel::geom_label_repel(
+    data = centroids,
+    aes(x, y, label = cluster),
+    colour = "black", fill = alpha("white", 0.7),
+    size = 2.5, label.size = 0.2, max.overlaps = Inf, seed = 42
+  ) +
+  guides(colour = guide_legend(override.aes = list(size = 3),
+                               ncol = 3, title = "Cluster")) +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right") +
+  labs(title = "HSC clusters (res 0.9)")
+```
+
+---
+
+# 3 · Per-condition PAGA graphs
+
+Each panel shows only cells from that condition (coloured) on a grey background of all cells.
+Edge width ∝ per-condition PAGA connectivity; edges below `COND_THR` are hidden.
+
+```{r cond-graph-helpers}
+#' Build a tbl_graph positioned at UMAP centroids.
+#' @param edge_df  data.frame with cluster_A, cluster_B, weight
+#' @param node_df  data.frame with cluster, x, y, n_cells
+make_graph <- function(edge_df, node_df) {
+  # Keep only nodes that appear in edges + have positions
+  used <- union(edge_df$cluster_A, edge_df$cluster_B)
+  nodes <- node_df %>% filter(cluster %in% used) %>%
+    mutate(.name = cluster)
+  edges <- edge_df %>%
+    filter(cluster_A %in% nodes$cluster,
+           cluster_B %in% nodes$cluster)
+  tbl_graph(nodes = nodes, edges = edges, directed = FALSE)
+}
+
+#' ggraph panel for one condition.
+#' @param cond_name  "WT", "mCh-", or "mCh+"
+#' @param weight_col  column in cond_edges to use as weight
+#' @param edge_col    hex colour for edges
+cond_panel <- function(cond_name, weight_col, edge_col) {
+  cells_bg   <- meta[, c("UMAP1", "UMAP2")]
+  cells_fg   <- meta %>% filter(condition == cond_name)
+
+  edf <- cond_edges %>%
+    transmute(cluster_A, cluster_B,
+              weight = .data[[weight_col]]) %>%
+    filter(weight >= COND_THR)
+
+  g <- make_graph(edf, node_attrs)
+
+  ggraph(g, layout = "manual",
+         x = V(g)$x, y = V(g)$y) +
+    # Grey background — all cells
+    geom_point(data = cells_bg,
+               aes(UMAP1, UMAP2), inherit.aes = FALSE,
+               colour = "#cccccc", size = BG_SIZE, alpha = BG_ALPHA, shape = 16) +
+    # Condition cells
+    geom_point(data = cells_fg,
+               aes(UMAP1, UMAP2), inherit.aes = FALSE,
+               colour = edge_col, size = FG_SIZE, alpha = 0.5, shape = 16) +
+    # PAGA edges
+    geom_edge_link(aes(width = weight, alpha = weight),
+                   colour = edge_col,
+                   lineend = "round", show.legend = FALSE) +
+    scale_edge_width(range = c(0.4, EDGE_MAX_WIDTH)) +
+    scale_edge_alpha(range = c(0.3, 0.9)) +
+    # Nodes
+    geom_node_point(aes(size = node_size),
+                    fill = "white", colour = edge_col,
+                    shape = 21, stroke = 0.8, show.legend = FALSE) +
+    geom_node_text(aes(label = cluster), size = 2.2, fontface = "bold",
+                   colour = "black") +
+    scale_size_identity() +
+    coord_fixed() +
+    theme_void(base_size = 10) +
+    labs(title = cond_name) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold",
+                                    colour = edge_col, size = 13))
+}
+```
+
+```{r plot-cond-panels, fig.width=15, fig.height=5.5}
+p_wt  <- cond_panel("WT",    "wt",     COND_PAL["WT"])
+p_neg <- cond_panel("mCh-",  "mchneg", COND_PAL["mCh-"])
+p_pos <- cond_panel("mCh+",  "mchpos", COND_PAL["mCh+"])
+
+p_wt + p_neg + p_pos +
+  plot_annotation(title = "PAGA — per-condition connectivity (res 0.9)",
+                  theme = theme(plot.title = element_text(size = 14,
+                                                           face = "bold")))
+```
+
+---
+
+# 4 · Combined graph — three conditions overlaid
+
+Global PAGA graph drawn once; edge colour shows the dominant condition.
+All three condition-edge sets are plotted as separate layers on the same coordinate system.
+
+```{r combined-graph, fig.width=7, fig.height=5.5}
+# Build per-condition edge layers (same node layout)
+make_edge_layer <- function(weight_col, cond_col, thr = COND_THR) {
+  cond_edges %>%
+    transmute(cluster_A, cluster_B,
+              weight = .data[[weight_col]],
+              colour = cond_col) %>%
+    filter(weight >= thr) %>%
+    left_join(node_attrs %>% select(cluster, x, y),
+              by = c("cluster_A" = "cluster")) %>%
+    rename(x1 = x, y1 = y) %>%
+    left_join(node_attrs %>% select(cluster, x, y),
+              by = c("cluster_B" = "cluster")) %>%
+    rename(x2 = x, y2 = y) %>%
+    drop_na(x1, y1, x2, y2)
+}
+
+edges_wt  <- make_edge_layer("wt",     COND_PAL["WT"])
+edges_neg <- make_edge_layer("mchneg", COND_PAL["mCh-"])
+edges_pos <- make_edge_layer("mchpos", COND_PAL["mCh+"])
+
+all_edges <- bind_rows(
+  mutate(edges_wt,  condition = "WT"),
+  mutate(edges_neg, condition = "mCh-"),
+  mutate(edges_pos, condition = "mCh+")
+) %>%
+  mutate(condition = factor(condition, levels = COND_ORDER))
+
+# Slight jitter on overlapping edges so all three are visible
+set.seed(42)
+all_edges <- all_edges %>%
+  mutate(
+    jitter = (as.integer(condition) - 2) * 0.08,
+    x1j = x1 + jitter * (y2 - y1) / sqrt((x2-x1)^2 + (y2-y1)^2 + 1e-9),
+    y1j = y1 - jitter * (x2 - x1) / sqrt((x2-x1)^2 + (y2-y1)^2 + 1e-9),
+    x2j = x2 + jitter * (y2 - y1) / sqrt((x2-x1)^2 + (y2-y1)^2 + 1e-9),
+    y2j = y2 - jitter * (x2 - x1) / sqrt((x2-x1)^2 + (y2-y1)^2 + 1e-9)
+  )
+
+ggplot() +
+  geom_point(data = meta[, c("UMAP1", "UMAP2")],
+             aes(UMAP1, UMAP2), colour = "#cccccc",
+             size = BG_SIZE, alpha = BG_ALPHA, shape = 16) +
+  geom_segment(data = all_edges,
+               aes(x = x1j, y = y1j, xend = x2j, yend = y2j,
+                   colour = condition, linewidth = weight, alpha = weight),
+               lineend = "round") +
+  geom_point(data = node_attrs,
+             aes(x, y, size = node_size),
+             fill = "white", colour = "grey30",
+             shape = 21, stroke = 0.7) +
+  geom_text(data = node_attrs,
+            aes(x, y, label = cluster),
+            size = 2.2, fontface = "bold") +
+  scale_colour_manual(values = COND_PAL, name = "Condition") +
+  scale_linewidth(range = c(0.4, EDGE_MAX_WIDTH), guide = "none") +
+  scale_alpha(range = c(0.25, 0.85), guide = "none") +
+  scale_size_identity() +
+  coord_fixed() +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right") +
+  labs(title = "PAGA — all conditions overlaid")
+```
+
+---
+
+# 5 · Edge condition specificity
+
+## 5.1 Dominant condition (categorical)
+
+For each edge, the dominant condition is the one with the highest PAGA weight.
+Edge width ∝ global connectivity; colour = dominant condition.
+Specificity (opacity) = how much the dominant condition exceeds the mean:
+`(max_w − mean_others) / max_w`.
+
+```{r specificity-calc}
+spec_edges <- cond_edges %>%
+  filter(max_weight >= GLOBAL_THR) %>%
+  rowwise() %>%
+  mutate(
+    w_vec     = list(c(wt = wt, `mCh-` = mchneg, `mCh+` = mchpos)),
+    dominant  = COND_ORDER[which.max(c(wt, mchneg, mchpos))],
+    max_w     = max(wt, mchneg, mchpos),
+    mean_oth  = (wt + mchneg + mchpos - max_w) / 2,
+    specificity = (max_w - mean_oth) / (max_w + 1e-9)  # 0 = uniform, 1 = exclusive
+  ) %>%
+  ungroup() %>%
+  mutate(dominant = factor(dominant, levels = COND_ORDER)) %>%
+  left_join(node_attrs %>% select(cluster, x, y), by = c("cluster_A" = "cluster")) %>%
+  rename(x1 = x, y1 = y) %>%
+  left_join(node_attrs %>% select(cluster, x, y), by = c("cluster_B" = "cluster")) %>%
+  rename(x2 = x, y2 = y) %>%
+  drop_na(x1, y1, x2, y2)
+
+cat(sprintf("Edges by dominant condition:\n"))
+print(spec_edges %>% count(dominant) %>% arrange(dominant))
+```
+
+```{r plot-specificity-dominant, fig.width=7, fig.height=5.5}
+ggplot() +
+  geom_point(data = meta[, c("UMAP1", "UMAP2")],
+             aes(UMAP1, UMAP2), colour = "#cccccc",
+             size = BG_SIZE, alpha = BG_ALPHA, shape = 16) +
+  geom_segment(data = spec_edges,
+               aes(x = x1, y = y1, xend = x2, yend = y2,
+                   colour = dominant,
+                   linewidth = max_weight,
+                   alpha = specificity),
+               lineend = "round") +
+  geom_point(data = node_attrs,
+             aes(x, y, size = node_size),
+             fill = "white", colour = "grey30",
+             shape = 21, stroke = 0.8) +
+  geom_text(data = node_attrs,
+            aes(x, y, label = cluster),
+            size = 2.2, fontface = "bold") +
+  scale_colour_manual(values = COND_PAL, name = "Dominant\ncondition") +
+  scale_linewidth(range = c(0.4, EDGE_MAX_WIDTH),
+                  name = "Connectivity") +
+  scale_alpha(range = c(0.15, 0.95),
+              name = "Specificity",
+              labels = scales::percent_format(accuracy = 1)) +
+  scale_size_identity() +
+  coord_fixed() +
+  theme_void(base_size = 11) +
+  theme(legend.position = "right") +
+  labs(title = "Edge dominant condition",
+       subtitle = "Width = connectivity · Opacity = condition specificity")
+```
+
+## 5.2 Continuous specificity strip
+
+Edges coloured by specificity score on a continuous diverging scale.
+Low specificity (shared) → grey; high specificity (exclusive) → condition colour.
+
+```{r plot-specificity-continuous, fig.width=15, fig.height=5.5}
+# For each condition: show edges where that condition dominates,
+# coloured by specificity (0 = shared across conditions, 1 = exclusive)
+spec_panel <- function(cond_name, weight_col, cond_col) {
+  df <- spec_edges %>%
+    filter(dominant == cond_name,
+           .data[[weight_col]] >= COND_THR)
+
+  if (nrow(df) == 0)
+    return(ggplot() + theme_void() + labs(title = paste(cond_name, "(no dominant edges)")))
+
+  ggplot() +
+    geom_point(data = meta[, c("UMAP1", "UMAP2")],
+               aes(UMAP1, UMAP2), colour = "#cccccc",
+               size = BG_SIZE, alpha = BG_ALPHA, shape = 16) +
+    geom_segment(data = df,
+                 aes(x = x1, y = y1, xend = x2, yend = y2,
+                     colour = specificity,
+                     linewidth = .data[[weight_col]]),
+                 alpha = 0.85, lineend = "round") +
+    geom_point(data = node_attrs,
+               aes(x, y, size = node_size),
+               fill = "white", colour = "grey40",
+               shape = 21, stroke = 0.7, show.legend = FALSE) +
+    geom_text(data = node_attrs,
+              aes(x, y, label = cluster),
+              size = 2.2, fontface = "bold") +
+    scale_colour_gradient(low = "#cccccc", high = cond_col,
+                          limits = c(0, 1), name = "Specificity",
+                          labels = scales::percent_format(accuracy = 1)) +
+    scale_linewidth(range = c(0.4, EDGE_MAX_WIDTH), guide = "none") +
+    scale_size_identity() +
+    coord_fixed() +
+    theme_void(base_size = 10) +
+    theme(legend.position = "right") +
+    labs(title = cond_name,
+         subtitle = sprintf("dominant edges (n=%d)", nrow(df)))
+}
+
+spec_panel("WT",   "wt",     COND_PAL["WT"]) +
+spec_panel("mCh-", "mchneg", COND_PAL["mCh-"]) +
+spec_panel("mCh+", "mchpos", COND_PAL["mCh+"]) +
+plot_annotation(
+  title    = "Condition-specific edges",
+  subtitle = "Colour = specificity (grey = shared, saturated = exclusive to condition)",
+  theme    = theme(plot.title = element_text(size = 14, face = "bold"))
+)
+```
+
+---
+
+# 6 · Specificity scatter — per-edge condition profile
+
+One row per edge. Strips show WT / mCh− / mCh+ weight side by side,
+sorted by dominant condition and specificity.
+
+```{r specificity-scatter, fig.width=9, fig.height=6}
+spec_long <- spec_edges %>%
+  select(cluster_A, cluster_B, dominant, specificity,
+         wt, mchneg, mchpos, max_weight) %>%
+  pivot_longer(c(wt, mchneg, mchpos),
+               names_to  = "condition",
+               values_to = "weight") %>%
+  mutate(
+    condition = factor(recode(condition,
+                              wt = "WT", mchneg = "mCh-", mchpos = "mCh+"),
+                       levels = COND_ORDER),
+    edge_label = paste0(cluster_A, "–", cluster_B)
+  )
+
+# Order edges by dominant condition then descending specificity
+edge_order <- spec_edges %>%
+  arrange(dominant, desc(specificity)) %>%
+  mutate(edge_label = paste0(cluster_A, "–", cluster_B)) %>%
+  pull(edge_label)
+
+spec_long <- spec_long %>%
+  mutate(edge_label = factor(edge_label, levels = edge_order))
+
+ggplot(spec_long, aes(weight, edge_label, fill = condition)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, alpha = 0.85) +
+  scale_fill_manual(values = COND_PAL, name = "Condition") +
+  scale_x_continuous(limits = c(0, 1), expand = expansion(mult = c(0, 0.05))) +
+  facet_grid(dominant ~ ., scales = "free_y", space = "free_y",
+             labeller = labeller(dominant = function(x) paste("Dominant:", x))) +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text.y   = element_text(size = 7),
+    panel.grid.major.y = element_blank(),
+    strip.text    = element_text(face = "bold", size = 8)
+  ) +
+  labs(x = "PAGA connectivity", y = "Edge (cluster A – cluster B)",
+       title = "Per-edge condition weight profile",
+       subtitle = "Sorted by dominant condition and specificity")
+```
+
+---
+
+# 7 · Connectivity heatmaps
+
+```{r conn-heatmaps-helper}
+# Build n_clusters × n_clusters matrix for one condition
+# Includes only clusters present in node_attrs (not excluded)
+all_clusters <- sort(as.integer(node_attrs$cluster))
+
+cond_matrix <- function(weight_col) {
+  mat <- matrix(0, nrow = length(all_clusters), ncol = length(all_clusters),
+                dimnames = list(all_clusters, all_clusters))
+  rows <- cond_edges %>%
+    filter(cluster_A %in% as.character(all_clusters),
+           cluster_B %in% as.character(all_clusters))
+  for (i in seq_len(nrow(rows))) {
+    a <- as.character(rows$cluster_A[i])
+    b <- as.character(rows$cluster_B[i])
+    w <- rows[[weight_col]][i]
+    mat[a, b] <- w
+    mat[b, a] <- w
+  }
+  as.data.frame(mat) %>%
+    tibble::rownames_to_column("cluster_from") %>%
+    pivot_longer(-cluster_from, names_to = "cluster_to", values_to = "weight") %>%
+    mutate(across(c(cluster_from, cluster_to), ~ factor(.x, levels = all_clusters)))
+}
+
+hm_wt  <- cond_matrix("wt")     %>% mutate(condition = "WT")
+hm_neg <- cond_matrix("mchneg") %>% mutate(condition = "mCh-")
+hm_pos <- cond_matrix("mchpos") %>% mutate(condition = "mCh+")
+hm_all <- bind_rows(hm_wt, hm_neg, hm_pos) %>%
+  mutate(condition = factor(condition, levels = COND_ORDER))
+```
+
+```{r plot-heatmaps, fig.width=14, fig.height=5}
+ggplot(hm_all, aes(cluster_to, cluster_from, fill = weight)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_gradient(low = "white", high = "#08519c",
+                      limits = c(0, 1), name = "Connectivity") +
+  facet_wrap(~ condition, ncol = 3) +
+  coord_fixed() +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text     = element_text(size = 7),
+    strip.text    = element_text(face = "bold", size = 11),
+    panel.grid    = element_blank()
+  ) +
+  labs(x = "Cluster", y = "Cluster",
+       title = "PAGA connectivity matrices by condition")
+```
+
+## 7.1 Difference matrices
+
+Positive = stronger in the first condition; negative = stronger in the second.
+
+```{r diff-heatmaps, fig.width=14, fig.height=5}
+make_diff <- function(w_a, w_b, label) {
+  cond_matrix(w_a) %>%
+    rename(w_a = weight) %>%
+    left_join(cond_matrix(w_b) %>% rename(w_b = weight),
+              by = c("cluster_from", "cluster_to")) %>%
+    mutate(diff = w_a - w_b, label = label)
+}
+
+diff_all <- bind_rows(
+  make_diff("mchpos", "wt",     "mCh+ − WT"),
+  make_diff("mchpos", "mchneg", "mCh+ − mCh−"),
+  make_diff("mchneg", "wt",     "mCh− − WT")
+) %>%
+  mutate(label = factor(label, levels = c("mCh+ − WT", "mCh+ − mCh−", "mCh− − WT")))
+
+vabs <- max(abs(diff_all$diff), na.rm = TRUE)
+vabs <- min(round(vabs, 2), 1)
+
+ggplot(diff_all, aes(cluster_to, cluster_from, fill = diff)) +
+  geom_tile(colour = "white", linewidth = 0.3) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b",
+                       midpoint = 0, limits = c(-vabs, vabs),
+                       name = "Δ connectivity") +
+  facet_wrap(~ label, ncol = 3) +
+  coord_fixed() +
+  theme_bw(base_size = 9) +
+  theme(
+    axis.text     = element_text(size = 7),
+    strip.text    = element_text(face = "bold", size = 11),
+    panel.grid    = element_blank()
+  ) +
+  labs(x = "Cluster", y = "Cluster",
+       title = "PAGA connectivity differences",
+       subtitle = sprintf("Colour scale ±%.2f", vabs))
+```
+
+---
+
+# 8 · Session info
+
+```{r session-info}
+sessionInfo()
+```
+
+{{< include ../_session-info.qmd >}}

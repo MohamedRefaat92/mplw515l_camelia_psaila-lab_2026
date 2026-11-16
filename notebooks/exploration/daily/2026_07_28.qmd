@@ -1,0 +1,35 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+x <- read.csv("output/objects/paga_conditions/paga_edge_comparison_sNN_pca.SCT_30_res.0.9.csv")
+```
+
+```{r}
+y <- x[,2:4] 
+rownames(y) <- x$pair
+y <- y[rowVars(as.matrix(y))>0,]
+```
+
+```{r}
+pheatmap(y,fontsize_row = 5,scale = "row")
+```
+
+```{r}
+x <- FindMarkers(mpn_processed_hsc_fullcc,ident.1 = "5",ident.2 = "15",group.by = "sNN_pca.SCT_30_res.1.5")
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.1.5"
+mpn_processed_hsc_fullcc <- Seurat::FindSubCluster(mpn_processed_hsc_fullcc,
+                                                   cluster = "5",
+                                                   graph.name = "sNN_pca.SCT_30",
+                                                   resolution = 0.2)
+VlnPlot(mpn_processed_hsc_fullcc,features = "Eda2r",group.by = "sub.cluster",sort = TRUE)
+
+
+x <- FindMarkers(mpn_processed_hsc_fullcc,
+                 ident.1 = "5_2",
+                 group.by = "sub.cluster")
+
+```

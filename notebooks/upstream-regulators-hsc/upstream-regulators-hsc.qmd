@@ -1,0 +1,390 @@
+---
+title: "Upstream Regulators — HSC"
+subtitle: "DoRothEA TF activity · PROGENy pathway activity · mm10"
+date: today
+format:
+  html:
+    embed-resources: false
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    toc-float: true
+    code-fold: true
+    fig-align: center
+execute:
+  echo: true
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup, include=FALSE}
+library(targets)
+library(Seurat)
+library(decoupleR)
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+library(DT)
+
+
+COND_PAL   <- c(WT = "#1f78b4", "mCh-" = "#a6cee3", "mCh+" = "#e31a1c")
+COND_ORDER <- c("WT", "mCh-", "mCh+")
+
+TARGET_GENES <- c("Mmp14", "Mmp16", "Rarb", "Dmxl2")
+```
+
+```{r load}
+tar_load(mpn_processed_hsc_fullcc)   # DietSeurat: SCT data layer + UMAP + metadata
+
+DefaultAssay(mpn_processed_hsc_fullcc) <- "SCT"
+
+clust_col <- grep("sNN_pca.*_res\\.0\\.1$",
+                  colnames(mpn_processed_hsc_fullcc@meta.data), value = TRUE)[1]
+
+# UMAP coords + condition derived directly from the Seurat object
+base_umap_df <- as.data.frame(
+    Embeddings(mpn_processed_hsc_fullcc, reduction = "umap.nn")
+  ) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::rename(UMAP1 = umapnn_1, UMAP2 = umapnn_2) |>
+  dplyr::mutate(
+    sample.name = mpn_processed_hsc_fullcc$sample.name[cell_id],
+    condition   = dplyr::case_when(
+      grepl("mCh\\+", sample.name) ~ "mCh+",
+      grepl("mCh-",   sample.name) ~ "mCh-",
+      grepl("WT",     sample.name) ~ "WT",
+      TRUE ~ sample.name
+    )
+  )
+```
+
+---
+
+# 1 · Run upstream analysis
+
+```{r fetch-networks}
+# OmnipathR 3.18.x has a parsing bug with its evidences system; both servers
+# are reachable, so we fetch directly via the REST API and cache to disk.
+cache_dir   <- file.path("output/objects/cache")
+tf_net_path <- file.path(cache_dir, "dorothea_mouse_ab.csv")
+pw_net_path <- file.path(cache_dir, "progeny_mouse_top500.csv")
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(tf_net_path)) {
+  message("Downloading DoRothEA mouse A/B from OmniPath REST API...")
+  url <- paste0(
+    "https://omnipathdb.org/interactions?",
+    "genesymbols=1&datasets=dorothea&dorothea_levels=A,B",
+    "&organisms=10090&fields=dorothea_level,is_stimulation,is_inhibition"
+  )
+  raw <- readr::read_tsv(url, show_col_types = FALSE)
+  tf_net_raw <- raw |>
+    dplyr::filter(is_stimulation != is_inhibition) |>
+    dplyr::transmute(
+      source     = source_genesymbol,
+      target     = target_genesymbol,
+      mor        = ifelse(is_stimulation == 1L, 1L, -1L),
+      confidence = dorothea_level
+    ) |>
+    dplyr::distinct(source, target, .keep_all = TRUE)
+  readr::write_csv(tf_net_raw, tf_net_path)
+  message(sprintf("  Cached %d TF-target pairs -> %s", nrow(tf_net_raw), tf_net_path))
+}
+
+if (!file.exists(pw_net_path)) {
+  message("Downloading PROGENy weights from OmniPath REST API...")
+  # Annotations endpoint returns key-value rows: label="pathway"|"weight" per record_id.
+  # Human gene symbols are title-cased to match mouse convention (MMP14 → Mmp14).
+  url <- "https://omnipathdb.org/annotations?resources=PROGENy"
+  raw <- readr::read_tsv(url, show_col_types = FALSE)
+  pw_net_raw <- raw |>
+    dplyr::select(genesymbol, label, value, record_id) |>
+    tidyr::pivot_wider(
+      id_cols     = c(genesymbol, record_id),
+      names_from  = label,
+      values_from = value
+    ) |>
+    dplyr::transmute(
+      target = stringr::str_to_title(genesymbol),
+      source = pathway,
+      weight = as.numeric(weight)
+    ) |>
+    dplyr::filter(!is.na(weight)) |>
+    dplyr::group_by(source, target) |>
+    dplyr::slice_max(abs(weight), n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
+    dplyr::group_by(source) |>
+    dplyr::slice_max(abs(weight), n = 500, with_ties = FALSE) |>
+    dplyr::ungroup()
+  readr::write_csv(pw_net_raw, pw_net_path)
+  message(sprintf("  Cached %d pathway-gene pairs -> %s", nrow(pw_net_raw), pw_net_path))
+}
+
+tf_net <- readr::read_csv(tf_net_path, show_col_types = FALSE)
+pw_net <- readr::read_csv(pw_net_path, show_col_types = FALSE)
+cat(sprintf("DoRothEA: %d pairs (%d TFs) | PROGENy: %d pairs (%d pathways)\n",
+            nrow(tf_net), dplyr::n_distinct(tf_net$source),
+            nrow(pw_net), dplyr::n_distinct(pw_net$source)))
+```
+
+```{r run-analysis}
+run_upstream_analysis <- function(
+    seu,
+    tf_network   = tf_net,
+    pw_network   = pw_net,
+    target_genes = TARGET_GENES,
+    group_var    = "sample.name"
+) {
+  mat <- as.matrix(GetAssayData(seu, assay = "SCT", layer = "data"))
+  mat <- mat[, !duplicated(colnames(mat))]
+
+  # TF activities (DoRothEA)
+  tf_acts <- run_wmean(
+    mat, tf_network,
+    .source  = "source",
+    .target  = "target",
+    .mor     = "mor",
+    times    = 100,
+    minsize  = 5
+  )
+
+  # Pathway activities (PROGENy)
+  pw_acts <- run_wmean(
+    mat, pw_network,
+    .source  = "source",
+    .target  = "target",
+    .mor     = "weight",
+    times    = 100,
+    minsize  = 5
+  )
+
+  # Reshape to features × cells matrices (select only needed cols to avoid
+  # p_value / statistic acting as extra pivot id-columns → duplicate source rows)
+  tf_mat <- tf_acts |>
+    filter(statistic == "norm_wmean") |>
+    select(source, condition, score) |>
+    pivot_wider(names_from = condition, values_from = score,
+                values_fn = mean) |>
+    column_to_rownames("source") |>
+    as.matrix()
+
+  pw_mat <- pw_acts |>
+    filter(statistic == "norm_wmean") |>
+    select(source, condition, score) |>
+    pivot_wider(names_from = condition, values_from = score,
+                values_fn = mean) |>
+    column_to_rownames("source") |>
+    as.matrix()
+
+  # Add as assays (align to Seurat cell order)
+  shared_cells <- intersect(colnames(tf_mat), colnames(seu))
+  seu <- seu[, shared_cells]
+  seu[["TF_activity"]]      <- CreateAssayObject(data = tf_mat[, shared_cells])
+  seu[["Pathway_activity"]] <- CreateAssayObject(data = pw_mat[, shared_cells])
+
+  # Score cells for target-gene expression
+  genes_present <- intersect(target_genes, rownames(mat))
+  cat("Target genes found in SCT assay:", paste(genes_present, collapse = ", "), "\n")
+  seu$target_gene_score <- colMeans(mat[genes_present, shared_cells, drop = FALSE])
+
+  # Differential TF activity: target-gene-high vs low
+  Idents(seu) <- ifelse(
+    seu$target_gene_score > median(seu$target_gene_score),
+    "target_high", "target_low"
+  )
+
+  DefaultAssay(seu) <- "TF_activity"
+  tf_diff <- FindMarkers(
+    seu,
+    ident.1          = "target_high",
+    ident.2          = "target_low",
+    test.use         = "wilcox",
+    logfc.threshold  = 0,
+    min.pct          = 0
+  )
+
+  DefaultAssay(seu) <- "Pathway_activity"
+  pw_diff <- FindMarkers(
+    seu,
+    ident.1          = "target_high",
+    ident.2          = "target_low",
+    test.use         = "wilcox",
+    logfc.threshold  = 0,
+    min.pct          = 0
+  )
+
+  list(
+    seurat               = seu,
+    tf_differential      = tf_diff,
+    pathway_differential = pw_diff,
+    tf_acts              = tf_acts,
+    pw_acts              = pw_acts
+  )
+}
+
+results <- run_upstream_analysis(mpn_processed_hsc_fullcc)
+mpn_processed_hsc_fullcc <- results$seurat
+tf_diff  <- results$tf_differential
+pw_diff  <- results$pathway_differential
+```
+
+---
+
+# 2 · Target gene score
+
+Distribution of the composite target-gene score (`r paste(TARGET_GENES, collapse = ", ")`) across
+cells, split by condition.
+
+```{r target-score-umap, fig.width=11, fig.height=4}
+umap_df <- base_umap_df |>
+  dplyr::filter(cell_id %in% colnames(mpn_processed_hsc_fullcc)) |>
+  dplyr::mutate(score = mpn_processed_hsc_fullcc$target_gene_score[cell_id]) |>
+  dplyr::arrange(score)
+
+p_score <- ggplot(umap_df, aes(UMAP1, UMAP2, colour = score)) +
+  geom_point(size = 0.2, alpha = 0.5) +
+  scale_colour_gradientn(
+    colours = c("#f0f0f0", "#feb24c", "#f03b20", "#bd0026"),
+    name    = "Target\nscore"
+  ) +
+  labs(title = "Target gene score") +
+  theme_void(base_size = 10) +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_vln <- ggplot(umap_df, aes(condition, score, fill = condition)) +
+  geom_violin(scale = "width", trim = TRUE, colour = NA) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white", colour = "grey30") +
+  scale_fill_manual(values = COND_PAL) +
+  scale_x_discrete(limits = COND_ORDER) +
+  labs(x = NULL, y = "Target gene score") +
+  theme_classic(base_size = 10) +
+  theme(legend.position = "none")
+
+p_score + p_vln + patchwork::plot_layout(widths = c(2, 1))
+```
+
+---
+
+# 3 · Differential TF activity
+
+TFs with significantly different activity between target-gene-high and -low cells.
+
+```{r tf-diff-table}
+datatable(
+  tf_diff |>
+    tibble::rownames_to_column("TF") |>
+    dplyr::arrange(p_val_adj, desc(abs(avg_log2FC))) |>
+    dplyr::mutate(across(where(is.numeric), \(x) round(x, 4))),
+  rownames  = FALSE,
+  filter    = "top",
+  caption   = sprintf("Differential TF activity: target_high vs target_low (%d TFs)", nrow(tf_diff)),
+  options   = list(pageLength = 15, scrollX = TRUE)
+)
+```
+
+```{r tf-diff-volcano, fig.width=7, fig.height=5}
+tf_vol <- tf_diff |>
+  tibble::rownames_to_column("TF") |>
+  dplyr::mutate(
+    sig   = p_val_adj < 0.05 & abs(avg_log2FC) > 0.25,
+    label = ifelse(sig, TF, NA_character_)
+  )
+
+ggplot(tf_vol, aes(avg_log2FC, -log10(p_val_adj + 1e-300),
+                    colour = sig, label = label)) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  ggrepel::geom_text_repel(size = 2.8, max.overlaps = 20,
+                            min.segment.length = 0, seed = 42) +
+  scale_colour_manual(values = c("FALSE" = "grey70", "TRUE" = "#e31a1c"),
+                      guide = "none") +
+  geom_vline(xintercept = c(-0.25, 0.25), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  labs(
+    x     = "avg log2FC (target_high vs target_low)",
+    y     = "-log10(adj p-value)",
+    title = "Differential TF activity"
+  ) +
+  theme_classic(base_size = 11)
+```
+
+```{r tf-umap, fig.width=14, fig.height=4}
+top_tfs <- tf_diff |>
+  tibble::rownames_to_column("TF") |>
+  dplyr::filter(p_val_adj < 0.05) |>
+  dplyr::slice_max(abs(avg_log2FC), n = 6) |>
+  dplyr::pull(TF)
+
+if (length(top_tfs) > 0) {
+  DefaultAssay(mpn_processed_hsc_fullcc) <- "TF_activity"
+  tf_umap_df <- umap_df |>
+    dplyr::bind_cols(
+      as.data.frame(t(GetAssayData(mpn_processed_hsc_fullcc, assay = "TF_activity",
+                                   layer = "data")[top_tfs, umap_df$cell_id,
+                                                   drop = FALSE]))
+    )
+
+  plots <- lapply(top_tfs, function(tf) {
+    tf_umap_df |> dplyr::arrange(.data[[tf]]) |>
+      ggplot(aes(UMAP1, UMAP2, colour = .data[[tf]])) +
+      geom_point(size = 0.15, alpha = 0.5) +
+      scale_colour_gradientn(
+        colours = c("#f0f0f0", "#feb24c", "#f03b20", "#bd0026"),
+        name    = "activity"
+      ) +
+      labs(title = tf) +
+      theme_void(base_size = 9) +
+      theme(plot.title = element_text(face = "bold", size = 9, hjust = 0.5))
+  })
+  patchwork::wrap_plots(plots, nrow = 1)
+} else {
+  message("No significant TFs at padj < 0.05")
+}
+```
+
+---
+
+# 4 · Differential pathway activity
+
+```{r pw-diff-table}
+datatable(
+  pw_diff |>
+    tibble::rownames_to_column("pathway") |>
+    dplyr::arrange(p_val_adj, desc(abs(avg_log2FC))) |>
+    dplyr::mutate(across(where(is.numeric), \(x) round(x, 4))),
+  rownames  = FALSE,
+  filter    = "top",
+  caption   = sprintf("Differential pathway activity: target_high vs target_low (%d pathways)", nrow(pw_diff)),
+  options   = list(pageLength = 15, scrollX = TRUE)
+)
+```
+
+```{r pw-diff-barplot, fig.width=7, fig.height=4}
+pw_diff |>
+  tibble::rownames_to_column("pathway") |>
+  dplyr::arrange(avg_log2FC) |>
+  dplyr::mutate(
+    pathway   = factor(pathway, levels = pathway),
+    direction = ifelse(avg_log2FC > 0, "up", "down"),
+    sig       = p_val_adj < 0.05
+  ) |>
+  ggplot(aes(avg_log2FC, pathway, fill = direction, alpha = sig)) +
+  geom_col(colour = "grey30", linewidth = 0.2) +
+  scale_fill_manual(values  = c(up = "#b2182b", down = "#2166ac"), guide = "none") +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4),
+                     labels = c("TRUE" = "padj < 0.05", "FALSE" = "n.s."),
+                     name   = NULL) +
+  geom_vline(xintercept = 0, linewidth = 0.4) +
+  labs(x = "avg log2FC (target_high vs target_low)", y = NULL,
+       title = "PROGENy pathway activity") +
+  theme_classic(base_size = 11)
+```
+
+```{r cleanup, include=FALSE}
+rm(results, tf_net, pw_net); gc()
+```
+
+{{< include ../_session-info.qmd >}}

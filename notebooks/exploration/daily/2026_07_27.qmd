@@ -1,0 +1,46 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Il6"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo", limit = c(0,4))&RestoreLegend()
+```
+
+```{r}
+VlnPlot(mpn_processed_hsc_fullcc,features = c("nFeature_RNA"),group.by = "sNN_pca.SCT_30_res.0.9",sort = T,split.by = "sample.name")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("nFeature_RNA"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo", limit = c(2000,6000))&RestoreLegend()
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.0.9"
+VlnPlot(mpn_processed_hsc_fullcc,features = c("nFeature_RNA"),group.by = "sNN_pca.SCT_30_res.0.9",sort = T,split.by = "sample.name", idents = c("6", "8"))
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Cdk1", "Cdkn1a", "Cdkn2a"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo", limit = c(0,4))&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Hoxb2", "Irf9", "Ar", "Nfat5", "Mitf"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Rarb", "Hoxb5"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Tgif1"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Cdh4"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Serpine1", "Cdh4"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&RestoreLegend()
+```

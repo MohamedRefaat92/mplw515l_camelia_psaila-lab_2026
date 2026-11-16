@@ -1,0 +1,167 @@
+---
+title: "mpn_meeting_presentation"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r}
+plot_umap_groups(mpn_processed_hsc_fullcc,
+                 group_i = "sNN_pca.SCT_30_res.0.5",
+                 label = TRUE,
+                 label_size = 5)&NoLegend()&
+  scale_color_manual(values = yaml::read_yaml(config_file)$cell_colours%>% unlist()%>% unname()%>% tail(23))
+```
+
+```{r}
+x <- mpn_processed_hsc_fullcc$sample.name %>% levels()
+cols <- c("#056C5C", "#d6604d", "#fee391")
+
+plot_umap_groups_ext(mpn_processed_hsc_fullcc,
+                     group_i  = "sample.name",
+                     split.by = "sample.name",
+                     label = FALSE,
+                     label_size = 5,
+                     cols = set_names(cols, x))&NoLegend()
+```
+
+```{r}
+mpn_processed_hsc_fullcc@meta.data%>%
+  dplyr::count(sample.name) %>% 
+  ggplot(aes("",n, fill =sample.name))+
+  geom_col()+scale_fill_manual(values = set_names(cols, x))+
+  coord_polar("y", start=0)+theme_void()
+
+
+```
+
+```{r}
+
+cond_prop_levels <- mpn_processed_hsc_fullcc@meta.data%>%
+  dplyr::count(sample.name, sNN_pca.SCT_30_res.0.5) %>%
+  filter(sample.name == "HSC_WT_CD41+")%>%
+  mutate(cond_prop = n/sum(n),
+         sNN_pca.SCT_30_res.0.5 = as.character(sNN_pca.SCT_30_res.0.5)) %>% 
+  arrange(cond_prop)%>%
+  pull(sNN_pca.SCT_30_res.0.5)
+
+clust_prop_levels <- mpn_processed_hsc_fullcc@meta.data%>%
+  dplyr::count(sample.name, sNN_pca.SCT_30_res.0.5) %>%
+  filter(sample.name == "HSC_WT_CD41+")%>%
+  mutate(clust_prop = n/sum(n),
+         sNN_pca.SCT_30_res.0.5 = as.character(sNN_pca.SCT_30_res.0.5)) %>% 
+  arrange(clust_prop)%>%
+  pull(sNN_pca.SCT_30_res.0.5)
+
+mpn_processed_hsc_fullcc@meta.data%>%
+  dplyr::count(sample.name, sNN_pca.SCT_30_res.0.5) %>%
+  group_by(sNN_pca.SCT_30_res.0.5) %>%
+  mutate(clust_prop = n/sum(n))%>%
+  ungroup() %>% 
+  group_by(sample.name) %>% 
+  mutate(cond_prop = n/sum(n)) %>% 
+  ungroup() %>% 
+  mutate(sNN_pca.SCT_30_res.0.5 = factor(sNN_pca.SCT_30_res.0.5, levels =cond_prop_levels),
+         sample.name = factor(sample.name,
+                              levels = c("HSC_WT_CD41+", "HSC_Het_CD41+mCh-","HSC_Het_CD41+mCh+")) 
+  ) %>% 
+  ggplot(aes(sNN_pca.SCT_30_res.0.5,cond_prop, fill = sample.name))+
+  geom_col(position = position_dodge())+
+  coord_flip()+
+  facet_wrap(~sample.name)+
+  theme(panel.grid.major.x = element_line(colour = "grey90"),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 10))
+
+
+```
+
+```{r}
+x <- mpn_processed_hsc_fullcc@meta.data%>%
+  dplyr::count(sample.name,sNN_pca.SCT_30_res.0.5)%>%
+  pivot_wider(names_from = sample.name, values_from = n)%>%
+  mutate(x_col = 1,
+         sNN_pca.SCT_30_res.0.5 = as.numeric(sNN_pca.SCT_30_res.0.5))
+
+ggplot()+
+  scatterpie::geom_scatterpie(aes(x_col,
+                                  sNN_pca.SCT_30_res.0.5,
+                                  group = sNN_pca.SCT_30_res.0.5,r = 0.5),
+                              data = x,
+                              cols = colnames(x)[2:4])+coord_flip()+theme(legend.position = "top")
+
+```
+
+
+```{r alluvial_plot}
+library(ggalluvial)
+
+mpn_processed_hsc_fullcc@meta.data %>%
+  dplyr::count(sample.name, sNN_pca.SCT_30_res.0.5) %>%
+  group_by(sample.name) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    sample.name = factor(sample.name,
+                         levels = c("HSC_WT_CD41+", "HSC_Het_CD41+mCh-", "HSC_Het_CD41+mCh+")),
+    cluster = factor(sNN_pca.SCT_30_res.0.5, levels =rev(cond_prop_levels))
+  ) %>%
+  ggplot(aes(x = sample.name, y = prop,
+             stratum = cluster, alluvium = cluster,
+             fill = cluster, label = cluster)) +
+  geom_flow(stat = "alluvium", aes.flow = "forward", alpha = 0.6,
+            color = "white", linewidth = 0.3) +
+  geom_stratum(alpha = 0.9, color = "white", linewidth = 0.3) +
+  geom_text(stat = "stratum", size = 3, fontface = "bold", color = "white") +
+  scale_fill_manual(values = colorspace::sequential_hcl(16, palette = "Batlow")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Proportion of condition", fill = "Cluster") +
+  theme_classic() +
+  theme(
+    axis.text.x  = element_text(size = 10),
+    legend.position = "none"
+  )
+```
+
+```{r}
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      c("Podxl"),
+                      reduction = "umap.nn",
+                      viridis_option = "turbo",
+                      split.by = "sample.name")&
+  scale_color_gradientn(colors  = c("lightgrey", "#ff0000", "#00ff00"))
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+                      c("Cd14"),
+                      reduction = "umap.nn",
+                      split.by = "sample.name")&
+  scale_color_gradientn(colors  = c("lightgrey", "#ff0000", "#00ff00"))
+```
+
+
+```{r}
+top_markers <-  feat_delegate_summary %>%
+  filter(rate1 >= 0.2 & group1_is_max) %>%
+  group_by(group1) %>%
+  slice_min(n = 1,order_by = min_padj) %>%
+  ungroup() %>%
+  pull(feature) %>%
+  unique()
+
+clust_res <- "sNN_pca.SCT_30_res.0.5"
+clust_n   <- sort(unique(mpn_processed_hsc_fullcc@meta.data[[clust_res]]))
+pal_n     <- scales::hue_pal()(length(clust_n))
+clust_cols <- yaml::read_yaml(config_file)$cell_colours%>% unlist()%>% unname()%>% tail(23)
+
+plot_srt_ctr_stacked_vln(mpn_processed_data_hsc,
+                         clust_id = clust_res,
+                         feats    = top_markers,
+                         cols     = clust_cols)
+```
+
+
+

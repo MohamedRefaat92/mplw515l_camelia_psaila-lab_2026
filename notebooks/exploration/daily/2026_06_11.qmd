@@ -1,0 +1,42 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Sbno2", 
+                                                  "Etv3",
+                                                  "Socs3",
+                                                  "Bcl3"),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Arid5a",
+                                                  "Atf3", 
+                                                  "Sp1",
+                                                  "Pgr"),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("S100a8", "S100a9"),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,features = c(
+    "Elane",    # promyelocyte
+    "Prtn3",    # promyelocyte
+    "Ctsg",     # promyelocyte
+    "Itgam",    # myelocyte+ (CD11b)
+    "Csf3r",    # mature neutrophil (G-CSFR)
+    "Fcgr3",    # mature neutrophil (CD16)
+    "Cxcr2",
+    "Prtn3"
+),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Ar"),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```

@@ -1,0 +1,674 @@
+---
+title: "hdWGCNA — HSC GRN (Non-blood promoters)"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(igraph)
+library(ComplexHeatmap)
+library(circlize)
+library(hdWGCNA)
+library(WGCNA)
+
+
+theme_set(theme_cowplot())
+
+cond_pal <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+
+label_condition <- function(x) dplyr::case_when(
+  grepl("WT",      x) ~ "WT",
+  grepl("mCh-",   x) ~ "mCh-",
+  grepl("mCh\\+", x) ~ "mCh+",
+  TRUE                ~ x
+)
+
+CLUST_COL <- "sNN_pca.SCT_30_res.0.9"
+```
+
+```{r load}
+targets::tar_load(hdwgcna_hsc_modules)
+srt <- hdwgcna_hsc_modules
+rm(hdwgcna_hsc_modules); gc()
+
+DefaultAssay(srt) <- "SCT"
+srt$condition <- label_condition(srt$sample.name) %>% setNames(., names(srt$sample.name))
+
+umap_df <- as.data.frame(Embeddings(srt, "umap.nn")) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::rename(UMAP1 = 2, UMAP2 = 3) |>
+  dplyr::mutate(
+    cluster   = srt@meta.data[[CLUST_COL]],
+    condition = srt$condition,
+    sample    = srt$sample.name
+  )
+
+modules <- GetModules(srt, wgcna_name = "hsc_modules")
+cat("Cells:", ncol(srt), "| Modules:", length(unique(modules$module)) - 1L, "\n")
+```
+
+```{r aug-load}
+mm10_non_blood_promoters_gr <- targets::tar_read(mm10_non_blood_promoters_gr)
+mm10_protein_coding_promoters_gr <- targets::tar_read(mm10_protein_coding_promoters_gr)
+
+cat(sprintf("All promoters:            %d transcripts, %d genes\n",
+            length(mm10_protein_coding_promoters_gr),
+            length(unique(mm10_protein_coding_promoters_gr$symbol))))
+cat(sprintf("Non-blood promoters:      %d transcripts, %d genes\n",
+            length(mm10_non_blood_promoters_gr),
+            length(unique(mm10_non_blood_promoters_gr$symbol))))
+cat(sprintf("Excluded (blood-open):    %d transcripts\n",
+            length(mm10_protein_coding_promoters_gr) - length(mm10_non_blood_promoters_gr)))
+```
+
+```{r aug-pkgs}
+library(motifmatchr)
+```
+
+```{r aug-def}
+AugmentMotifScanWithBED <- function(
+  seurat_obj,
+  gr_list,
+  pfm,
+  species_genome = "mm10",
+  wgcna_name     = NULL
+) {
+  if (is.null(wgcna_name)) wgcna_name <- seurat_obj@misc$active_wgcna
+  hdWGCNA::CheckWGCNAName(seurat_obj, wgcna_name)
+
+  wgcna_genes <- hdWGCNA::GetWGCNAGenes(seurat_obj, wgcna_name = wgcna_name)
+
+  motif_df <- data.frame(
+    motif_name = purrr::map_chr(seq_along(pfm), ~ pfm[[.x]]@name),
+    motif_ID   = purrr::map_chr(seq_along(pfm), ~ pfm[[.x]]@ID),
+    stringsAsFactors = FALSE
+  )
+
+  elem_grs <- lapply(gr_list, function(e)
+    if (methods::is(e, "GRanges")) e else e$gr
+  )
+
+  scan_gr <- do.call(c, unname(lapply(elem_grs, GenomicRanges::granges)))
+  GenomeInfoDb::genome(GenomeInfoDb::seqinfo(scan_gr)) <- species_genome
+
+  cat(sprintf("[AugmentMotifScanWithBED] Scanning %d regions (%s)...\n",
+              length(scan_gr),
+              paste(sprintf("%d %s", lengths(elem_grs), names(elem_grs)),
+                    collapse = " + ")))
+
+  motif_res <- motifmatchr::matchMotifs(pfm, scan_gr, genome = species_genome)
+  all_match <- motifmatchr::motifMatches(motif_res)
+  colnames(all_match) <- motif_df$motif_ID
+  rm(motif_res, scan_gr); invisible(gc())
+
+  offset   <- 0L
+  tf_match <- NULL
+
+  for (nm in names(gr_list)) {
+    elem    <- gr_list[[nm]]
+    n_rows  <- length(elem_grs[[nm]])
+    e_match <- all_match[(offset + 1L):(offset + n_rows), , drop = FALSE]
+    offset  <- offset + n_rows
+
+    if (methods::is(elem, "GRanges")) {
+      row_ids <- as.character(seq_len(n_rows))
+      pg <- data.frame(rng_id = row_ids, gene = elem$symbol,
+                       stringsAsFactors = FALSE)
+      pg <- pg[!is.na(pg$gene), ]
+      rownames(e_match) <- row_ids
+    } else {
+      rownames(e_match) <- names(elem$gr)
+      pg <- data.frame(rng_id = elem$peak_gene$reduced_name,
+                       gene   = elem$peak_gene$gene,
+                       stringsAsFactors = FALSE)
+    }
+
+    gl <- wgcna_genes[wgcna_genes %in% pg$gene]
+    pg <- pg[pg$gene %in% gl & pg$rng_id %in% rownames(e_match), ]
+
+    if (length(gl) > 0 && nrow(pg) > 0) {
+      g_idx    <- setNames(seq_along(gl), gl)
+      rgn_gene <- Matrix::sparseMatrix(
+        i        = match(pg$rng_id, rownames(e_match)),
+        j        = g_idx[pg$gene],
+        x        = 1L,
+        dims     = c(nrow(e_match), length(gl)),
+        dimnames = list(rownames(e_match), gl)
+      )
+      contrib <- Matrix::t(rgn_gene) %*% methods::as(e_match, "dgCMatrix")
+      contrib <- contrib > 0L
+      rm(rgn_gene)
+    } else {
+      contrib <- NULL
+    }
+    rm(e_match); invisible(gc())
+
+    if (!is.null(contrib)) {
+      if (is.null(tf_match)) {
+        tf_match <- contrib
+      } else {
+        shared  <- intersect(rownames(tf_match), rownames(contrib))
+        only_tf <- setdiff(rownames(tf_match), rownames(contrib))
+        only_c  <- setdiff(rownames(contrib),  rownames(tf_match))
+        tf_match <- rbind(
+          tf_match[shared, , drop = FALSE] | contrib[shared, , drop = FALSE],
+          tf_match[only_tf, , drop = FALSE],
+          contrib[only_c,   , drop = FALSE]
+        )
+      }
+    }
+  }
+  rm(all_match); invisible(gc())
+
+  if (is.null(tf_match))
+    stop("[AugmentMotifScanWithBED] No gene–motif hits found across all elements.")
+
+  tf_targets <- setNames(
+    lapply(colnames(tf_match), function(m)
+      names(which(as.logical(tf_match[, m])))),
+    colnames(tf_match)
+  )
+  motif_df$n_targets <- lengths(tf_targets)
+
+  tfs_fix <- names(which(table(motif_df$motif_name) > 1))
+  for (cur_tf in tfs_fix) {
+    cur_idx <- as.numeric(rownames(subset(motif_df, motif_name == cur_tf)))
+    tf_targets[[cur_tf]] <- unique(unlist(tf_targets[cur_idx]))
+  }
+
+  tmp <- gsub("\\(.*\\)", "", motif_df$motif_name)
+  tmp <- gsub("::", ",", tmp)
+  names(tmp) <- motif_df$motif_ID
+
+  motif_df_out <- do.call(rbind, lapply(seq_along(tmp), function(i) {
+    x  <- tmp[[i]]; id <- names(tmp)[i]
+    if (grepl(",", x)) x <- unlist(strsplit(x, ","))
+    data.frame(motif_ID = id, gene_name = trimws(x), stringsAsFactors = FALSE)
+  }))
+  ix <- match(motif_df_out$motif_ID, motif_df$motif_ID)
+  motif_df_out <- cbind(motif_df_out, motif_df[ix, c("motif_name", "n_targets")])
+  rownames(motif_df_out) <- seq_len(nrow(motif_df_out))
+  motif_df_out <- dplyr::select(motif_df_out,
+                                 motif_ID, motif_name, n_targets, gene_name)
+  motif_df_out <- subset(motif_df_out, gene_name %in% rownames(seurat_obj))
+
+  seurat_obj <- hdWGCNA::SetMotifMatrix(seurat_obj,  tf_match)
+  seurat_obj <- hdWGCNA::SetMotifs(seurat_obj,       motif_df_out)
+  seurat_obj <- hdWGCNA::SetMotifTargets(seurat_obj, tf_targets)
+  seurat_obj <- hdWGCNA::SetPFMList(seurat_obj,      pfm)
+
+  cat(sprintf("[AugmentMotifScanWithBED] Done: %d genes × %d motifs\n",
+              nrow(tf_match), ncol(tf_match)))
+  seurat_obj
+}
+```
+
+```{r tf-pkgs}
+bioc_needed <- c("JASPAR2024", "TFBSTools",
+                 "BSgenome.Mmusculus.UCSC.mm10", "EnsDb.Mmusculus.v79")
+missing_pkgs <- bioc_needed[!bioc_needed %in% rownames(installed.packages())]
+if (length(missing_pkgs) > 0) {
+  message("Installing: ", paste(missing_pkgs, collapse = ", "))
+  BiocManager::install(missing_pkgs, ask = FALSE)
+}
+library(JASPAR2024)
+library(TFBSTools)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(EnsDb.Mmusculus.v79)
+
+pfm_set <- TFBSTools::getMatrixSet(
+  x    = JASPAR2024()@db,
+  opts = list(collection  = "CORE",
+              tax_id      = list(10090),
+              all_versions = FALSE,
+              matrixtype  = "PFM")
+)
+cat("Motifs loaded:", length(pfm_set), "\n")
+```
+
+---
+
+## 14 — Non-blood promoters
+
+Motif scanning restricted to gene promoter windows that do **not** overlap any
+ImmGenATAC18 open chromatin region (OCR) in blood cells. These are promoters
+that are normally **closed** in the haematopoietic compartment.
+
+**Rationale.** Restricting to inaccessible promoters isolates TF binding
+programmes that would require aberrant chromatin opening to operate. In the
+MPN context, TFs whose motifs are enriched in normally-closed promoters of
+module genes are candidates for driving atypical gene expression through
+chromatin remodelling rather than through canonical blood regulatory elements.
+Comparing the resulting GRN with the promoter-only (§12) and ATAC-only (§13)
+networks reveals which regulatory connections are unique to the closed-chromatin
+gene set.
+
+`mm10_non_blood_promoters_gr` is computed in the targets pipeline as:
+
+```r
+GenomicRanges::subsetByOverlaps(
+  mm10_protein_coding_promoters_gr,
+  yoshida_2020_ocr_gr,            # all blood OCRs (±250 bp around summit)
+  invert = TRUE
+)
+```
+
+### 14.1 — Motif scan
+
+```{r nbp-scan}
+srt <- AugmentMotifScanWithBED(
+  seurat_obj = srt,
+  gr_list    = list(non_blood_promoters = mm10_non_blood_promoters_gr),
+  pfm        = pfm_set,
+  wgcna_name = "hsc_modules"
+)
+```
+
+### 14.2 — Overlap motifs with modules
+
+```{r nbp-overlap}
+srt <- OverlapModulesMotifs(srt, wgcna_name = "hsc_modules")
+
+motif_df <- GetMotifOverlap(srt, wgcna_name = "hsc_modules")
+motif_genes_df <- GetMotifs(srt)
+
+motif_df <- dplyr::left_join(
+  motif_df,
+  motif_genes_df[, c("motif_ID", "motif_name")],
+  by = c("tf" = "motif_ID")
+)
+
+tf_genes      <- unique(motif_genes_df$gene_name)
+modules_net   <- GetModules(srt, wgcna_name = "hsc_modules")
+nongrey_genes <- subset(modules_net, module != "grey")$gene_name
+genes_use     <- unique(c(tf_genes, nongrey_genes))
+
+srt <- SetWGCNAGenes(srt, genes_use, wgcna_name = "hsc_modules")
+srt <- SetDatExpr(srt,
+                  group_name = unique(srt$sample.name),
+                  group.by   = "sample.name",
+                  assay      = "SCT",
+                  layer      = "data",
+                  wgcna_name = "hsc_modules")
+
+model_params <- list(
+  objective = "reg:squarederror",
+  max_depth = 1,
+  eta       = 0.1,
+  nthread   = 16,
+  alpha     = 0.5
+)
+srt <- ConstructTFNetwork(
+  srt,
+  model_params = model_params,
+  wgcna_name   = "hsc_modules"
+)
+
+cat("motif_df rows:", nrow(motif_df), "\n")
+```
+
+### 14.3 — TF regulons
+
+```{r nbp-tf-regulons}
+srt <- AssignTFRegulons(
+  srt,
+  strategy   = "C",
+  reg_thresh = 0.1,
+  wgcna_name = "hsc_modules"
+)
+
+results <- GetTFNetwork(srt, wgcna_name = "hsc_modules")
+cat("TF–gene pairs after regulon assignment:", nrow(results), "\n")
+```
+
+### 14.4 — TF network table
+
+```{r nbp-tf-network-table}
+tf_network <- GetTFNetwork(srt, wgcna_name = "hsc_modules")
+cat("TF–gene pairs in network:", nrow(tf_network), "\n")
+
+DT::datatable(
+  tf_network,
+  filter     = "top",
+  rownames   = FALSE,
+  extensions = "Buttons",
+  options    = list(
+    pageLength   = 20,
+    dom          = "Blfrtip",
+    buttons      = c("csv", "excel"),
+    scrollX      = TRUE,
+    autoWidth    = TRUE,
+    initComplete = DT::JS(
+      "function(settings, json) {",
+      "  $(this.api().table().node()).css('font-size', '11px');",
+      "}"
+    )
+  )
+)
+```
+
+### 14.5 — Regulon scores
+
+```{r nbp-regulon-scores}
+srt <- RegulonScores(
+  srt,
+  target_type        = "positive",
+  exclude_grey_genes = FALSE,
+  cor_thresh         = 0.05,
+  ncores             = 8,
+  wgcna_name         = "hsc_modules"
+)
+srt <- RegulonScores(
+  srt,
+  target_type        = "negative",
+  exclude_grey_genes = FALSE,
+  cor_thresh         = -0.05,
+  ncores             = 8,
+  wgcna_name         = "hsc_modules"
+)
+
+pos_regulon_scores <- GetRegulonScores(srt, target_type = "positive",
+                                       wgcna_name = "hsc_modules")
+neg_regulon_scores <- GetRegulonScores(srt, target_type = "negative",
+                                       wgcna_name = "hsc_modules")
+
+cat("Regulon score matrix dims (pos):", dim(pos_regulon_scores), "\n")
+```
+
+### 14.6 — Top TF targets per cluster
+
+Top TF in cluster 6 and cluster 8 selected by highest mean positive regulon
+score across cells in each cluster.
+
+```{r nbp-top-tf-per-cluster}
+# Score each TF by mean expression of its target genes in cells of each cluster.
+# tf_network$tf is guaranteed valid for RegulonBarPlot (same slot as AssignTFRegulons).
+expr_mat  <- GetDatExpr(srt, wgcna_name = "hsc_modules")  # cells × genes
+clust_vec <- srt@meta.data[[CLUST_COL]]
+valid_tfs <- unique(tf_network$tf)
+cat("TFs in network:", length(valid_tfs), "\n")
+
+top_tf_by_target_expr <- function(cl_id, net, expr, cv) {
+  cells_cl <- intersect(names(cv)[cv == cl_id], rownames(expr))
+  if (length(cells_cl) == 0 || nrow(net) == 0)
+    return(valid_tfs[1])
+  cl_mean <- colMeans(expr[cells_cl, , drop = FALSE])
+  scores   <- vapply(valid_tfs, function(tf) {
+    tgts <- intersect(net$target[net$tf == tf], names(cl_mean))
+    if (length(tgts) == 0L) return(0)
+    mean(cl_mean[tgts])
+  }, numeric(1L))
+  valid_tfs[which.max(scores)]
+}
+
+tf_c6 <- top_tf_by_target_expr("6", tf_network, expr_mat, clust_vec)
+tf_c8 <- top_tf_by_target_expr("8", tf_network, expr_mat, clust_vec)
+cat("Top TF cluster 6:", tf_c6, "\n")
+cat("Top TF cluster 8:", tf_c8, "\n")
+
+gn_c6 <- tf_c6
+gn_c8 <- tf_c8
+cur_tf <- tf_c6
+```
+
+```{r nbp-regulon-barplot-c6}
+#| fig-width: 10
+#| fig-height: 8
+RegulonBarPlot(srt, selected_tf = tf_c6, wgcna_name = "hsc_modules") +
+  ggplot2::labs(title = paste0(gn_c6, " predicted targets  [top TF — cluster 6]")) +
+  ggplot2::theme(axis.text = ggplot2::element_text(size = 8))
+```
+
+```{r nbp-regulon-barplot-c8}
+#| fig-width: 10
+#| fig-height: 8
+RegulonBarPlot(srt, selected_tf = tf_c8, wgcna_name = "hsc_modules") +
+  ggplot2::labs(title = paste0(gn_c8, " predicted targets  [top TF — cluster 8]")) +
+  ggplot2::theme(axis.text = ggplot2::element_text(size = 8))
+```
+
+### 14.7 — Regulon UMAP
+
+```{r nbp-regulon-umap}
+#| fig-width: 12
+#| fig-height: 8
+
+# pos_regulon_scores columns are motif IDs; look up the corresponding column
+motif_map_reg <- GetMotifs(srt) |> dplyr::select(motif_ID, gene_name) |> dplyr::distinct()
+get_reg_col <- function(gn, pos_scores, mmap) {
+  if (gn %in% colnames(pos_scores)) return(gn)
+  ids <- mmap$motif_ID[mmap$gene_name == gn]
+  hit <- intersect(ids, colnames(pos_scores))
+  if (length(hit)) hit[1] else colnames(pos_scores)[1]
+}
+col_c6 <- get_reg_col(gn_c6, pos_regulon_scores, motif_map_reg)
+col_c8 <- get_reg_col(gn_c8, pos_regulon_scores, motif_map_reg)
+
+srt$pos_regulon_score_c6 <- pos_regulon_scores[colnames(srt), col_c6]
+srt$pos_regulon_score_c8 <- pos_regulon_scores[colnames(srt), col_c8]
+
+p1 <- FeaturePlot(srt, feature = gn_c6) + umap_theme() +
+  ggplot2::ggtitle(paste(gn_c6, "expression (c6 top TF)"))
+p2 <- FeaturePlot(srt, feature = "pos_regulon_score_c6",
+                  cols = c("lightgrey", "red")) + umap_theme() +
+  ggplot2::ggtitle(paste(gn_c6, "regulon score"))
+p3 <- FeaturePlot(srt, feature = gn_c8) + umap_theme() +
+  ggplot2::ggtitle(paste(gn_c8, "expression (c8 top TF)"))
+p4 <- FeaturePlot(srt, feature = "pos_regulon_score_c8",
+                  cols = c("lightgrey", "red")) + umap_theme() +
+  ggplot2::ggtitle(paste(gn_c8, "regulon score"))
+(p1 | p2) / (p3 | p4)
+```
+
+### 14.8 — Module regulatory heatmap
+
+```{r nbp-regulon-module-heatmap}
+#| fig-width: 12
+#| fig-height: 6
+
+p1 <- ModuleRegulatoryHeatmap(srt, feature = "positive",
+                               high_color = "orange2",
+                               wgcna_name = "hsc_modules")
+p2 <- ModuleRegulatoryHeatmap(srt, feature = "negative",
+                               high_color = "dodgerblue",
+                               wgcna_name = "hsc_modules")
+p1 | p2
+```
+
+### 14.9 — TF regulon–trait correlation
+
+Pearson correlation between positive regulon scores and condition (one-hot
+encoded). `*` marks BH-adjusted q < 0.0005.
+
+```{r nbp-regulon-trait-correlation}
+#| fig-width: 8
+#| fig-height: 6
+
+cond_vec  <- label_condition(srt$sample.name)
+trait_mat <- model.matrix(~ 0 + factor(cond_vec))
+colnames(trait_mat) <- levels(factor(cond_vec))
+
+cor_res  <- WGCNA::corAndPvalue(pos_regulon_scores, trait_mat)
+r_mat    <- cor_res$cor
+p_mat    <- cor_res$p
+q_mat    <- matrix(p.adjust(p_mat, "BH"), nrow = nrow(p_mat),
+                   dimnames = dimnames(p_mat))
+sig_mat  <- ifelse(q_mat < 0.0005, "*", "")
+
+Heatmap(
+  r_mat,
+  name     = "Pearson r",
+  col      = colorRamp2(c(-1, 0, 1), c("#2166ac", "white", "#b2182b")),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (sig_mat[i, j] != "")
+      grid::grid.text(sig_mat[i, j], x, y, gp = grid::gpar(fontsize = 14, fontface = "bold"))
+  },
+  cluster_rows    = TRUE,
+  cluster_columns = TRUE,
+  row_names_gp    = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 9),
+  column_title    = "Condition",
+  row_title       = "TF regulon"
+)
+```
+
+### 14.10 — Regulon activity heatmap by cluster
+
+Mean positive-regulon score per cluster (z-scored within each TF), clustered
+with Ward.D2 on both rows and columns.
+
+```{r nbp-regulon-cluster-heatmap}
+#| fig-height: 16
+#| fig-width: 14
+
+shared_cells_reg <- intersect(rownames(pos_regulon_scores), colnames(srt))
+reg_mat  <- pos_regulon_scores[shared_cells_reg, , drop = FALSE]
+cl_vec   <- srt@meta.data[shared_cells_reg, CLUST_COL]
+
+agg      <- rowsum(reg_mat, cl_vec)
+cl_n     <- as.numeric(table(cl_vec)[rownames(agg)])
+agg_mean <- sweep(agg, 1, cl_n, "/")
+
+heat_reg <- t(scale(agg_mean))
+heat_reg <- heat_reg[complete.cases(heat_reg), ]
+
+hc_rows_reg <- hclust(dist(heat_reg),    method = "ward.D2")
+hc_cols_reg <- hclust(dist(t(heat_reg)), method = "ward.D2")
+
+cond_cells <- srt$condition[shared_cells_reg]
+prop_reg   <- prop.table(table(cl_vec, cond_cells), margin = 1)
+prop_reg   <- as.matrix(prop_reg)
+cond_ord   <- intersect(c("WT", "mCh-", "mCh+"), colnames(prop_reg))
+prop_reg   <- prop_reg[rownames(agg_mean), cond_ord, drop = FALSE]
+
+col_ann_reg <- HeatmapAnnotation(
+  `Condition mix` = anno_barplot(
+    prop_reg,
+    ylim       = c(0, 1), bar_width = 0.9,
+    gp         = gpar(fill = cond_pal[cond_ord], col = NA),
+    axis_param = list(side = "left", gp = gpar(fontsize = 7))
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp   = gpar(fontsize = 8)
+)
+
+draw(
+  Heatmap(
+    heat_reg,
+    name                 = "z-score\nmean score",
+    col                  = colorRamp2(c(-2.5, 0, 2.5), c("#2166ac", "white", "#b2182b")),
+    top_annotation       = col_ann_reg,
+    cluster_rows         = as.dendrogram(hc_rows_reg),
+    cluster_columns      = as.dendrogram(hc_cols_reg),
+    column_names_gp      = gpar(fontsize = 9),
+    row_names_gp         = gpar(fontsize = 8),
+    border               = FALSE,
+    column_title         = sprintf("%d clusters — positive regulon scores (non-blood promoters)", ncol(heat_reg)),
+    column_title_gp      = gpar(fontsize = 9),
+    heatmap_legend_param = list(direction = "vertical")
+  ),
+  heatmap_legend_side = "right", annotation_legend_side = "right"
+)
+```
+
+### 14.11 — Regulon-activity embedding UMAP
+
+```{r reg-umap-fn}
+build_regulon_umap <- function(srt, pos_scores, suffix, n_pcs = 30L, k = 20L) {
+  shared_cells <- intersect(rownames(pos_scores), colnames(srt))
+  mat_tfc <- Matrix::Matrix(
+    t(pos_scores[shared_cells, , drop = FALSE]), sparse = TRUE
+  )
+  assay_name <- paste0("RegScore_", suffix)
+  srt[[assay_name]] <- SeuratObject::CreateAssay5Object(data = mat_tfc)
+  DefaultAssay(srt)  <- assay_name
+  srt <- Seurat::ScaleData(srt,
+                            features  = rownames(srt[[assay_name]]),
+                            do.scale  = TRUE, do.center = TRUE,
+                            verbose   = FALSE)
+  n_pcs_use <- min(n_pcs, nrow(srt[[assay_name]]) - 1L)
+  pca_name  <- paste0("pca_reg_", suffix)
+  nn_name   <- paste0("nn_reg_", suffix)
+  umap_name <- paste0("umap_reg_", suffix)
+  srt <- Seurat::RunPCA(srt,
+                         features       = rownames(srt[[assay_name]]),
+                         npcs           = n_pcs_use,
+                         reduction.name = pca_name,
+                         reduction.key  = paste0(suffix, "PC_"),
+                         verbose        = FALSE)
+  srt <- Seurat::FindNeighbors(srt,
+                                dims            = seq_len(n_pcs_use),
+                                reduction       = pca_name,
+                                k.param         = k,
+                                compute.SNN     = TRUE,
+                                graph.name      = nn_name,
+                                return.neighbor = TRUE)
+  srt <- Seurat::RunUMAP(srt,
+                          n.neighbors    = k,
+                          nn.name        = nn_name,
+                          reduction.name = umap_name,
+                          reduction.key  = paste0(suffix, "UMAP_"),
+                          verbose        = FALSE)
+  DefaultAssay(srt) <- "SCT"
+  srt
+}
+```
+
+```{r reg-umap-nbp}
+#| fig-width: 14
+#| fig-height: 5
+
+srt <- build_regulon_umap(srt, pos_regulon_scores, suffix = "nbp")
+
+DimPlot(srt, group.by = CLUST_COL, reduction = "umap_reg_nbp",
+        label = TRUE) & NoLegend() |
+  DimPlot(srt, group.by = CLUST_COL, reduction = "umap.nn",
+          label = TRUE) & NoLegend()
+```
+
+```{r reg-umap-nbp-cond}
+#| fig-width: 14
+#| fig-height: 5
+
+DimPlot(srt, group.by = "condition", reduction = "umap_reg_nbp") +
+  scale_colour_manual(values = cond_pal, name = "Condition") |
+  DimPlot(srt, group.by = "condition", reduction = "umap.nn") +
+  scale_colour_manual(values = cond_pal, name = "Condition")
+```
+
+```{r reg-umap-nbp-split}
+#| fig-width: 18
+#| fig-height: 4
+
+DimPlot(srt, group.by = "condition", reduction = "umap_reg_nbp",
+        split.by = "sample.name") +
+  scale_colour_manual(values = cond_pal, name = "Condition")
+```
+
+---
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
+
+{{< include ../_session-info.qmd >}}

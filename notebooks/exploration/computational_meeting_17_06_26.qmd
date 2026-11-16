@@ -1,0 +1,455 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+pals <- list(
+  blue    = c("grey88", "#14B3FF", "#2E8BE0", "#2A5DB0", "#10316E"),
+  red     = c("grey88", "#FF6B6B", "#F03B3B", "#C81E1E", "#7A0C0C"),
+  heat    = c("grey88", "#FDB31A", "#FB6A4A", "#E42A2A", "#A31D1D", "#67000D"),
+  green   = c("grey88", "#4FD16B", "#22A53C", "#157A28", "#0A4715"),
+  orange  = c("grey88", "#FFA63D", "#FB7A1E", "#E25410", "#8C2D04"),
+  purple  = c("grey88", "#B26BFF", "#8A3FE0", "#6A24B0", "#3D106E"),
+  teal    = c("grey88", "#2EE0C0", "#14B8A6", "#0E8074", "#0A4A44"),
+  magenta = c("grey88", "#FF5CC8", "#E0289E", "#A8156E", "#5E0A3E")
+)
+expr_scale <- function(pal, floor = 0.03) {
+  scale_colour_gradientn(
+    colours  = pal,
+    values   = c(0, seq(floor, 1, length.out = length(pal) - 1)),
+    na.value = pal[1]
+  )
+}
+
+```
+
+```{r}
+marker_genes <- list(hsc=c("Slamf1", "Mecom", "Ly6a", "Cd34"),
+                     ery = c("Klf1","Itga4"),
+                     mk = c("Pf4"),
+                     bcell= c("Cd79a", "Cd19"),
+                     mono = c("Ccr2"),
+                     mast = c("Cpa3", "Fcer1a","Lyz2"),
+                     Basophiles = c("Prss34", "Mcpt8"),
+                     neut = c("Elane","Csf3r", "S100a8"))
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c("Pf4"),
+            reduction = "umap.nn",
+            pt.size = 0.1, 
+            order = F)&
+  theme_void()&
+  expr_scale(pal = pals$blue)&
+  theme(legend.text = element_text(size = 20),
+        legend.position = c(0.9,0.8),
+        title = element_text(size = 20))
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c("Pf4"),
+            reduction = "umap.nn",
+            pt.size = 0.1, 
+            order = F)&
+  theme_void()&
+  NoLegend()&
+  expr_scale(pal = pals$blue)
+```
+
+```{r}
+VlnPlot(mpn_processed_hsc_fullcc, 
+        features = "Pf4",
+        group.by = "sNN_pca.SCT_30_res.0.9",
+        split.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE,
+        slot = "data",
+        idents = c("4","8","6"))
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Csf3r", "Cd14", "Elane")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_colour_gradientn(colours = reds, na.value = "grey88")
+```
+
+```{r}
+
+plot_nhood_graph_da(milo_hsc_obj, milo_hsc_da$mChNeg_vs_WT$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+    labs(title = milo_hsc_da$mChNeg_vs_WT$model_contrast,
+         fill = "log2FC") +
+    ggplot2::scale_fill_gradient2(
+        low = "#2166AC",
+        mid          = "white",
+        high         = "#B2182B",
+        limits = c(-10, 10)
+        
+    )
+
+plot_nhood_graph_da(milo_hsc_obj, milo_hsc_da$mChPos_vs_WT$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+    labs(title = milo_hsc_da$mChPos_vs_WT$model_contrast,
+         fill = "log2FC") +
+    ggplot2::scale_fill_gradient2(
+        low = "#2166AC",
+        mid          = "white",
+        high         = "#B2182B",
+        limits = c(-10, 10)
+        
+    )
+
+
+```
+
+```{r}
+milo_tests_scores_df <- names(milo_hsc_cell_scores) %>%
+  lapply(function(x) {
+    new_name <- paste0("mean_lfc_", x)
+    milo_hsc_cell_scores[[x]] %>% dplyr::rename(!!sym(new_name) := "mean_lfc") }) %>%
+  purrr::reduce(inner_join) %>%
+  column_to_rownames("cell_id")
+
+
+srt_sub <- subset(mpn_processed_hsc_fullcc, n_nhoods >= 1 & sNN_pca.SCT_30_res.0.9 == "3")
+var_feats <- FindVariableFeatures_filt(srt_sub,
+                                         exclude_genes    = excluded_genes,
+                                         selection.method = "vst",
+                                         nfeatures        = 1000) |>
+    Seurat::VariableFeatures()
+ 
+srt_sub <- Seurat::SCTransform(srt_sub,
+                      assay             = "RNA",
+                      do.correct.umi    = FALSE,
+                      residual.features = var_feats)
+VlnPlot(srt_sub,
+        features = "mean_lfc_mChNeg_vs_WT",
+        group.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE)
+srt_sub <- Seurat::GroupCorrelation(srt_sub,
+                                    assay = "SCT",
+                                    slot = "scale.data",
+                                    var = "mean_lfc_mChNeg_vs_WT",
+                                    do.plot = FALSE)
+
+srt_sub[["SCT"]]@meta.features%>%
+  rownames_to_column("gene_symbol")%>%
+  filter(! gene_symbol %in% sex_degs,
+         !is.na(mean_lfc_mChNeg_vs_WT_cor))%>%
+  mutate(gene_symbol = ifelse(mean_lfc_mChNeg_vs_WT_cor>=0.3 | mean_lfc_mChNeg_vs_WT_cor< -0.2,
+                              gene_symbol,
+                              ""),
+         r = rank(mean_lfc_mChNeg_vs_WT_cor))%>%
+  ggplot(aes(r,
+             mean_lfc_mChNeg_vs_WT_cor,
+             label = gene_symbol))+
+  geom_point(pch = 21,
+             fill = "black", 
+             color = "white")+
+      geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+  ggrepel::geom_text_repel(min.segment.length = 0,
+                           segment.color = scales::alpha("black", 0.5))
+```
+
+```{r}
+srt_sub <- subset(mpn_processed_hsc_fullcc, n_nhoods >= 1 & sNN_pca.SCT_30_res.0.9 == "2")
+var_feats <- FindVariableFeatures_filt(srt_sub,
+                                         exclude_genes    = excluded_genes,
+                                         selection.method = "vst",
+                                         nfeatures        = 1000) |>
+    Seurat::VariableFeatures()
+ 
+srt_sub <- Seurat::SCTransform(srt_sub,
+                      assay             = "RNA",
+                      do.correct.umi    = FALSE,
+                      residual.features = var_feats)
+VlnPlot(srt_sub,
+        features = "mean_lfc_mChNeg_vs_WT",
+        group.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE)
+srt_sub <- Seurat::GroupCorrelation(srt_sub,
+                                    assay = "SCT",
+                                    slot = "scale.data",
+                                    var = "mean_lfc_mChNeg_vs_WT",
+                                    do.plot = FALSE)
+
+srt_sub[["SCT"]]@meta.features%>%
+  rownames_to_column("gene_symbol")%>%
+  filter(! gene_symbol %in% sex_degs,
+         !is.na(mean_lfc_mChNeg_vs_WT_cor))%>%
+  mutate(gene_symbol = ifelse(mean_lfc_mChNeg_vs_WT_cor>=0.3 | mean_lfc_mChNeg_vs_WT_cor< -0.2,
+                              gene_symbol,
+                              ""),
+         r = rank(mean_lfc_mChNeg_vs_WT_cor))%>%
+  ggplot(aes(r,
+             mean_lfc_mChNeg_vs_WT_cor,
+             label = gene_symbol))+
+  geom_point(pch = 21,
+             fill = "black", 
+             color = "white")+
+      geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+  ggrepel::geom_text_repel(min.segment.length = 0,
+                           segment.color = scales::alpha("black", 0.5))
+```
+
+```{r}
+cl <- "2"
+cat("##", cl, "\n\n")
+df_cl <- filter(volcano_df , cluster == cl)
+p <- ggplot(df_cl, aes(x = log_fc, y = neg_log_p)) +
+  geom_vline(xintercept = 0,                    colour = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = c(-logfc_allvsall, logfc_allvsall), colour = "grey50", linewidth = 0.3,
+             linetype = "dashed") +
+  geom_hline(yintercept = -log10(padj_allvsall),        colour = "grey50", linewidth = 0.3,
+             linetype = "dashed") +
+  geom_point(data = ~filter(.x, !sig),
+             aes(size = max_rate),
+             fill = "grey80", colour = "white", shape = 21, alpha = 0.5) +
+  geom_point(data = ~filter(.x, sig),
+             aes(fill = comparison, size = max_rate),
+             colour = "white", shape = 21, alpha = 0.5) +
+  ggrepel::geom_text_repel(
+    data         = ~top_n_volcano_sig(.x, n = 100),
+    aes(label    = feature, colour = comparison),
+    size         = 2.5, max.overlaps = 30, show.legend = FALSE,
+    segment.size = 0.3, segment.colour = "grey60"
+  ) +
+  ggrepel::geom_text_repel(
+    data         = ~top_n_volcano_notsig(.x, n = 100),
+    aes(label    = feature),
+    color = "grey60",
+    size         = 2.5, max.overlaps = 30, show.legend = FALSE,
+    segment.size = 0.3, segment.colour = "grey60"
+  ) +
+
+  scale_fill_manual(values   = comp_cols, name = "Comparison") +
+  scale_colour_manual(values = comp_cols, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = 0.05)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_size_continuous(name = "Max expression\nrate", range = c(0.3, 2)) +
+  facet_wrap(~comparison, ncol = 1) +
+  labs(x = "log FC", y = "-log\u2081\u2080 (padj)", title = paste("Cluster", cl),
+       caption = "Dashed: |log FC| = logfc_allvsall, padj = padj_allvsall  |  Labels: top 20 significant genes ranked by |log FC| + -log\u2081\u2080(padj)") +
+  theme_bw(base_size = 11) + theme(legend.position = "right")
+print(p)
+cat("\n\n")
+
+```
+
+```{r}
+targets::tar_load(delegate_res_cluster_rest_markers_hsc)
+delegate_res_cluster_rest_markers_hsc$sNN_pca.SCT_30_res.0.9 %>% View
+
+geno_degs <- df_cl %>%
+  filter(sig) %>%
+  pull(feature)%>%
+  unique()
+
+delegate_res_cluster_rest_markers_hsc$sNN_pca.SCT_30_res.0.9 %>%
+  filter(feature %in% geno_degs)
+```
+
+```{r}
+VlnPlot(srt_sub,
+        features = "Slc25a21",
+        group.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE)
+
+VlnPlot(srt_sub,
+        features = "Ms4a3",
+        group.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE)
+
+VlnPlot(srt_sub,
+        features = "Car1",
+        group.by = "sample.name",
+        alpha = 0.2,
+        sort = TRUE)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c("Pgr","Irf8", "Cd28") ,
+            slot = "data" ,
+            reduction = "umap.nn",
+            pt.size = 0.1, 
+            order = T,
+            split.by = "sample.name")&
+  viridis::scale_color_viridis(option = "turbo")
+
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = c("Pgr","Cd28","Irf8"),
+                      viridis_option = "turbo", 
+                      split.by = "sample.name",
+                      cell_order = "expression")
+
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = c("Ms4a3","Hmga2", "Hells"),
+                      viridis_option = "turbo", 
+                      split.by = "sample.name",
+                      cell_order = "expression")
+
+```
+
+```{r}
+srt_sub <- subset(mpn_processed_hsc_fullcc, n_nhoods >= 1 & sNN_pca.SCT_30_res.0.9 == "5")
+DimPlot(srt_sub,
+        split.by = "sample.name",
+        group.by =  "sNN_pca.SCT_30_res.1",
+        label = TRUE,
+        reduction = "umap.nn")
+
+subclust_50 <- c("0", "1", "7", "10", "17","16")
+
+table(srt_sub$sNN_pca.SCT_30_res.1,srt_sub$sample.name.long) %>%
+    as.matrix() %>%
+    as.data.frame() %>%
+    filter(Var1 %in% subclust_50)%>%
+    mutate(Var2 = str_extract(Var2,"mCh_negative|mCh_positive|WT"))%>%
+    ggplot(aes(Var2,Freq))+
+    geom_col()+
+    facet_wrap(.~Var1)+
+    coord_flip()+
+    scale_y_continuous(name = "number of cells")+
+    theme(axis.title.y = element_blank())
+
+x <- FindAllMarkers(srt_sub,group.by = "sNN_pca.SCT_30_res.1")
+Idents(srt_sub) <- "sNN_pca.SCT_30_res.1"
+x2 <- FindMarkers(srt_sub, "10", "7")
+x <- FindAllMarkers(srt_sub,group.by = "sample.name")
+
+
+```
+
+```{r}
+
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = c("Ccl3", "Ccl4"),
+                      viridis_option = "turbo", 
+                      split.by = "sample.name",cell_order = "expression")
+plot_umap_feature_ext(srt_sub,
+                      features = c("Il1r1", "Il18r1"),
+                      viridis_option = "turbo",
+                      split.by = "sample.name",
+                      cell_order = "expression")
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = c("Il1r1", "Il18r1"),
+                      viridis_option = "turbo",
+                      split.by = "sample.name",
+                      cell_order = "expression")
+
+plot_umap_feature_ext(srt_sub,
+                      features = c("Meis2"),
+                      viridis_option = "turbo", 
+                      split.by = "sample.name",
+                      cell_order = "expression")&
+  viridis::scale_color_viridis(option = "turbo",
+                               limits = c(0,2))
+
+plot_umap_feature_ext(srt_sub,
+                      features = c("Ncam2", "Rhbdl2", "Egr4"),
+                      viridis_option = "turbo",
+                      split.by = "sample.name",
+                      cell_order = "expression")
+
+
+plot_umap_feature_ext(mpn_processed_hsc_fullcc,
+                      features = c("Hbegf"),
+                      viridis_option = "turbo",
+                      split.by = "sample.name",
+                      cell_order = "expression")
+```
+
+```{r}
+srt_sub <- subset(mpn_processed_hsc_fullcc, n_nhoods >= 1 & sNN_pca.SCT_30_res.1.5 %in% c("21","2", "5"))
+
+srt_sub$sNN_pca.SCT_30_res.1.5 <-  factor(srt_sub$sNN_pca.SCT_30_res.1.5, levels = c( "5", "21","2"))
+
+```
+
+```{r}
+DimPlot(srt_sub,group.by =  "sNN_pca.SCT_30_res.1.5",label = TRUE,reduction = "umap.nn")
+table(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.0.9,
+      mpn_processed_hsc_fullcc$sample.name.long) %>%
+    as.matrix() %>%
+    as.data.frame() %>%
+    filter(Var1 %in% c("8", "6"))%>%
+    mutate(Var2 = str_extract(Var2,"mCh_negative|mCh_positive|WT"))%>%
+    ggplot(aes(Var2,Freq))+
+    geom_col()+
+    facet_wrap(.~Var1)+
+    coord_flip()+
+    scale_y_continuous(name = "number of cells")+
+    theme(axis.title.y = element_blank())
+
+table(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.1.5,
+      mpn_processed_hsc_fullcc$sample.name.long) %>%
+    as.matrix() %>%
+    as.data.frame() %>%
+    filter(Var1 %in% c("21","2", "5"))%>%
+    mutate(Var2 = str_extract(Var2,"mCh_negative|mCh_positive|WT"),
+           Var1 = factor(Var1, levels = c("2", "21", "5")%>%rev))%>%
+    ggplot(aes(Var2,Freq))+
+    geom_col()+
+    facet_wrap(.~Var1)+
+    coord_flip()+
+    scale_y_continuous(name = "number of cells")+
+    theme(axis.title.y = element_blank())
+
+```
+
+```{r}
+x <- FindAllMarkers(srt_sub,group.by = "sNN_pca.SCT_30_res.1.5")
+
+```
+
+```{r}
+DotPlot(srt_sub,
+        features = c("Meis2","Ly6a","Nfkb1","Nfkbie","Cx3cl1","Il18r1","Il1r1","Il1r2","Il4ra","Il2rg"),
+        group.by = "sNN_pca.SCT_30_res.1.5")+
+  coord_flip()
+
+DotPlot(srt_sub, 
+        features = c("Cavin2","Pf4", "Itga6","Itga2b","Myo1e","Mt2","Mt1","Col4a6","Col18a1","Col16a1","Ctnnal1", "Id1","Matn4"),
+        group.by = "sNN_pca.SCT_30_res.1.5")+
+  coord_flip()
+
+DotPlot(srt_sub, 
+        features = c("Gem", "Rec8"),
+        group.by = "sNN_pca.SCT_30_res.1.5")+
+  coord_flip()
+
+
+
+```
+
+```{r}
+Idents(srt_sub) <- "sNN_pca.SCT_30_res.1.5"
+x_5 <- FindMarkers(srt_sub, "5","21")%>%rownames_to_column("feature")
+x_21 <- FindMarkers(srt_sub, "2","21")%>%rownames_to_column("feature")
+
+inner_join(x_5, x_21, by = "feature")%>%
+  filter(pct.1.x>=0.1 |pct.1.y>=0.1) %>% 
+  ggplot(aes(avg_log2FC.x, avg_log2FC.y))+
+  geom_point()
+
+inner_join(x_5, x_21, by = "feature") %>%  
+  filter(pct.1.x>=0.1 |pct.1.y>=0.1) %>% 
+ filter(avg_log2FC.x < -1, avg_log2FC.y < -1) %>% View()
+
+FeaturePlot(srt_sub,c("Il1r1", "Irak2", "Antxr2", "Capn2") ,slot = "data" ,reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&viridis::scale_color_viridis(option = "turbo",)
+
+
+```
+
+g

@@ -1,0 +1,43 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+BiocManager::install("plyranges")
+library(plyranges)
+```
+
+```{r}
+std_chr <- paste0("chr",c(1:22,"X", "Y"))
+score_cutoff <- 200
+chipatlas_tf_beds <-list.files("data/chip_atalas/mm10/tfs_and_others/camelia_mpl",
+                               full.names = TRUE) 
+names(chipatlas_tf_beds) <- chipatlas_tf_beds %>% basename() %>% str_split_i("\\.",5)
+tf_ranges_lst <- lapply(chipatlas_tf_beds,
+                        function(bed_path){
+                          
+  cat((bed_path))
+  plyranges::read_bed(bed_path) %>%                        
+  mutate(id = str_extract(name, "ID=[A-Za-z0-9\\.]+") %>% str_remove_all("ID="),
+         tf = str_extract(name, "(?<=Name=)[^%]+") %>% str_remove_all("Name=")
+           ) %>%
+    filter(score > score_cutoff & seqnames %in% std_chr & !is.na(tf)) %>% #filter peaks based on score, chromosome, and 
+    group_by(tf) %>% #for each TF, merge overlapping peaks across studies
+    reduce_ranges(experiment = paste(id %>% sort %>% unique, collapse= ",")) %>%
+    ungroup()%>%
+    mutate(n_experiment = sapply(experiment,function(z) {str_count(z, ",")+1}))
+  })
+
+tf_peaks_lst <- tf_ranges_lst %>%
+    bind_ranges(.id = "source") %>%
+    group_by(tf) %>% 
+    reduce_ranges(source = paste(source %>% sort %>% unique, collapse= ",")) %>% 
+    split(.,.$tf)
+
+```
+
+```{r}
+# setwd("/home/rstudio")   # the old container's project root; notebooks now run from the project root
+```

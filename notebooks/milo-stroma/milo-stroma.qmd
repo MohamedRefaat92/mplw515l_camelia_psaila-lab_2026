@@ -1,0 +1,266 @@
+---
+title: "Milo — Differential Abundance (Stroma)"
+author:
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+# Introduction
+
+Milo tests differential abundance (DA) by fitting a negative-binomial GLM on cell counts within KNN neighbourhoods across conditions. Neighbourhoods enriched or depleted in Het stromal cells relative to WT are identified at a spatial FDR threshold, revealing which stromal cell states are altered by the *Mpl* mutation.
+
+Single contrast: `Het vs WT`.
+
+```{r setup}
+library(Seurat)
+library(miloR)
+library(SingleCellExperiment)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(DT)
+library(htmltools)
+library(dplyr)
+library(tidyr)
+library(targets)
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+------------------------------------------------------------------------
+
+# Data preview {#sec-data-preview}
+
+```{r preview-load}
+targets::tar_load(mpn_processed_stroma)
+# res 0.1 is what Milo uses for neighbourhood annotation (milo_cluster_col)
+clust_col_milo    <- grep("sNN_pca.*_res\\.0\\.1$",
+                          colnames(mpn_processed_stroma@meta.data), value = TRUE)[1]
+clust_col_preview <- grep("sNN_pca.*_res\\.0\\.9$",
+                          colnames(mpn_processed_stroma@meta.data), value = TRUE)[1]
+```
+
+```{r preview-umap-clusters, fig.height=6, fig.width=14}
+p_cl <- DimPlot(mpn_processed_stroma, group.by = clust_col_preview,
+                reduction = "umap.nn", label = TRUE, label.size = 7) +
+  NoLegend() + labs(title = "Stroma clusters (res 0.9)")
+
+p_cond <- DimPlot(mpn_processed_stroma, group.by = "sample.name",
+                  reduction = "umap.nn") +
+  labs(title = "Stroma — condition")
+
+p_cl | p_cond
+```
+
+```{r preview-umap-split, fig.height=6, fig.width=12}
+DimPlot(mpn_processed_stroma, group.by = clust_col_preview,
+        reduction = "umap.nn", split.by = "sample.name",
+        label = TRUE, label.size = 7) +
+  NoLegend() + labs(title = "Stroma clusters split by condition (res 0.9)")
+```
+
+Replicate structure: rows are HTO pseudo-replicates (`dm2_class`), columns are conditions (`sample.name`). This shows whether each pseudo-replicate within a condition covers the same cell-state landscape.
+
+```{r preview-umap-dm2-facet, fig.height=10, fig.width=15}
+umap_df <- cbind(
+  Embeddings(mpn_processed_stroma, "umap.nn"),
+  mpn_processed_stroma@meta.data[, c("dm2_class", "sample.name", clust_col_preview)]
+) |> as.data.frame()
+colnames(umap_df)[1:2] <- c("UMAP1", "UMAP2")
+umap_df$dm2_class   <- factor(umap_df$dm2_class)
+umap_df$sample.name <- factor(umap_df$sample.name)
+
+ggplot(umap_df, aes(UMAP1, UMAP2, colour = .data[[clust_col_preview]])) +
+  geom_point(size = 0.2, alpha = 0.4) +
+  facet_grid(dm2_class ~ sample.name) +
+  labs(x = NULL, y = NULL, colour = "Cluster") +
+  theme_bw(base_size = 11) +
+  theme(axis.text = element_blank(), axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        strip.text = element_text(size = 9)) +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1), nrow = 4))
+```
+
+```{r preview-cleanup}
+rm(mpn_processed_stroma); invisible(gc(verbose = FALSE))
+```
+
+------------------------------------------------------------------------
+
+# Milo differential abundance {#sec-milo-da}
+
+```{r stroma-milo-load}
+targets::tar_load(names = c(milo_stroma_da, milo_stroma_obj))
+```
+
+## Beeswarm — Het vs WT
+
+```{r stroma-milo-beeswarm, fig.height=7, fig.width=10}
+da        <- milo_stroma_da$Het_vs_WT$da_results
+clust_var <- milo_stroma_da$Het_vs_WT$cluster_col
+
+clust_order <- da %>%
+  dplyr::group_by(.data[[clust_var]]) %>%
+  dplyr::summarise(med_lfc = median(logFC, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(med_lfc) %>%
+  dplyr::pull(.data[[clust_var]])
+da[[clust_var]] <- factor(da[[clust_var]], levels = clust_order)
+
+plotDAbeeswarm(da, group.by = clust_var, alpha = 0.5) +
+  ggplot2::scale_color_gradient2(
+    low  = scales::muted("blue"),
+    mid  = "white",
+    high = scales::muted("red")) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(title = paste(milo_stroma_da$Het_vs_WT$model_contrast, "— beeswarm"),
+       x = "Cluster", y = "log2 FC") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Neighbourhood graph
+
+```{r stroma-nhood-graph, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_stroma_obj, milo_stroma_da$Het_vs_WT$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+  labs(title = milo_stroma_da$Het_vs_WT$model_contrast, fill = "log2FC") +
+  ggplot2::scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", limits = c(-10, 10))
+```
+
+## Volcano
+
+Per-neighbourhood volcano plot (logFC vs −log₁₀ spatial FDR).
+
+```{r stroma-milo-volcano, fig.height=5, fig.width=6}
+da_vol <- milo_stroma_da$Het_vs_WT$da_results %>%
+  dplyr::mutate(
+    sig  = SpatialFDR < 0.1,
+    dir  = dplyr::case_when(
+             sig & logFC > 0 ~ "Enriched in Het",
+             sig & logFC < 0 ~ "Depleted in Het",
+             TRUE            ~ "n.s."),
+    neg_log_fdr = -log10(SpatialFDR)
+  )
+
+ggplot(da_vol, aes(logFC, neg_log_fdr, colour = dir)) +
+  geom_point(size = 1.4, alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(
+    values = c("Enriched in Het" = "#B2182B",
+               "Depleted in Het" = "#2166AC",
+               "n.s."           = "grey70"),
+    name   = "") +
+  labs(x = "log2 FC (Het vs WT)",
+       y = expression(-log[10](spatial~FDR)),
+       title = "Stroma Milo — Het vs WT") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+```{r stroma-cleanup}
+rm(milo_stroma_da, milo_stroma_obj)
+invisible(gc(verbose = FALSE))
+```
+
+------------------------------------------------------------------------
+
+# Limitations
+
+**Pseudo-replicates only — no statistical power.** There is one WT tube and one Het tube for the stroma compartment; there are no true biological replicates per condition. To allow edgeR to fit the negative-binomial GLM at all, the HTO demultiplex tags (`dm2_class`) are used as pseudo-replicates within each tube. These are not biologically independent: all tags from the same tube come from the same animal and the same sort. As a result, edgeR estimates high within-condition dispersion and the spatial FDR never reaches significance, even where the UMAP shows clear density shifts between Het and WT.
+
+The beeswarm log-fold-change values are still informative directionally — clusters 5, 2, and 3 are consistently shifted positive (enriched in Het) — but they should be interpreted as effect-size estimates, not as tested hypotheses. Adding independent biological replicates would be required for any formal statistical comparison in stroma.
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+Milo identified stromal neighbourhoods significantly enriched or depleted in Het cells relative to WT. The neighbourhood graph and DA group plots highlight the spatial organisation of differential abundance across the stromal compartment.
+
+------------------------------------------------------------------------
+
+# Extra
+
+## Neighbourhood grouping {#sec-nhood-groups}
+
+```{r stroma-nhood-groups-load}
+targets::tar_load(names = c(milo_stroma_da, milo_stroma_obj))
+```
+
+```{r stroma-nhood-groups}
+da_groups <- miloR::groupNhoods(milo_stroma_obj,
+                                milo_stroma_da$Het_vs_WT$da_results,
+                                compute.new = FALSE,
+                                da.fdr = 0.1)
+```
+
+```{r stroma-nhood-groups-graph, fig.height=5, fig.width=8}
+plot_nhood_graph_groups(milo_stroma_obj, da_groups,
+                        colour_by = "NhoodGroup", layout = "umap.nn") +
+  ggtitle("Stroma DA groups — Het vs WT")
+```
+
+```{r stroma-nhood-groups-umap, fig.height=5, fig.width=6}
+targets::tar_load(mpn_processed_stroma)
+
+nhood_mat   <- miloR::nhoods(milo_stroma_obj)
+grp_vec     <- setNames(da_groups$NhoodGroup, as.character(da_groups$Nhood))
+grp_aligned <- as.numeric(grp_vec[as.character(seq_len(ncol(nhood_mat)))])
+grp_mat     <- model.matrix(~ factor(grp_aligned) - 1)
+colnames(grp_mat) <- levels(factor(grp_aligned))
+cell_grp_mat <- nhood_mat %*% grp_mat
+cell_grp_vec <- apply(cell_grp_mat, 1, which.max)
+
+mpn_processed_stroma$milo_ngb_grps <- cell_grp_vec
+DimPlot(mpn_processed_stroma, group.by = "milo_ngb_grps",
+        label = TRUE, reduction = "umap.nn") &
+  NoLegend() &
+  labs(title = "Het vs WT DA groups on cell UMAP")
+```
+
+```{r stroma-extra-cleanup}
+rm(milo_stroma_da, milo_stroma_obj, mpn_processed_stroma, da_groups)
+invisible(gc(verbose = FALSE))
+```
+
+{{< include ../_session-info.qmd >}}

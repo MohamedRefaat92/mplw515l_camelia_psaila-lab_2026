@@ -1,0 +1,336 @@
+---
+title: "HSC — per-condition embeddings"
+author:
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+Each HSC condition (WT, Het mCh−, Het mCh+) was processed independently with SCTransform → PCA → SNN → UMAP using the same parameters as the combined object. Cluster labels from the combined object at resolution 0.9 are transferred to each condition-specific embedding by cell barcode matching, enabling direct comparison of cluster identity across conditions.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(targets)
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+---
+
+# Introduction
+
+Processing cells from different opposing conditions together has the potential of introducing artifacts to the resulting cell space. So far, we have been looking at the complete set HSCs with cells from mutant and wild-type mice inhabiting the same cell space, which made it easier to draw direct comparisons between them. Moreover, the cells from different conditions were merely combined rather than integrated, which further reduces the risk of forcing cells into sub-optimal parts of the cell space. Nevertheless, having a look at the separate cell space of each condition could make it easier to explore and reveal the role of the condition, or lack of it, isolated from 
+influence of other cells.
+
+This notebook explores the cell embedding per each condition. New clusters are defined per condition. To facilitate the comparison to the combined state, we label the clusters of each condition with the cluster definition from the combined set. Additionally, I labelled the cell embedding by top PCs to identify the largest sources of separation per each set. Finally, I calculate the distortion of cell states by comparing the neighboring cells in the combined states and the separate states.
+
+# Combined reference {#sec-reference}
+
+UMAP of the full combined HSC object: cluster labels (res 0.9) and per-condition split.
+
+```{r load-combined}
+targets::tar_load(mpn_processed_hsc_fullcc)
+clust_col <- grep("sNN_pca.*_res\\.0\\.9$",
+                  colnames(mpn_processed_hsc_fullcc@meta.data), value = TRUE)[1]
+```
+
+```{r ref-umap-clusters, fig.height=6, fig.width=14}
+p_clust <- DimPlot(mpn_processed_hsc_fullcc, group.by = clust_col, reduction = "umap.nn",
+                   label = TRUE, label.size = 7) +
+  NoLegend() + labs(title = "Combined HSC — clusters (res 0.9)")
+
+p_phase <- DimPlot(mpn_processed_hsc_fullcc, group.by = "Phase", reduction = "umap.nn") +
+  labs(title = "Combined HSC — cell cycle phase")
+
+p_clust | p_phase
+```
+
+```{r ref-umap-split, fig.height=6, fig.width=18}
+DimPlot(mpn_processed_hsc_fullcc, group.by = clust_col, reduction = "umap.nn",
+        split.by = "sample.name", label = TRUE, label.size = 7) +
+  NoLegend() +
+  labs(title = "Combined HSC — clusters split by condition")
+```
+
+Top principal components projected onto the combined UMAP embedding. Diverging colour scale centred on zero (blue = negative, red = positive).
+
+```{r ref-pca-features, fig.height=10, fig.width=18}
+n_pcs    <- 6
+pca_red  <- grep("^pca", Reductions(mpn_processed_hsc_fullcc), value = TRUE)[1]
+pca_cols <- paste0("PC_", 1:n_pcs)
+pca_emb  <- as.data.frame(Embeddings(mpn_processed_hsc_fullcc, pca_red)[, pca_cols])
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc, pca_emb)
+
+plots <- FeaturePlot(mpn_processed_hsc_fullcc, features = pca_cols,
+                     reduction = "umap.nn", combine = FALSE)
+plots <- lapply(plots, function(p)
+  p + scale_color_gradient2(low = "#2166AC", mid = "grey92", high = "#B2182B",
+                            midpoint = 0, name = "PC score") +
+      theme(legend.key.height = unit(0.4, "cm")))
+patchwork::wrap_plots(plots, ncol = 3)
+```
+
+```{r extract-labels}
+label_df <- mpn_processed_hsc_fullcc@meta.data[, clust_col, drop = FALSE]
+colnames(label_df) <- "combined_cluster"
+rm(mpn_processed_hsc_fullcc); invisible(gc(verbose = FALSE))
+```
+
+```{r load-conditions}
+targets::tar_load(c(mpn_processed_hsc_wt_fullcc,
+                    mpn_processed_hsc_mchneg_fullcc,
+                    mpn_processed_hsc_mchpos_fullcc))
+
+cond_list <- list(
+  "WT"   = mpn_processed_hsc_wt_fullcc,
+  "mCh⁻" = mpn_processed_hsc_mchneg_fullcc,
+  "mCh⁺" = mpn_processed_hsc_mchpos_fullcc
+)
+rm(mpn_processed_hsc_wt_fullcc, mpn_processed_hsc_mchneg_fullcc,
+   mpn_processed_hsc_mchpos_fullcc); invisible(gc(verbose = FALSE))
+```
+
+```{r transfer-labels}
+cond_list <- lapply(cond_list, function(srt) {
+  shared <- intersect(colnames(srt), rownames(label_df))
+  srt    <- AddMetaData(srt, label_df[shared, , drop = FALSE])
+  srt$combined_cluster <- factor(srt$combined_cluster)
+  srt
+})
+```
+
+---
+
+# UMAP {#sec-umap}
+
+Left: cluster labels transferred from the combined object (res 0.9). Right: clusters from the condition-specific embedding (res 0.9).
+
+::: {.panel-tabset}
+
+```{r umap-tabs, results="asis", fig.height=5, fig.width=19}
+for (nm in names(cond_list)) {
+  cat("##", nm, "\n\n")
+  srt      <- cond_list[[nm]]
+  umap_red <- grep("^umap", Reductions(srt), value = TRUE)[1]
+  own_col  <- grep("sNN_pca.*_res\\.0\\.9$", colnames(srt@meta.data), value = TRUE)[1]
+
+  p1 <- DimPlot(srt, group.by = "combined_cluster", reduction = umap_red,
+                label = TRUE, label.size = 7) +
+    NoLegend() + labs(title = paste(nm, "— combined clusters (res 0.9)"))
+
+  p2 <- DimPlot(srt, group.by = own_col, reduction = umap_red,
+                label = TRUE, label.size = 7) +
+    NoLegend() + labs(title = paste(nm, "— condition-specific clusters (res 0.9)"))
+
+  p3 <- DimPlot(srt, group.by = "Phase", reduction = umap_red) +
+    labs(title = paste(nm, "— cell cycle phase"))
+
+  print(p1 | p2 | p3)
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+# PCA {#sec-pca}
+
+PC1–PC2 and PC1–PC3 coloured by combined cluster labels.
+
+::: {.panel-tabset}
+
+```{r pca-tabs, results="asis", fig.height=5, fig.width=19}
+for (nm in names(cond_list)) {
+  cat("##", nm, "\n\n")
+  srt     <- cond_list[[nm]]
+  pca_red <- grep("^pca", Reductions(srt), value = TRUE)[1]
+
+  p1 <- DimPlot(srt, group.by = "combined_cluster", reduction = pca_red,
+                dims = c(1, 2), label = TRUE, label.size = 7) +
+    NoLegend() + labs(title = paste(nm, "— PC1 vs PC2"))
+
+  p2 <- DimPlot(srt, group.by = "combined_cluster", reduction = pca_red,
+                dims = c(1, 3), label = TRUE, label.size = 7) +
+    NoLegend() + labs(title = paste(nm, "— PC1 vs PC3"))
+
+  p3 <- DimPlot(srt, group.by = "Phase", reduction = pca_red,
+                dims = c(1, 2)) +
+    labs(title = paste(nm, "— cell cycle phase (PC1 vs PC2)"))
+
+  print(p1 | p2 | p3)
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+# PC scores on UMAP {#sec-pc-umap}
+
+Top 6 principal components from each condition-specific PCA projected onto the condition-specific UMAP. Diverging colour scale centred on zero (blue = negative, red = positive).
+
+::: {.panel-tabset}
+
+```{r pc-umap-tabs, results="asis", fig.height=10, fig.width=18}
+n_pcs <- 6
+for (nm in names(cond_list)) {
+  cat("##", nm, "\n\n")
+  srt      <- cond_list[[nm]]
+  umap_red <- grep("^umap", Reductions(srt), value = TRUE)[1]
+  pca_red  <- grep("^pca",  Reductions(srt), value = TRUE)[1]
+
+  pca_cols <- paste0("PC_", 1:n_pcs)
+  pca_emb  <- as.data.frame(Embeddings(srt, pca_red)[, pca_cols])
+  srt      <- AddMetaData(srt, pca_emb)
+
+  plots <- FeaturePlot(srt, features = pca_cols,
+                       reduction = umap_red, combine = FALSE)
+  plots <- lapply(plots, function(p)
+    p + scale_color_gradient2(low = "#2166AC", mid = "grey92", high = "#B2182B",
+                              midpoint = 0, name = "PC score") +
+        theme(legend.key.height = unit(0.4, "cm")))
+  print(patchwork::wrap_plots(plots, ncol = 3))
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+# Cell distortion {#sec-distortion}
+
+Distortion is measured how the preservation of condition-specific neighbors in the combined embedding. Values close to 1 mean the local neighbourhood is faithfully reproduced by the joint PCA; low values flag cells whose relative distances are distorted by pooling all conditions together. `distortion = 1 − neighbour_preservation`.
+
+The violin plot shows that the mCh+ cells suffer from a higher, although slight, distortion compared to other conditions.
+
+```{r distortion-helpers}
+neighbor_overlap <- function(emb_a, emb_b, k = 30) {
+  stopifnot(identical(rownames(emb_a), rownames(emb_b)))
+  idx <- function(e) Indices(FindNeighbors(e, k.param = k + 1, return.neighbor = TRUE,
+                                           compute.SNN = FALSE, verbose = FALSE))[, -1]
+  na <- idx(emb_a); nb <- idx(emb_b)
+  vapply(seq_len(nrow(emb_a)),
+         function(i) length(intersect(na[i, ], nb[i, ])) / k, numeric(1)) |>
+    setNames(rownames(emb_a))
+}
+
+distortion_scores <- function(obj_int, obj_sep, cond_col = "condition",
+                              red_int = "pca", red_sep = "pca", dims = 1:30, k = 30) {
+  cond        <- obj_int[[cond_col, drop = TRUE]]
+  emb_int_all <- Embeddings(obj_int, red_int)[, dims]
+  scores <- lapply(names(obj_sep), function(cn) {
+    cells   <- intersect(colnames(obj_sep[[cn]]), colnames(obj_int)[cond == cn])
+    emb_int <- emb_int_all[cells, , drop = FALSE]
+    emb_sep <- Embeddings(obj_sep[[cn]], red_sep)[cells, dims, drop = FALSE]
+    neighbor_overlap(emb_sep, emb_int, k = k)
+  })
+  unlist(scores)
+}
+```
+
+```{r distortion-compute}
+targets::tar_load(mpn_processed_hsc_fullcc)
+
+# Name list by actual sample.name values so distortion_scores can match on cond_col
+cond_lst <- setNames(
+  cond_list,
+  sapply(cond_list, function(srt) unique(as.character(srt$sample.name))[1])
+)
+
+pca_red <- grep("^pca", Reductions(mpn_processed_hsc_fullcc), value = TRUE)[1]
+
+ov <- distortion_scores(
+  mpn_processed_hsc_fullcc, cond_lst,
+  cond_col = "sample.name",
+  red_int  = pca_red,
+  red_sep  = pca_red
+)
+
+mpn_processed_hsc_fullcc$nbr_preservation <- ov[colnames(mpn_processed_hsc_fullcc)]
+mpn_processed_hsc_fullcc$distortion       <- 1 - mpn_processed_hsc_fullcc$nbr_preservation
+```
+
+```{r distortion-umap, fig.height=5, fig.width=18}
+FeaturePlot(mpn_processed_hsc_fullcc, "distortion",
+            split.by = "sample.name", reduction = "umap.nn") &
+  scale_color_viridis_c(option = "turbo", limits = c(0, 0.7)) &
+  RestoreLegend()
+```
+
+```{r distortion-vln, fig.height=5, fig.width=8}
+VlnPlot(mpn_processed_hsc_fullcc,
+        features = "distortion",
+        group.by = "sample.name",
+        sort  = TRUE,
+        pt.size = 0.1,
+        alpha   = 0.1) +
+  stat_summary(fun = median, fun.min = median, fun.max = median,
+               geom = "crossbar", width = 0.45, linewidth = 0.8, colour = "black") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r distortion-cleanup}
+rm(mpn_processed_hsc_fullcc, cond_lst, ov); invisible(gc(verbose = FALSE))
+```
+
+```{r cleanup}
+rm(cond_list, label_df); invisible(gc(verbose = FALSE))
+```
+
+# Limitations
+
+-   The PC scores are not directly comparable between conditions, but the pattern can still help reveals the largest sources of variation.
+
+-   Cluster labels transferred from the combined object are based on a single resolution (0.9) and may not capture fine-grained structure visible in condition-specific embeddings at other resolutions.
+
+-   The distortion score measures KNN preservation between the condition-specific and combined PCA spaces; it does not distinguish whether distortion is driven by biological or technical artifacts.
+
+# Conclusion
+
+Per-condition re-embedding with transferred cluster labels allows visual inspection of whether cluster boundaries and relative positions are preserved when each condition is processed independently. Visually speaking, separate embedding of mCh+ shows a large deviation from the combined embedding. Finally, the relatively low distortion of mCh- cells indicates that it's an intermediate state between the two other pure states.
+
+{{< include ../_session-info.qmd >}}

@@ -1,0 +1,713 @@
+---
+title: "Fibrosis & Myelofibrotic Signatures — mCh+ and mCh- vs WT"
+format:
+  html:
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(UCell)
+library(ggnewscale)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(pheatmap)
+library(viridis)
+library(msigdbr)
+library(fgsea)
+library(DT)
+library(htmltools)
+library(ComplexHeatmap)
+library(circlize)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+
+theme_set(theme_cowplot(font_size = 11))
+
+cond_pal   <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+cond_order <- c("WT", "mCh-", "mCh+")
+
+label_condition <- function(x) {
+  dplyr::case_when(
+    grepl("WT",      x) ~ "WT",
+    grepl("mCh-",   x) ~ "mCh-",
+    grepl("mCh\\+", x) ~ "mCh+",
+    TRUE                ~ x
+  )
+}
+```
+
+# Overview
+
+Tests whether *Het mCh+* and *Het mCh−* HSC show elevated fibrotic /
+myelofibrotic transcriptional programmes compared to WT, within each cluster.
+
+**Approach:**
+
+1. **Signatures** — in-house (DE-derived) + public MSigDB fibrosis / ECM / TGF-β genesets
+2. **UCell scores** — rank-based per-cell scoring via `extract_ucell_scores()` (no background bias)
+3. **Pairwise testing** — Wilcoxon test per geneset × cluster × comparison
+   (WT vs mCh−, WT vs mCh+, mCh− vs mCh+); BH correction across all tests
+4. **Violin plots** — genesets significant in ≥ 1 cluster × comparison (padj < 0.05)
+5. **ORA** — over-representation of fibrosis genesets in per-cluster upregulated genes
+
+---
+
+# 1  Signature definition
+
+## In-house signature
+
+Genes upregulated in Het (mCh+ or mCh−) vs WT (padj ≤ 0.05, log FC ≥ 0.25)
+filtered for fibrosis / ECM / TGF-β / myofibroblast annotations.
+
+```{r inhouse-sig}
+fibrosis_patterns <- c(
+  # Collagens and ECM structural components
+  "^Col[0-9]", "^Lam[ab]", "Fn1", "Vtn", "Eln", "Postn", "Matn[0-9]",
+  # Matrix metalloproteinases and inhibitors
+  "^Mmp", "^Timp", "^Adam[st]",
+  # TGF-β / BMP pathway
+  "^Tgfb[0-9]", "^Tgfbr", "^Smad[2-7]", "^Ltbp", "Bmp[0-9]", "Bmpr",
+  "Acvr", "Inhba",
+  # Myofibroblast / EMT markers
+  "Acta2", "Tagln", "Vim", "Des", "Cdh2", "Snai[12]", "Twist[12]", "Zeb[12]",
+  # Connective tissue growth factors and matricellular proteins
+  "Ctgf", "Ccn[0-9]", "Thbs[0-9]", "Spp1", "Sparc", "Tnc",
+  # Lysyl oxidases (ECM crosslinking)
+  "^Lox$", "^Loxl",
+  # PDGF signalling
+  "^Pdgf[abcd]$", "^Pdgfr",
+  # Fibrinolysis / coagulation
+  "Serpine1", "Plau", "Plat", "F13a1",
+  # Integrins associated with fibrosis
+  "Itga[5v]", "Itgb[135]",
+  # JAK-STAT / inflammatory mediators linked to myelofibrosis
+  "Jak2", "Stat3", "Stat5[ab]", "Il6", "Il13", "Tnf", "Ifng",
+  # Megakaryocyte / platelet factors driving BM fibrosis
+  "Pf4", "Thpo", "Tgfb1", "Pdgfb", "Vwf"
+)
+fibrosis_regex <- paste(fibrosis_patterns, collapse = "|")
+
+de_hsc <- targets::tar_read(delegate_allvsall_markers_hsc)
+inhouse_fibrosis <- de_hsc |>
+  dplyr::filter(padj <= 0.05, log_fc >= 0.25,
+                grepl("mCh", group1), grepl("WT", group2)) |>
+  dplyr::pull(feature) |>
+  unique() |>
+  (\(x) x[grepl(fibrosis_regex, x, ignore.case = TRUE)])()
+
+rm(de_hsc); gc()
+
+cat("In-house fibrosis signature:", length(inhouse_fibrosis), "genes\n")
+```
+
+```{r inhouse-table}
+DT::datatable(data.frame(gene = sort(inhouse_fibrosis)), rownames = FALSE,
+              caption = "In-house fibrosis / ECM genes (Het vs WT, HSC)")
+```
+
+## Public signatures
+
+```{r public-sigs}
+srt_hsc    <- targets::tar_read(mpn_processed_hsc_fullcc)
+fibrosis_pattern <- paste(c(
+  "FIBROSIS", "PROFIBROTIC", "COLLAGEN", "EXTRACELLULAR_MATRIX", "\\bECM\\b",
+  "TGF_BETA", "TRANSFORMING_GROWTH_FACTOR",
+  "EPITHELIAL_MESENCHYMAL", "\\bEMT\\b",
+  "PDGF", "WOUND_HEALING", "COAGULATION",
+  "MYOFIBROBLAST", "MYELOID_FIBROSIS",
+  "MEGAKARYOCYTE_MORPHOLOGY",
+  "JAK_STAT", "INFLAMMATORY_RESPONSE",
+  "CYTOSKELETON","CELL_MIGRATION", "CELL_CELL_ADHESION"
+), collapse = "|")
+
+clean_names <- function(x) {
+  x |>
+    gsub("HALLMARK_|REACTOME_|GOBP_|GOCC_|GOMF_|WP_|KEGG_", "", x = _) |>
+    tolower() |> gsub("_", " ", x = _) |>
+    tools::toTitleCase() |> substr(1, 50)
+}
+
+sig_tbl <- purrr::map_dfr(
+  c("H", "C2", "C5"),
+  ~ msigdbr::msigdbr(species = "Mus musculus", category = .x) |>
+      dplyr::select(gs_name, gs_collection = gs_cat, gene_symbol)
+) |>
+  dplyr::filter(gene_symbol %in% rownames(srt_hsc)) |>
+  dplyr::filter(grepl(fibrosis_pattern, gs_name, ignore.case = TRUE)) |>
+  dplyr::group_by(gs_name, gs_collection) |>
+  dplyr::summarise(genes = list(unique(gene_symbol)), .groups = "drop") |>
+  dplyr::filter(lengths(genes) >= 15, lengths(genes) <= 500) |>
+  dplyr::arrange(gs_collection, gs_name) |>
+  dplyr::mutate(label = clean_names(gs_name)) |>
+  dplyr::distinct(label, .keep_all = TRUE)
+
+public_sigs <- setNames(sig_tbl$genes, sig_tbl$label)
+all_sigs    <- c(list(`In-house fibrosis` = inhouse_fibrosis), public_sigs)
+
+cat("Total signatures:", length(all_sigs), "\n")
+purrr::iwalk(all_sigs, ~ cat(" ", .y, ":", length(.x), "genes\n"))
+```
+
+```{r sig-table}
+purrr::imap_dfr(all_sigs, ~ data.frame(signature = .y, gene = .x)) |>
+  DT::datatable(rownames = FALSE, filter = "top",
+                caption  = "All fibrosis / myelofibrosis signatures",
+                options  = list(pageLength = 15, scrollY = "350px"))
+```
+
+---
+
+# 2  UCell scores — HSC
+
+```{r ucell-scores}
+hsc_cl_col <- grep("sNN.*res\\.0\\.9$", colnames(srt_hsc@meta.data), value = TRUE)[1]
+
+# Rank-based per-cell UCell scoring via utilities wrapper
+ucell_df <- extract_ucell_scores(
+  srt       = srt_hsc,
+  genesets  = all_sigs,
+  assay     = "SCT",
+  layer     = "data",
+  umap_name = "umap.nn"
+)
+
+# Add cluster column
+ucell_df$cluster <- as.character(srt_hsc@meta.data[[hsc_cl_col]])
+
+rm(srt_hsc); gc()
+
+# Build long data.frame: cell × geneset × score + metadata
+scores_df <- ucell_df |>
+  dplyr::mutate(condition = label_condition(sample.name)) |>
+  tidyr::pivot_longer(
+    cols      = dplyr::all_of(names(all_sigs)),
+    names_to  = "geneset",
+    values_to = "score"
+  )
+
+cat("Scored", dplyr::n_distinct(scores_df$cell_id), "cells ×",
+    dplyr::n_distinct(scores_df$geneset), "genesets\n")
+cat("Clusters:", paste(sort(unique(scores_df$cluster)), collapse = ", "), "\n")
+cat("Conditions:", paste(sort(unique(scores_df$condition)), collapse = ", "), "\n")
+```
+
+### UMAP — UCell scores per signature
+
+```{r ucell-umap}
+#| eval: false
+#| fig.width: 14
+#| fig.height: !expr ceiling(length(all_sigs) / 3) * 4
+plots_umap <- lapply(names(all_sigs), function(gs) {
+  df <- ucell_df |>
+    dplyr::rename(umap1 = UMAP1, umap2 = UMAP2) |>
+    dplyr::mutate(score = .data[[gs]])
+  ggplot(df |> dplyr::arrange(score),
+         aes(umap1, umap2, colour = score)) +
+    geom_point(size = 0.3, alpha = 0.7) +
+    scale_colour_viridis_c(option = "plasma", name = "UCell") +
+    labs(title = gs) +
+    theme_void() +
+    theme(plot.title      = element_text(size = 8, face = "bold"),
+          legend.key.height = unit(0.35, "cm"),
+          legend.text       = element_text(size = 7))
+})
+
+patchwork::wrap_plots(plots_umap, ncol = 3) +
+  patchwork::plot_annotation(
+    title = "UCell scores — fibrosis / myelofibrosis signatures",
+    theme = theme(plot.title = element_text(face = "bold", size = 12)))
+```
+
+---
+
+# 3  Median score heatmap
+
+Median UCell score per geneset × cluster × condition.
+Gives an absolute view of signature activity (independent of pairwise testing).
+
+```{r med-mat-build}
+med_df <- scores_df |>
+  dplyr::group_by(geneset, cluster, condition) |>
+  dplyr::summarise(med_score = median(score, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(
+    condition = factor(condition, levels = cond_order),
+    col_key   = paste0(cluster, " | ", condition)
+  )
+
+med_mat_full <- med_df |>
+  dplyr::select(geneset, col_key, med_score) |>
+  tidyr::pivot_wider(names_from = col_key, values_from = med_score,
+                     values_fill = NA_real_) |>
+  tibble::column_to_rownames("geneset") |>
+  as.matrix()
+
+# Drop columns: missing median (no cells) OR fewer than 50 cells in that
+# cluster × condition combination
+n_cells_full <- scores_df |>
+  dplyr::distinct(cell_id, cluster, condition) |>
+  dplyr::count(cluster, condition, name = "n_cells") |>
+  dplyr::mutate(col_key = paste0(cluster, " | ", condition))
+
+keep_cols <- colSums(is.na(med_mat_full)) == 0 &
+  (n_cells_full$n_cells[match(colnames(med_mat_full), n_cells_full$col_key)] >= 100)
+med_mat_full <- med_mat_full[, keep_cols, drop = FALSE]
+
+# Compute variance and size per geneset
+row_var_df <- tibble::tibble(
+  geneset  = rownames(med_mat_full),
+  variance = apply(med_mat_full, 1, var, na.rm = TRUE),
+  size     = lengths(all_sigs)[rownames(med_mat_full)]
+) |>
+  dplyr::arrange(dplyr::desc(variance)) |>
+  dplyr::mutate(rank = dplyr::row_number())
+```
+
+```{r variance-rank-plot, fig.height=4, fig.width=13}
+N_LABEL <- 15 # number of top genesets to annotate by variance
+
+repel_args <- list(
+  size               = 2.6,
+  max.overlaps       = Inf,
+  box.padding        = 0.6,
+  point.padding      = 0.3,
+  force              = 5,
+  force_pull         = 0.3,
+  min.segment.length = 0,        # always draw segment
+  segment.size       = 0.25,
+  segment.color      = "grey55",
+  segment.curvature  = 0,        # straight lines
+  segment.linetype   = 1,
+  colour             = "grey15",
+  seed               = 42,
+  xlim               = c(NA, NA),
+  ylim               = c(NA, NA)
+)
+
+repel_layer <- function(data, direction, nudge_y) {
+  do.call(ggrepel::geom_text_repel, c(
+    list(data    = data,
+         mapping = aes(label = geneset),
+         direction = direction,
+         nudge_y   = nudge_y),
+    repel_args
+  ))
+}
+
+top_df   <- dplyr::slice_head(row_var_df, n = N_LABEL)
+nudge_y  <- max(row_var_df$variance) * 0.05
+
+p_rank <- ggplot(row_var_df, aes(rank, variance)) +
+  geom_point(aes(colour = size), size = 2, alpha = 0.7) +
+  repel_layer(top_df, direction = "y", nudge_y = nudge_y) +
+  scale_colour_viridis_c(option = "viridis", name = "Geneset\nsize") +
+  labs(
+    x     = "Rank (by variance)",
+    y     = "Variance of median UCell score",
+    title = "Geneset informativeness — ranked by variance"
+  ) +
+  theme(plot.title = element_text(size = 10, face = "bold"))
+
+p_scatter <- ggplot(row_var_df, aes(size, variance)) +
+  geom_point(aes(colour = size), size = 2, alpha = 0.7) +
+  repel_layer(top_df, direction = "both", nudge_y = nudge_y) +
+  scale_colour_viridis_c(option = "viridis", name = "Geneset\nsize") +
+  labs(
+    x     = "Geneset size (n genes)",
+    y     = "Variance of median UCell score",
+    title = "Variance vs geneset size"
+  ) +
+  theme(plot.title = element_text(size = 10, face = "bold"))
+
+p_rank + p_scatter + patchwork::plot_layout(guides = "collect")
+```
+
+```{r median-score-heatmap, fig.height=8, fig.width=14}
+# Keep only non-zero-variance genesets for the heatmap
+med_mat <- med_mat_full[row_var_df$geneset[row_var_df$variance >= 1e-6], , drop = FALSE]
+
+# Row z-score scaling — no NAs remain so cor() is clean
+med_mat_z <- t(scale(t(med_mat)))
+
+# Column metadata
+col_meta <- med_df |>
+  dplyr::distinct(col_key, cluster, condition) |>
+  dplyr::arrange(match(col_key, colnames(med_mat_z)))
+
+med_cl_vals   <- col_meta$cluster[match(colnames(med_mat_z), col_meta$col_key)]
+med_cond_vals <- as.character(
+  col_meta$condition[match(colnames(med_mat_z), col_meta$col_key)]
+)
+med_n_col <- ncol(med_mat_z)
+
+med_cond_pal <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+
+med_cluster_anno <- ComplexHeatmap::AnnotationFunction(
+  fun = function(index, k, n) {
+    for (i in seq_along(index)) {
+      v <- med_cl_vals[index[i]]
+      grid::grid.rect(
+        x      = grid::unit((i - 0.5) / length(index), "npc"),
+        y      = grid::unit(0.5, "npc"),
+        width  = grid::unit(1 / length(index), "npc"),
+        height = grid::unit(1, "npc"),
+        gp     = grid::gpar(fill = "#cccccc", col = "white", lwd = 0.3))
+      grid::grid.text(
+        as.character(v),
+        x  = grid::unit((i - 0.5) / length(index), "npc"),
+        y  = grid::unit(0.5, "npc"),
+        gp = grid::gpar(fontsize = 7, fontface = "bold", col = "#333333"))
+    }
+  },
+  which = "column", n = med_n_col, height = grid::unit(5, "mm"))
+
+# N cells per cluster × condition (distinct cells in scores_df)
+n_cells_df <- scores_df |>
+  dplyr::distinct(cell_id, cluster, condition) |>
+  dplyr::count(cluster, condition, name = "n_cells") |>
+  dplyr::mutate(col_key = paste0(cluster, " | ", condition))
+n_cells_vals <- n_cells_df$n_cells[match(colnames(med_mat_z), n_cells_df$col_key)]
+
+med_col_anno <- ComplexHeatmap::HeatmapAnnotation(
+  "N cells\n(>100)" = ComplexHeatmap::anno_barplot(
+    n_cells_vals,
+    gp         = grid::gpar(fill = med_cond_pal[med_cond_vals], col = NA),
+    border     = FALSE,
+    axis_param = list(gp = grid::gpar(fontsize = 6)),
+    height     = grid::unit(1.2, "cm")
+  ),
+  Cluster   = med_cluster_anno,
+  Condition = med_cond_vals,
+  col       = list(Condition = med_cond_pal),
+  annotation_name_gp   = grid::gpar(fontsize = 8),
+  annotation_name_side = "left",
+  show_legend          = c("N cells\n(>100)" = FALSE, Cluster = FALSE, Condition = TRUE),
+  annotation_height    = grid::unit(c(12, 5, 4), "mm")
+)
+
+lim_z <- max(abs(med_mat_z), na.rm = TRUE)
+col_fun_z <- circlize::colorRamp2(c(-lim_z, 0, lim_z),
+                                  c("#2166ac", "white", "#d73027"))
+
+# ward.D2 clustering + OLO optimal leaf ordering
+# Returns list(dend, hc) so cutree can be applied to the same hclust object
+olo_dend <- function(mat) {
+  d   <- dist(mat)
+  hc  <- hclust(d, method = "ward.D2")
+  ser <- seriation::seriate(d, method = "OLO", control = list(hclust = hc))
+  list(dend = as.dendrogram(as.hclust(ser[[1]])), hc = hc)
+}
+
+res_row  <- olo_dend(med_mat_z)
+res_col  <- olo_dend(t(med_mat_z))
+
+# Pre-order matrix by dendrogram leaf order and cut — then disable clustering in
+# ComplexHeatmap so the displayed order is fully under our control and the cut
+# labels used here are guaranteed to match what the heatmap shows.
+N_CUTS <- 6
+row_ord <- order.dendrogram(res_row$dend)
+col_ord <- order.dendrogram(res_col$dend)
+
+# cutree on the original hclust (heights intact, no round-trip through dendrogram)
+row_cut_raw <- cutree(res_row$hc, k = N_CUTS)
+col_cut_raw <- cutree(res_col$hc, k = N_CUTS)
+
+# Relabel in visual top→bottom / left→right order: first group seen = "Cut 1"
+relabel_in_order <- function(cut_vec, ord) {
+  labs_ordered <- cut_vec[ord]
+  remap        <- setNames(seq_along(unique(labs_ordered)), unique(labs_ordered))
+  relabeled    <- remap[as.character(cut_vec)]
+  result       <- factor(paste0("Cut ", relabeled),
+                         levels = paste0("Cut ", seq_len(N_CUTS)))
+  names(result) <- names(cut_vec)   # paste0 drops names; restore explicitly
+  result
+}
+row_cut <- relabel_in_order(row_cut_raw, row_ord)
+col_cut <- relabel_in_order(col_cut_raw, col_ord)
+
+# Re-order matrix rows and columns to match the dendrogram order
+med_mat_z_ord <- med_mat_z[row_ord, col_ord, drop = FALSE]
+row_cut_ord   <- row_cut[row_ord]
+col_cut_ord   <- col_cut[col_ord]
+
+# Variance rank for each row in med_mat (lower rank = higher variance)
+rank_vals <- row_var_df$rank[match(rownames(med_mat_z_ord), row_var_df$geneset)]
+
+rank_col_fun <- circlize::colorRamp2(
+  c(1, max(rank_vals)),
+  c("#f7fbff", "#08306b")   # white = rank 1 (most variable), dark = lowest
+)
+
+row_anno <- ComplexHeatmap::rowAnnotation(
+  Rank        = rank_vals,
+  col         = list(Rank = rank_col_fun),
+  show_legend = FALSE,   # legend added manually to draw() for reliable merging
+  simple_anno_size   = grid::unit(3, "mm"),
+  annotation_name_gp = grid::gpar(fontsize = 8)
+)
+
+rank_legend <- ComplexHeatmap::Legend(
+  col_fun = rank_col_fun,
+  title   = "Var\nrank"
+)
+
+ht <- ComplexHeatmap::Heatmap(
+  med_mat_z_ord,
+  col              = col_fun_z,
+  na_col           = "grey88",
+  name             = "Row\nz-score",
+  top_annotation   = med_col_anno,
+  right_annotation = row_anno,
+  cluster_rows     = FALSE,
+  cluster_columns  = FALSE,
+  row_split        = row_cut_ord,
+  column_split     = col_cut_ord,
+  show_column_names    = FALSE,
+  row_names_gp         = grid::gpar(fontsize = 6),
+  column_title_gp      = grid::gpar(fontsize = 8),
+  row_title_gp         = grid::gpar(fontsize = 8),
+  heatmap_legend_param = list(title = "Row\nz-score")
+)
+
+ComplexHeatmap::draw(
+  ht,
+  merge_legends          = TRUE,
+  heatmap_legend_side    = "right",
+  annotation_legend_side = "right",
+  heatmap_legend_list    = list(rank_legend)
+)
+```
+
+---
+
+# 4  Row-cut geneset membership & gene-level heatmap
+
+```{r cut-extraction}
+# row_cut is a factor (Cut 1 … Cut N) already ordered top→bottom from the heatmap
+# — same vector passed to row_split, so labels are guaranteed identical
+cut_df <- tibble::tibble(
+  geneset = names(row_cut),
+  cut     = as.character(row_cut)
+) |> dplyr::arrange(cut)
+
+# Union of underlying genes per cut
+cut_gene_lst <- split(cut_df$geneset, cut_df$cut) |>
+  lapply(function(gs) list(
+    genesets = gs,
+    genes    = unique(unlist(all_sigs[gs]))
+  ))
+
+# Summary table
+cut_summary <- cut_df |>
+  dplyr::group_by(cut) |>
+  dplyr::summarise(
+    n_genesets = dplyr::n(),
+    genesets   = paste(geneset, collapse = "; "),
+    n_genes    = length(unique(unlist(all_sigs[geneset]))),
+    .groups    = "drop"
+  )
+
+DT::datatable(
+  cut_summary,
+  rownames = FALSE,
+  caption  = "Geneset membership and gene union per row cut",
+  options  = list(pageLength = 10, scrollX = TRUE)
+)
+```
+
+```{r cut-gene-heatmap, fig.height=6, fig.width=14}
+# Load processed HSC object for average expression
+srt_hsc_cut  <- targets::tar_read(mpn_processed_hsc_fullcc)
+hsc_cl_col_c <- grep("sNN.*res\\.0\\.9$", colnames(srt_hsc_cut@meta.data), value = TRUE)[1]
+
+srt_hsc_cut$col_key <- paste0(
+  as.character(srt_hsc_cut@meta.data[[hsc_cl_col_c]]),
+  " | ",
+  label_condition(srt_hsc_cut$sample.name)
+)
+
+# Filter to cells in valid columns (>100 cells, matching the score heatmap)
+valid_cols  <- colnames(med_mat)
+srt_hsc_cut <- srt_hsc_cut[, srt_hsc_cut$col_key %in% valid_cols]
+
+# Average SCT expression per cluster × condition group
+avg_expr <- Seurat::AverageExpression(
+  srt_hsc_cut,
+  assays   = "SCT",
+  layer    = "data",
+  group.by = "col_key",
+  verbose  = FALSE
+)$SCT
+
+# Seurat prepends "g" to column names starting with a digit — strip it back
+colnames(avg_expr) <- sub("^g(?=[0-9])", "", colnames(avg_expr), perl = TRUE)
+
+rm(srt_hsc_cut); gc()
+
+# Column annotation matching the score heatmap
+avg_cols     <- intersect(valid_cols, colnames(avg_expr))
+avg_expr     <- avg_expr[, avg_cols, drop = FALSE]
+cut_cl_vals  <- sub(" \\|.*", "", avg_cols)
+cut_cnd_vals <- sub(".* \\| ", "", avg_cols)
+
+cut_cluster_anno <- ComplexHeatmap::AnnotationFunction(
+  fun = function(index, k, n) {
+    for (i in seq_along(index)) {
+      v <- cut_cl_vals[index[i]]
+      grid::grid.rect(
+        x = grid::unit((i - 0.5) / length(index), "npc"),
+        y = grid::unit(0.5, "npc"),
+        width = grid::unit(1 / length(index), "npc"),
+        height = grid::unit(1, "npc"),
+        gp = grid::gpar(fill = "#cccccc", col = "white", lwd = 0.3))
+      grid::grid.text(as.character(v),
+        x  = grid::unit((i - 0.5) / length(index), "npc"),
+        y  = grid::unit(0.5, "npc"),
+        gp = grid::gpar(fontsize = 7, fontface = "bold", col = "#333333"))
+    }
+  },
+  which = "column", n = length(avg_cols), height = grid::unit(5, "mm"))
+
+cut_col_anno <- ComplexHeatmap::HeatmapAnnotation(
+  Cluster   = cut_cluster_anno,
+  Condition = cut_cnd_vals,
+  col       = list(Condition = cond_pal),
+  annotation_name_gp   = grid::gpar(fontsize = 8),
+  annotation_name_side = "left",
+  show_legend          = c(Cluster = FALSE, Condition = TRUE),
+  annotation_height    = grid::unit(c(5, 4), "mm")
+)
+
+lim_expr <- 3   # z-score cap for display
+col_fun_expr <- circlize::colorRamp2(c(-lim_expr, 0, lim_expr),
+                                     c("#2166ac", "white", "#d73027"))
+
+# One heatmap per cut
+for (cut_name in names(cut_gene_lst)) {
+  genes_use <- intersect(cut_gene_lst[[cut_name]]$genes, rownames(avg_expr))
+  if (length(genes_use) < 2) next
+
+  mat   <- as.matrix(avg_expr[genes_use, avg_cols, drop = FALSE])
+  mat_z <- t(scale(t(mat)))
+  # Drop zero-variance genes
+  mat_z <- mat_z[apply(mat_z, 1, var, na.rm = TRUE) >= 1e-6, , drop = FALSE]
+  if (nrow(mat_z) < 2) next
+
+  dend_g <- olo_dend(mat_z)$dend
+  dend_c <- olo_dend(t(mat_z))$dend
+
+  ht_cut <- ComplexHeatmap::Heatmap(
+    mat_z,
+    col              = col_fun_expr,
+    name             = "Row\nz-score",
+    top_annotation   = cut_col_anno,
+    cluster_rows     = dend_g,
+    cluster_columns  = dend_c,
+    show_column_names = FALSE,
+    row_names_gp     = grid::gpar(fontsize = 4),
+    column_title     = paste0(cut_name, " — ", length(genes_use), " genes / ",
+                              length(cut_gene_lst[[cut_name]]$genesets), " genesets"),
+    column_title_gp  = grid::gpar(fontsize = 9, fontface = "bold"),
+    heatmap_legend_param = list(title = "Row\nz-score")
+  )
+  ComplexHeatmap::draw(ht_cut,
+    merge_legends          = TRUE,
+    heatmap_legend_side    = "right",
+    annotation_legend_side = "right")
+}
+```
+
+```{r cut-gene-heatmap-union, fig.height=14, fig.width=14}
+# Union of all genes across all cuts — independently clustered, 5 row × 5 col cuts
+N_CUTS_GENE <- 6
+
+all_genes_union <- unique(unlist(lapply(cut_gene_lst, `[[`, "genes")))
+genes_union     <- intersect(all_genes_union, rownames(avg_expr))
+
+mat_u   <- as.matrix(avg_expr[genes_union, avg_cols, drop = FALSE])
+mat_u_z <- t(scale(t(mat_u)))
+keep_g  <- apply(mat_u_z, 1, var, na.rm = TRUE) >= 1e-6
+mat_u_z <- mat_u_z[keep_g, , drop = FALSE]
+
+# Independent ward.D2 + OLO clustering of rows and columns
+res_row_u <- olo_dend(mat_u_z)
+res_col_u <- olo_dend(t(mat_u_z))
+
+row_ord_u <- order.dendrogram(res_row_u$dend)
+col_ord_u <- order.dendrogram(res_col_u$dend)
+
+row_cut_u <- relabel_in_order(cutree(res_row_u$hc, k = N_CUTS_GENE), row_ord_u)
+col_cut_u <- relabel_in_order(cutree(res_col_u$hc, k = N_CUTS_GENE), col_ord_u)
+
+mat_u_z   <- mat_u_z[row_ord_u, col_ord_u, drop = FALSE]
+row_cut_u <- row_cut_u[row_ord_u]
+col_cut_u <- col_cut_u[col_ord_u]
+
+avg_cols_u     <- avg_cols[col_ord_u]
+cut_cl_vals_u  <- sub(" \\|.*", "", avg_cols_u)
+cut_cnd_vals_u <- sub(".* \\| ", "", avg_cols_u)
+
+cut_cluster_anno_u <- ComplexHeatmap::AnnotationFunction(
+  fun = function(index, k, n) {
+    for (i in seq_along(index)) {
+      v <- cut_cl_vals_u[index[i]]
+      grid::grid.rect(
+        x = grid::unit((i - 0.5) / length(index), "npc"),
+        y = grid::unit(0.5, "npc"),
+        width  = grid::unit(1 / length(index), "npc"),
+        height = grid::unit(1, "npc"),
+        gp = grid::gpar(fill = "#cccccc", col = "white", lwd = 0.3))
+      grid::grid.text(as.character(v),
+        x  = grid::unit((i - 0.5) / length(index), "npc"),
+        y  = grid::unit(0.5, "npc"),
+        gp = grid::gpar(fontsize = 7, fontface = "bold", col = "#333333"))
+    }
+  },
+  which = "column", n = length(avg_cols_u), height = grid::unit(5, "mm"))
+
+cut_col_anno_u <- ComplexHeatmap::HeatmapAnnotation(
+  Cluster   = cut_cluster_anno_u,
+  Condition = cut_cnd_vals_u,
+  col       = list(Condition = cond_pal),
+  annotation_name_gp   = grid::gpar(fontsize = 8),
+  annotation_name_side = "left",
+  show_legend          = c(Cluster = FALSE, Condition = TRUE),
+  annotation_height    = grid::unit(c(5, 4), "mm")
+)
+
+ht_union <- ComplexHeatmap::Heatmap(
+  mat_u_z,
+  col               = col_fun_expr,
+  name              = "Row\nz-score",
+  top_annotation    = cut_col_anno_u,
+  cluster_rows      = FALSE,
+  cluster_columns   = FALSE,
+  row_split         = row_cut_u,
+  column_split      = col_cut_u,
+  show_column_names = FALSE,
+  row_names_gp      = grid::gpar(fontsize = 4),
+  column_title      = paste0("All cuts — ", nrow(mat_u_z), " genes"),
+  column_title_gp   = grid::gpar(fontsize = 9, fontface = "bold"),
+  row_title_gp      = grid::gpar(fontsize = 8),
+  heatmap_legend_param = list(title = "Row\nz-score")
+)
+
+ComplexHeatmap::draw(ht_union,
+  merge_legends          = TRUE,
+  heatmap_legend_side    = "right",
+  annotation_legend_side = "right")
+```
+
+

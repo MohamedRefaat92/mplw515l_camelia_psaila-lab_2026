@@ -1,0 +1,237 @@
+---
+title: "CellChat — Cross-compartment signaling (WT)"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| message: false
+#| warning: false
+
+library(targets)
+library(dplyr)
+library(ggplot2)
+library(Seurat)
+library(SeuratObject)
+library(CellChat)
+library(patchwork)
+
+options(stringsAsFactors = FALSE)
+
+CONDITION_LABEL    <- "WT"
+CLUSTER_COL_HSC    <- "sNN_pca.SCT_30_res.0.9"
+CLUSTER_COL_MNC    <- "sNN_pca.SCT_30_res.0.9"
+CLUSTER_COL_STROMA <- "sNN_pca.SCT_30_res.0.9"
+
+DE_TARGET_HSC    <- "cluster_de_each_vs_rest_hsc_0_9"
+DE_TARGET_MNC    <- "cluster_de_each_vs_rest_mnc_0_9"
+DE_TARGET_STROMA <- "cluster_de_each_vs_rest_stroma_0_9"
+
+DE_LOGFC_MIN <- 0.5
+DE_PADJ_MAX  <- 0.01
+```
+
+## Load and merge compartments
+
+```{r load-merge}
+#| message: false
+
+srt_merged <- tar_read(mpn_wt_all)
+DefaultAssay(srt_merged) <- "RNA"
+srt_merged <- SeuratObject::JoinLayers(srt_merged)
+srt_merged <- NormalizeData(srt_merged, normalization.method = "LogNormalize", scale.factor = 1e4, verbose = FALSE)
+
+md <- srt_merged@meta.data
+srt_merged$labels <- dplyr::case_when(
+  md$compartment == "HSC"    ~ paste0("HSC_c",    md[[CLUSTER_COL_HSC]]),
+  md$compartment == "MNC"    ~ paste0("MNC_c",    md[[CLUSTER_COL_MNC]]),
+  md$compartment == "Stroma" ~ paste0("Stroma_c", md[[CLUSTER_COL_STROMA]]),
+  TRUE ~ "Unknown"
+)
+
+cat("Groups:\n")
+print(table(srt_merged$labels))
+cat(sprintf("\nTotal: %d cells × %d genes\n", ncol(srt_merged), nrow(srt_merged)))
+```
+
+## Create CellChat object
+
+```{r create-cellchat}
+#| message: false
+
+data.input <- GetAssayData(srt_merged, assay = "RNA", layer = "data")
+cellchat <- createCellChat(object = data.input, meta = srt_merged@meta.data,
+                           group.by = "labels")
+rm(srt_merged, data.input); invisible(gc())
+```
+
+## Select CellChat database
+
+```{r select-db}
+CellChatDB <- CellChatDB.mouse
+cellchat_keys <- list(
+  c("Secreted Signaling", "ECM-Receptor", "Cell-Cell Contact"),
+  "CellChatDB v2"
+)
+cellchat@DB <- subsetDB(CellChatDB, search = cellchat_keys, key = c("annotation", "version"))
+cat(sprintf("DB interactions: %d\n", nrow(cellchat@DB$interaction)))
+```
+
+## Set var.features from DE markers
+
+```{r var-features}
+#| message: false
+
+hsc_de    <- tar_read_raw(DE_TARGET_HSC)
+mnc_de    <- tar_read_raw(DE_TARGET_MNC)
+stroma_de <- tar_read_raw(DE_TARGET_STROMA)
+
+sig_genes <- bind_rows(
+  hsc_de    |> dplyr::filter(log_fc >= DE_LOGFC_MIN, padj < DE_PADJ_MAX),
+  mnc_de    |> dplyr::filter(log_fc >= DE_LOGFC_MIN, padj < DE_PADJ_MAX),
+  stroma_de |> dplyr::filter(log_fc >= DE_LOGFC_MIN, padj < DE_PADJ_MAX)
+) |> dplyr::pull(feature) |> unique()
+
+rm(hsc_de, mnc_de, stroma_de); invisible(gc())
+
+cellchat <- subsetData(cellchat)
+sig_genes_valid <- intersect(sig_genes, rownames(cellchat@data.signaling))
+cellchat@var.features[["features"]] <- sig_genes_valid
+
+cat(sprintf("Significant DE genes: %d  |  in expression matrix: %d\n",
+            length(sig_genes), length(sig_genes_valid)))
+```
+
+## Compute communication probability
+
+```{r compute-prob}
+#| message: false
+
+cellchat <- identifyOverExpressedInteractions(cellchat, variable.both = FALSE)
+cellchat <- computeCommunProb(cellchat, type = "truncatedMean", trim = 0.1, raw.use = TRUE)
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+
+df.net <- subsetCommunication(cellchat)
+cat(sprintf("Inferred interactions: %d   |   pathways: %d\n",
+            nrow(df.net), length(cellchat@netP$pathways)))
+```
+
+## Network overview
+
+```{r network-overview}
+#| fig-width: 12
+#| fig-height: 6
+
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1, 2), xpd = TRUE, mar = c(1, 1, 2, 1))
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = TRUE,
+                 label.edge = FALSE, title.name = "Number of interactions")
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, weight.scale = TRUE,
+                 label.edge = FALSE, title.name = "Interaction weight / strength")
+```
+
+## Per-group outgoing interaction strength
+
+```{r per-group-outgoing}
+#| fig-width: 14
+#| fig-height: 10
+
+mat <- cellchat@net$weight
+par(mfrow = c(ceiling(nrow(mat) / 4), min(4, nrow(mat))), xpd = TRUE, mar = c(1, 1, 2, 1))
+for (i in seq_len(nrow(mat))) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = TRUE,
+                   edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+```
+
+## Detected signaling pathways
+
+```{r pathways-list}
+print(cellchat@netP$pathways)
+```
+
+## All interactions — bubble plot
+
+```{r bubble-all}
+#| fig-width: 14
+#| fig-height: 10
+
+netVisual_bubble(cellchat, remove.isolate = FALSE, angle.x = 45)
+```
+
+## Signaling role heatmap
+
+```{r signaling-roles}
+#| fig-width: 14
+#| fig-height: 8
+
+ht_out <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing",
+                                             width = 12, height = 6,
+                                             title = paste0(CONDITION_LABEL, " — outgoing"))
+ht_in  <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming",
+                                             width = 12, height = 6,
+                                             title = paste0(CONDITION_LABEL, " — incoming"))
+ComplexHeatmap::draw(ht_out + ht_in)
+```
+
+## Per-pathway analysis
+
+```{r per-pathway}
+#| fig-width: 8
+#| fig-height: 8
+#| results: hold
+
+for (pw in cellchat@netP$pathways) {
+  cat(sprintf("\n### %s\n\n", pw))
+  tryCatch({
+    par(mfrow = c(1, 1), mar = c(1, 1, 2, 1))
+    netVisual_aggregate(cellchat, signaling = pw, layout = "chord",
+                        title.name = paste0(pw, " — chord"))
+  }, error = function(e) message(pw, " chord: ", conditionMessage(e)))
+  tryCatch({
+    print(netAnalysis_contribution(cellchat, signaling = pw) + ggtitle(pw))
+  }, error = function(e) message(pw, " contribution: ", conditionMessage(e)))
+}
+```
+
+## Pathway bubble plots
+
+```{r pathway-bubbles}
+#| fig-width: 12
+#| fig-height: 6
+
+for (pw in cellchat@netP$pathways) {
+  tryCatch({
+    pairLR <- extractEnrichedLR(cellchat, signaling = pw, geneLR.return = FALSE)
+    print(netVisual_bubble(cellchat, pairLR.use = pairLR,
+                           remove.isolate = TRUE, angle.x = 45) + ggtitle(pw))
+  }, error = function(e) message(pw, " bubble: ", conditionMessage(e)))
+}
+```
+
+## Interaction table
+
+```{r interaction-table}
+DT::datatable(df.net |> dplyr::arrange(pathway_name, source, target),
+              filter = "top", options = list(pageLength = 20, scrollX = TRUE))
+```
+
+```{r session-info}
+sessionInfo()
+```
+
+{{< include ../_session-info.qmd >}}

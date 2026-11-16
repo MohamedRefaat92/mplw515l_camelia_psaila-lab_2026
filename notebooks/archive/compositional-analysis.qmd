@@ -1,0 +1,1552 @@
+---
+title: "Compositional Analysis"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+```{r setup}
+library(Seurat)
+library(miloR)
+library(SingleCellExperiment)
+library(ggplot2)
+library(patchwork)
+library(DT)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+library(targets)
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+This chapter explores cluster composition across conditions in three parts:
+
+1. **Cluster proportions** — bubble plots and heatmaps showing the fraction of each
+   cluster per `sample.name`, plus a sample × HTO tag breakdown.
+2. **Milo differential abundance** — neighbourhood-level DA testing with a negative-binomial
+   GLM, providing spatially resolved inference beyond fixed cluster boundaries.
+3. **Cluster condition purity** — resolution sweep quantifying how purely each cluster
+   maps to a single condition; identifies the resolution at which condition-pure clusters emerge.
+
+**Conditions per subset:**
+
+| Subset | Conditions |
+|--------|-----------|
+| Stroma | WT · Het |
+| HSC    | WT · Het mCh− · Het mCh+ |
+| MNC    | WT · mCh− · mCh+ |
+
+For Milo, each HTO tag (`dm2_class`) within a condition is used as a biological replicate
+(consistent with the pseudobulk DE approach elsewhere in this project). Cells labelled
+`negative` or `multiplet` are excluded throughout.
+
+---
+
+## Helper functions {.unnumbered}
+
+```{r helpers}
+# ── Proportion helpers ───────────────────────────────────────────────────────
+
+#' Long table: n and % of each cluster per grouping variable (singlets only).
+cluster_pct <- function(meta, group_var) {
+  meta %>%
+    dplyr::filter(!dm2_class %in% c("negative", "multiplet")) %>%
+    dplyr::count(.data[[group_var]], cluster, name = "n") %>%
+    dplyr::group_by(.data[[group_var]]) %>%
+    dplyr::mutate(pct = 100 * n / sum(n)) %>%
+    dplyr::ungroup() %>%
+    dplyr::arrange(.data[[group_var]], cluster)
+}
+
+#' Long table: n and % per sample.name × dm2_class (singlets only).
+cluster_pct_grid <- function(meta) {
+  meta %>%
+    dplyr::filter(!dm2_class %in% c("negative", "multiplet")) %>%
+    dplyr::count(sample.name, dm2_class, cluster, name = "n") %>%
+    dplyr::group_by(sample.name, dm2_class) %>%
+    dplyr::mutate(pct = 100 * n / sum(n)) %>%
+    dplyr::ungroup()
+}
+
+# ── Bubble plots ─────────────────────────────────────────────────────────────
+
+.bubble_layers <- function(max_size = 18, text_size = 3) {
+  list(
+    geom_point(aes(size = pct, fill = pct),
+               shape = 21, stroke = 0.3, colour = "grey30"),
+    geom_text(aes(label = label), size = text_size,
+              colour = "black", fontface = "bold"),
+    scale_size_area(max_size = max_size, name = "% cells"),
+    scale_fill_distiller(palette = "YlOrRd", direction = 1,
+                         name = "% cells", limits = c(0, NA)),
+    guides(size = guide_legend(override.aes = list(fill = "#fd8d3c")),
+           fill = guide_colourbar(barwidth = 0.8, barheight = 5)),
+    theme_bw(base_size = 11),
+    theme(panel.grid.major  = element_line(colour = "grey92"),
+          panel.grid.minor  = element_blank())
+  )
+}
+
+plot_cluster_bubble <- function(meta, group_var, title = "") {
+  df <- cluster_pct(meta, group_var) %>%
+    dplyr::mutate(
+      label   = ifelse(pct >= 1, sprintf("%.1f", pct), ""),
+      cluster = factor(cluster,
+                       levels = sort(unique(as.numeric(as.character(cluster)))))
+    )
+  ggplot(df, aes(.data[[group_var]], cluster)) +
+    .bubble_layers(max_size = 18, text_size = 3) +
+    labs(title = title, x = NULL, y = "Cluster") +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1))
+}
+
+plot_cluster_bubble_grid <- function(meta, title = "") {
+  df <- cluster_pct_grid(meta) %>%
+    dplyr::mutate(
+      label   = ifelse(pct >= 1, sprintf("%.1f", pct), ""),
+      cluster = factor(cluster,
+                       levels = sort(unique(as.numeric(as.character(cluster)))))
+    )
+  ggplot(df, aes(dm2_class, cluster)) +
+    .bubble_layers(max_size = 14, text_size = 2.3) +
+    facet_wrap(~ sample.name, nrow = 1) +
+    labs(title = title, x = "HTO tag", y = "Cluster") +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1),
+          strip.text  = element_text(size = 9))
+}
+
+# ── Heatmap ──────────────────────────────────────────────────────────────────
+
+plot_cluster_heatmap <- function(meta, title = "") {
+  cond_map <- c(
+    "Stroma_WT"          = "#4393c3", "Stroma_Het"         = "#d6604d",
+    "CD41+_HSC_WT"       = "#4393c3", "CD41+ HSC_Het_mCh-" = "#74c476",
+    "CD41+_HSC_Het_mCh+" = "#fd8d3c",
+    "MNC_WT"             = "#4393c3", "MNC_mCh-"           = "#1a9850",
+    "MNC_mCh+"           = "#d73027"
+  )
+
+  mat <- cluster_pct(meta, "sample.name") %>%
+    dplyr::select(sample.name, cluster, pct) %>%
+    tidyr::pivot_wider(names_from = sample.name, values_from = pct,
+                       values_fill = 0) %>%
+    dplyr::mutate(cluster = as.numeric(as.character(cluster))) %>%
+    dplyr::arrange(cluster) %>%
+    tibble::column_to_rownames("cluster") %>%
+    as.matrix()
+
+  lab_mat <- matrix(
+    ifelse(mat >= 1, sprintf("%.1f%%", mat), ""),
+    nrow = nrow(mat), ncol = ncol(mat),
+    dimnames = dimnames(mat)
+  )
+
+  scaled_mat <- t(scale(t(mat)))
+  scaled_mat[!is.finite(scaled_mat)] <- 0
+
+  present_cols <- intersect(colnames(mat), names(cond_map))
+  if (length(present_cols) > 0) {
+    col_ann     <- data.frame(Condition = names(cond_map[present_cols]),
+                              row.names = present_cols)
+    ann_colours <- list(Condition = cond_map[present_cols])
+    names(ann_colours$Condition) <- names(cond_map[present_cols])
+  } else {
+    col_ann     <- NA
+    ann_colours <- NA
+  }
+
+  pheatmap(
+    scaled_mat,
+    display_numbers      = lab_mat,
+    number_color         = "grey15",
+    fontsize_number      = 9,
+    color                = colorRampPalette(
+                             c("#2166ac", "#f7f7f7", "#b2182b"))(201),
+    breaks               = seq(-2.5, 2.5, length.out = 202),
+    cluster_rows         = FALSE,
+    cluster_cols         = FALSE,
+    border_color         = NA,
+    main                 = title,
+    fontsize             = 11,
+    fontsize_row         = 10,
+    fontsize_col         = 10,
+    angle_col            = 45,
+    cellwidth            = 52,
+    cellheight           = 22,
+    annotation_col       = col_ann,
+    annotation_colors    = ann_colours,
+    annotation_names_col = FALSE,
+    legend_breaks        = c(-2, -1, 0, 1, 2),
+    legend_labels        = c("−2", "−1", "0", "+1", "+2"),
+    treeheight_row       = 0,
+    treeheight_col       = 0
+  )
+}
+
+# ── Scatter-pie UMAP ─────────────────────────────────────────────────────────
+
+#' One scatter-pie per group, placed at the PCA-space medoid cell's UMAP coords.
+#' Pie fill = proportion of fill_var levels within each group.
+#' Pie area  = proportional to group size (radius scaled by sqrt(n_cells)).
+#'
+#' @param srt       Processed Seurat object.
+#' @param group_var Metadata column defining groups (e.g. cluster column).
+#' @param fill_var  Metadata column whose category proportions fill each pie.
+#' @param pca_name  PCA reduction name used for medoid distance calculation.
+#' @param umap_name UMAP reduction name used for pie placement.
+#' @param n_pcs     Number of PCs used in distance calculation.
+#' @param max_r     Radius of the largest pie in UMAP units; others scale by
+#'                  sqrt(n) so that pie area is proportional to group size.
+#' @param palette   Named colour vector for fill_var levels (optional).
+#' @param bg_alpha  Opacity of the background cell cloud (0 = hidden).
+plot_medoid_pie <- function(srt,
+                            group_var,
+                            fill_var,
+                            pca_name  = "pca.SCT",
+                            umap_name = "umap.nn",
+                            n_pcs     = 20,
+                            max_r     = 1.0,
+                            palette   = NULL,
+                            pie_alpha = 0.9,
+                            bg_alpha  = 0.05) {
+  pca_emb  <- Seurat::Embeddings(srt, pca_name)[, seq_len(n_pcs), drop = FALSE]
+  umap_emb <- Seurat::Embeddings(srt, umap_name)
+  meta     <- srt@meta.data
+
+  groups <- as.character(unique(meta[[group_var]]))
+  groups <- groups[!is.na(groups)]
+
+  # Medoid: cell closest to the group centroid in PCA space
+  medoid_idx <- vapply(groups, function(g) {
+    idx  <- which(as.character(meta[[group_var]]) == g)
+    if (length(idx) == 1L) return(idx)
+    cent  <- colMeans(pca_emb[idx, , drop = FALSE])
+    dists <- rowSums(sweep(pca_emb[idx, , drop = FALSE], 2, cent)^2)
+    idx[which.min(dists)]
+  }, integer(1L))
+
+  # Proportion table: one row per group, one column per fill_var level
+  prop_df <- meta %>%
+    dplyr::mutate(.grp  = as.character(.data[[group_var]]),
+                  .fill = as.character(.data[[fill_var]])) %>%
+    dplyr::filter(!is.na(.grp)) %>%
+    dplyr::count(.grp, .fill, name = "n") %>%
+    dplyr::group_by(.grp) %>%
+    dplyr::mutate(total = sum(n), prop = n / total) %>%
+    dplyr::ungroup() %>%
+    tidyr::pivot_wider(id_cols     = c(".grp", "total"),
+                       names_from  = ".fill",
+                       values_from = "prop",
+                       values_fill = 0) %>%
+    dplyr::left_join(
+      data.frame(.grp  = groups,
+                 UMAP1 = umap_emb[medoid_idx, 1],
+                 UMAP2 = umap_emb[medoid_idx, 2]),
+      by = ".grp"
+    ) %>%
+    dplyr::mutate(r = max_r * sqrt(total) / sqrt(max(total)))
+
+  fill_cols <- setdiff(colnames(prop_df), c(".grp", "total", "UMAP1", "UMAP2", "r"))
+
+  p <- ggplot() +
+    geom_point(data  = data.frame(UMAP1 = umap_emb[, 1], UMAP2 = umap_emb[, 2]),
+               aes(UMAP1, UMAP2),
+               size = 0.2, colour = "grey80", alpha = bg_alpha) +
+    scatterpie::geom_scatterpie(
+      data      = prop_df,
+      aes(x = UMAP1, y = UMAP2, r = r),
+      cols      = fill_cols,
+      colour    = "white",
+      linewidth = 0.15,
+      alpha     = pie_alpha
+    ) +
+    coord_equal() +
+    labs(fill = fill_var) +
+    theme_void(base_size = 11)
+
+  if (!is.null(palette))
+    p <- p + scale_fill_manual(values = palette)
+
+  p
+}
+
+# ── Tables ───────────────────────────────────────────────────────────────────
+
+pct_wide <- function(meta, group_var) {
+  cluster_pct(meta, group_var) %>%
+    dplyr::select(-.data[["n"]]) %>%
+    tidyr::pivot_wider(names_from = cluster, values_from = pct,
+                       values_fill = 0) %>%
+    dplyr::mutate(across(where(is.numeric), \(x) round(x, 1)))
+}
+
+show_pct_table <- function(meta, group_var, caption = "") {
+  DT::datatable(pct_wide(meta, group_var),
+                caption  = caption,
+                rownames = FALSE,
+                options  = list(pageLength = 20, scrollX = TRUE)) %>%
+    DT::formatStyle(columns = 1, fontWeight = "bold")
+}
+
+# ── Milo visualisation ───────────────────────────────────────────────────────
+
+plot_milo_results <- function(res, title = "", fdr = 0.1) {
+  da        <- res$da_results
+  clust_var <- res$cluster_col
+  if (is.null(clust_var) || is.na(clust_var))
+    clust_var <- grep("^sNN_", colnames(da), value = TRUE)[1]
+
+  p_bee <- plotDAbeeswarm(da, group.by = clust_var, alpha = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    labs(title = paste(title, "— beeswarm"),
+         x = "Cluster", y = "log2 fold-change") +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  p_vol <- ggplot(da, aes(logFC, -log10(SpatialFDR),
+                           colour = SpatialFDR < fdr)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    geom_hline(yintercept = -log10(fdr), linetype = "dashed", colour = "grey50") +
+    scale_colour_manual(values = c("TRUE" = "#e31a1c", "FALSE" = "grey60"),
+                        labels = c("TRUE" = paste0("DA (FDR<", fdr, ")"),
+                                   "FALSE" = "n.s."),
+                        name = NULL) +
+    labs(title = paste(title, "— volcano"),
+         x = "log2 fold-change", y = expression(-log[10](SpatialFDR))) +
+    theme_bw(base_size = 11)
+
+  p_size <- ggplot(res$nhood_sizes, aes(Size)) +
+    geom_histogram(bins = 40, fill = "#4393c3", colour = "white") +
+    labs(title = "Neighbourhood sizes",
+         x = "Cells per neighbourhood", y = "Count") +
+    theme_bw(base_size = 11)
+
+  (p_bee | p_vol) / p_size
+}
+
+plot_milo_contrasts_single <- function(res,
+                                fdr = 0.1) {
+  da   <- res$da_results
+  clust_var <- res$cluster_col
+
+  p_bee <- plotDAbeeswarm(da, group.by = clust_var, alpha = 0.5) +  
+    ggplot2::scale_color_gradient2(
+    low    = scales::muted("blue"),
+    mid    =  "white",
+    high   = scales::muted("red"))+
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    labs(title = paste(res$model_contrast, "— beeswarm"),
+         x = "Cluster", y = "log2 FC") +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  p_vol <- ggplot(da, aes(logFC, -log10(SpatialFDR),
+                                   colour = SpatialFDR < fdr)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    geom_hline(yintercept = -log10(fdr), linetype = "dashed", colour = "grey50") +
+    scale_colour_manual(values = c("TRUE" = "#fd8d3c", "FALSE" = "grey60"),
+                        labels = c("TRUE" = paste0("DA (FDR<", fdr, ")"),
+                                   "FALSE" = "n.s."), name = NULL) +
+    labs(title = paste(res$model_contrast, "— volcano"),
+         x = "log2 FC", y = expression(-log[10](SpatialFDR))) +
+    theme_bw(base_size = 11)
+  
+  p_bee/p_vol
+}
+
+plot_milo_contrasts <- function(res_two,
+                                label_neg = "mCh− vs WT",
+                                label_pos = "mCh+ vs WT",
+                                fdr = 0.1) {
+  da_neg    <- res_two$res_neg$da_results
+  da_pos    <- res_two$res_pos$da_results
+  clust_var <- res_two$res_neg$cluster_col
+  if (is.null(clust_var) || is.na(clust_var))
+    clust_var <- grep("^sNN_", colnames(da_neg), value = TRUE)[1]
+
+  p_bee_neg <- plotDAbeeswarm(da_neg, group.by = clust_var, alpha = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    labs(title = paste(label_neg, "— beeswarm"),
+         x = "Cluster", y = "log2 FC") +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  p_bee_pos <- plotDAbeeswarm(da_pos, group.by = clust_var, alpha = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    labs(title = paste(label_pos, "— beeswarm"),
+         x = "Cluster", y = "log2 FC") +
+    theme_bw(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  p_vol_neg <- ggplot(da_neg, aes(logFC, -log10(SpatialFDR),
+                                   colour = SpatialFDR < fdr)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    geom_hline(yintercept = -log10(fdr), linetype = "dashed", colour = "grey50") +
+    scale_colour_manual(values = c("TRUE" = "#74c476", "FALSE" = "grey60"),
+                        labels = c("TRUE" = paste0("DA (FDR<", fdr, ")"),
+                                   "FALSE" = "n.s."), name = NULL) +
+    labs(title = paste(label_neg, "— volcano"),
+         x = "log2 FC", y = expression(-log[10](SpatialFDR))) +
+    theme_bw(base_size = 11)
+
+  p_vol_pos <- ggplot(da_pos, aes(logFC, -log10(SpatialFDR),
+                                   colour = SpatialFDR < fdr)) +
+    geom_point(alpha = 0.5, size = 1.5) +
+    geom_hline(yintercept = -log10(fdr), linetype = "dashed", colour = "grey50") +
+    scale_colour_manual(values = c("TRUE" = "#fd8d3c", "FALSE" = "grey60"),
+                        labels = c("TRUE" = paste0("DA (FDR<", fdr, ")"),
+                                   "FALSE" = "n.s."), name = NULL) +
+    labs(title = paste(label_pos, "— volcano"),
+         x = "log2 FC", y = expression(-log[10](SpatialFDR))) +
+    theme_bw(base_size = 11)
+
+  (p_bee_neg | p_bee_pos) /
+    (p_vol_neg | p_vol_pos)
+}
+
+da_table <- function(res, caption = "") {
+  clust_var <- res$cluster_col
+  if (is.null(clust_var) || is.na(clust_var))
+    clust_var <- grep("^sNN_", colnames(res$da_results), value = TRUE)[1]
+
+  res$da_results %>%
+    dplyr::arrange(SpatialFDR) %>%
+    dplyr::select(Nhood, all_of(clust_var), logFC, PValue, SpatialFDR) %>%
+    dplyr::rename(Cluster = all_of(clust_var)) %>%
+    dplyr::mutate(across(where(is.numeric), \(x) round(x, 4))) %>%
+    DT::datatable(caption = caption, rownames = FALSE,
+                  options = list(pageLength = 15, scrollX = TRUE)) %>%
+    DT::formatStyle("SpatialFDR",
+                    backgroundColor = DT::styleInterval(0.1, c("#fff0f0", "white")))
+}
+```
+
+---
+
+# Cell density & mixing {#sec-density}
+
+Two complementary views of how conditions occupy UMAP space:
+
+- **Point density** — cells coloured by local neighbourhood density, faceted by `sample.name`.
+  Highlights whether conditions cluster together or spread differently.
+- **Mixing metric** — per-cell score (Seurat `MixingMetric`) measuring how much a cell's
+  nearest neighbours are drawn from other conditions vs its own.  Low values = well-mixed;
+  high values = segregated.  WT vs Het comparison shown per compartment.
+
+::: {.panel-tabset}
+
+## Stroma
+
+```{r stroma-density-load}
+targets::tar_load(anno_meta_cond_stroma)
+```
+
+```{r stroma-density, fig.height=8, fig.width=10}
+anno_meta_cond_stroma %>%
+  dplyr::filter(!dm2_class %in% c("negative", "multiplet")) %>%
+  ggplot(aes(UMAP1, UMAP2)) +
+  ggpointdensity::geom_pointdensity() +
+  facet_wrap(vars(sample.name)) +
+  scale_color_viridis_c(option = "magma", name = "Density") +
+  labs(title = "Stroma — point density by sample") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text  = element_blank(),
+        axis.ticks = element_blank())
+```
+
+```{r stroma-mixing-load}
+targets::tar_load(mpn_processed_data_stroma)
+```
+
+```{r stroma-mixing, fig.height=5, fig.width=6}
+mpn_processed_data_stroma$gps <- ifelse(
+  stringr::str_detect(mpn_processed_data_stroma$sample.name, "WT"), "WT", "Het")
+mpn_processed_data_stroma$mix <- Seurat::MixingMetric(
+  object       = mpn_processed_data_stroma,
+  grouping.var = "gps",
+  reduction    = "umap.nn")
+Seurat::FeaturePlot(mpn_processed_data_stroma, "mix", reduction = "umap.nn") &
+  scale_color_viridis_c(option = "turbo", name = "Mixing\nmetric") &
+  labs(title = "Stroma — mixing metric (WT vs Het)")
+```
+
+```{r stroma-density-cleanup}
+rm(anno_meta_cond_stroma, mpn_processed_data_stroma); gc()
+```
+
+## HSC
+
+```{r hsc-density-load}
+targets::tar_load(anno_meta_cond_hsc)
+```
+
+```{r hsc-density, fig.height=8, fig.width=10}
+anno_meta_cond_hsc %>%
+  dplyr::filter(!dm2_class %in% c("negative", "multiplet")) %>%
+  ggplot(aes(UMAP1, UMAP2)) +
+  ggpointdensity::geom_pointdensity() +
+  facet_wrap(vars(sample.name)) +
+  scale_color_viridis_c(option = "magma", name = "Density") +
+  labs(title = "HSC — point density by sample") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text  = element_blank(),
+        axis.ticks = element_blank())
+```
+
+```{r hsc-mixing-load}
+targets::tar_load(mpn_processed_data_hsc)
+```
+
+```{r hsc-mixing, fig.height=5, fig.width=6}
+mpn_processed_data_hsc$gps <- ifelse(
+  stringr::str_detect(mpn_processed_data_hsc$sample.name, "WT"), "WT", "Het")
+mpn_processed_data_hsc$mix <- Seurat::MixingMetric(
+  object       = mpn_processed_data_hsc,
+  grouping.var = "gps",
+  reduction    = "umap.nn")
+Seurat::FeaturePlot(mpn_processed_data_hsc, "mix", reduction = "umap.nn") &
+  scale_color_viridis_c(option = "turbo", name = "Mixing\nmetric") &
+  labs(title = "HSC — mixing metric (WT vs Het)")
+```
+
+```{r hsc-density-cleanup}
+rm(anno_meta_cond_hsc, mpn_processed_data_hsc); gc()
+```
+
+## MNC
+
+```{r mnc-density-load}
+targets::tar_load(anno_meta_cond_mnc)
+```
+
+```{r mnc-density, fig.height=8, fig.width=12}
+anno_meta_cond_mnc %>%
+  dplyr::filter(!dm2_class %in% c("negative", "multiplet")) %>%
+  ggplot(aes(UMAP1, UMAP2)) +
+  ggpointdensity::geom_pointdensity() +
+  facet_wrap(vars(sample.name)) +
+  scale_color_viridis_c(option = "magma", name = "Density") +
+  labs(title = "MNC — point density by sample") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(),
+        axis.text  = element_blank(),
+        axis.ticks = element_blank())
+```
+
+```{r mnc-mixing-load}
+targets::tar_load(mpn_processed_data_mnc)
+```
+
+```{r mnc-mixing, fig.height=5, fig.width=6}
+mpn_processed_data_mnc$gps <- ifelse(
+  stringr::str_detect(mpn_processed_data_mnc$sample.name, "WT"), "WT", "Het")
+mpn_processed_data_mnc$mix <- Seurat::MixingMetric(
+  object       = mpn_processed_data_mnc,
+  grouping.var = "gps",
+  reduction    = "umap.nn")
+Seurat::FeaturePlot(mpn_processed_data_mnc, "mix", reduction = "umap.nn") &
+  scale_color_viridis_c(option = "turbo", name = "Mixing\nmetric") &
+  labs(title = "MNC — mixing metric (WT vs Het)")
+```
+
+```{r mnc-density-cleanup}
+rm(anno_meta_cond_mnc, mpn_processed_data_mnc); gc()
+```
+
+:::
+
+---
+
+# Cluster proportions {#sec-proportions}
+
+::: {.panel-tabset}
+
+## Stroma
+
+```{r stroma-prop-load}
+targets::tar_load(anno_meta_cond_stroma)
+meta_stroma <- anno_meta_cond_stroma
+rm(anno_meta_cond_stroma); gc()
+```
+
+```{r stroma-bubble-sample, fig.height=6, fig.width=6}
+plot_cluster_bubble(meta_stroma, "sample.name",
+                    title = "Stroma — % per sample")
+```
+
+```{r stroma-heatmap, fig.height=5, fig.width=5}
+plot_cluster_heatmap(meta_stroma,
+                     title = "Stroma — row-scaled % (cluster × sample)")
+```
+
+```{r stroma-bubble-grid, fig.height=6, fig.width=8}
+plot_cluster_bubble_grid(meta_stroma,
+                         title = "Stroma — % per sample × HTO tag")
+```
+
+::: {.panel-tabset}
+
+### By sample
+
+```{r stroma-tbl-sample}
+show_pct_table(meta_stroma, "sample.name",
+               caption = "Stroma: cluster % per sample")
+```
+
+### By sample × HTO
+
+```{r stroma-tbl-grid}
+cluster_pct_grid(meta_stroma) %>%
+  dplyr::mutate(across(where(is.numeric), \(x) round(x, 1))) %>%
+  DT::datatable(caption = "Stroma: cluster % per sample × HTO tag",
+                rownames = FALSE,
+                options  = list(pageLength = 20, scrollX = TRUE))
+```
+
+:::
+
+```{r stroma-prop-cleanup}
+rm(meta_stroma); gc()
+```
+
+## HSC
+
+```{r hsc-prop-load}
+targets::tar_load(anno_meta_cond_hsc)
+meta_hsc <- anno_meta_cond_hsc
+rm(anno_meta_cond_hsc); gc()
+```
+
+```{r hsc-bubble-sample, fig.height=6, fig.width=7}
+plot_cluster_bubble(meta_hsc, "sample.name",
+                    title = "HSC — % per sample")
+```
+
+```{r hsc-heatmap, fig.height=5, fig.width=6}
+plot_cluster_heatmap(meta_hsc,
+                     title = "HSC — row-scaled % (cluster × sample)")
+```
+
+```{r hsc-bubble-grid, fig.height=6, fig.width=12}
+plot_cluster_bubble_grid(meta_hsc,
+                         title = "HSC — % per sample × HTO tag")
+```
+
+::: {.panel-tabset}
+
+### By sample
+
+```{r hsc-tbl-sample}
+show_pct_table(meta_hsc, "sample.name",
+               caption = "HSC: cluster % per sample")
+```
+
+### By sample × HTO
+
+```{r hsc-tbl-grid}
+cluster_pct_grid(meta_hsc) %>%
+  dplyr::mutate(across(where(is.numeric), \(x) round(x, 1))) %>%
+  DT::datatable(caption = "HSC: cluster % per sample × HTO tag",
+                rownames = FALSE,
+                options  = list(pageLength = 20, scrollX = TRUE))
+```
+
+:::
+
+```{r hsc-prop-cleanup}
+rm(meta_hsc); gc()
+```
+
+## MNC
+
+```{r mnc-prop-load}
+targets::tar_load(anno_meta_cond_mnc)
+meta_mnc <- anno_meta_cond_mnc
+rm(anno_meta_cond_mnc); gc()
+```
+
+```{r mnc-bubble-sample, fig.height=6, fig.width=7}
+plot_cluster_bubble(meta_mnc, "sample.name",
+                    title = "MNC — % per sample")
+```
+
+```{r mnc-heatmap, fig.height=5, fig.width=6}
+plot_cluster_heatmap(meta_mnc,
+                     title = "MNC — row-scaled % (cluster × sample)")
+```
+
+```{r mnc-bubble-grid, fig.height=6, fig.width=12}
+plot_cluster_bubble_grid(meta_mnc,
+                         title = "MNC — % per sample × HTO tag")
+```
+
+::: {.panel-tabset}
+
+### By sample
+
+```{r mnc-tbl-sample}
+show_pct_table(meta_mnc, "sample.name",
+               caption = "MNC: cluster % per sample")
+```
+
+### By sample × HTO
+
+```{r mnc-tbl-grid}
+cluster_pct_grid(meta_mnc) %>%
+  dplyr::mutate(across(where(is.numeric), \(x) round(x, 1))) %>%
+  DT::datatable(caption = "MNC: cluster % per sample × HTO tag",
+                rownames = FALSE,
+                options  = list(pageLength = 20, scrollX = TRUE))
+```
+
+:::
+
+```{r mnc-prop-cleanup}
+rm(meta_mnc); gc()
+```
+
+:::
+
+---
+
+# Milo differential abundance {#sec-milo}
+
+::: {.panel-tabset}
+
+## Stroma
+
+```{r stroma-milo-load}
+targets::tar_load(milo_stroma)
+```
+
+```{r stroma-milo, fig.height=10, fig.width=14}
+plot_milo_results(milo_stroma, title = "Stroma")
+```
+
+```{r stroma-nhood-graph, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_stroma$milo, milo_stroma$da_results,
+                 alpha = 0.1, layout = "UMAP") +
+  labs(title = "Stroma — DA on neighbourhood graph", fill = "log2FC") +
+  theme_bw(base_size = 11)
+```
+
+```{r stroma-da-table}
+da_table(milo_stroma, caption = "Stroma: Milo DA results (sorted by SpatialFDR)")
+```
+
+```{r stroma-milo-cleanup}
+rm(milo_stroma); gc()
+```
+
+## HSC
+
+Two pairwise contrasts vs WT: `Het_mChNeg − WT` and `Het_mChPos − WT`.
+
+```{r hsc-milo-load}
+targets::tar_load(names = c(milo_hsc_da, milo_hsc_obj, milo_hsc_cell_scores))
+```
+
+```{r hsc-milo, fig.height=12, fig.width=14}
+plot_milo_contrasts_single(milo_hsc_da$mChPos_vs_WT)
+```
+
+```{r hsc-nhood-graph-neg, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_hsc_obj, milo_hsc_da$mChNeg_vs_WT$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+    labs(title = milo_hsc_da$mChNeg_vs_WT$model_contrast,
+         fill = "log2FC") +
+    ggplot2::scale_fill_gradient2(
+        low = "#2166AC",
+        mid          = "white",
+        high         = "#B2182B",
+        limits = c(-10, 10)
+        
+    )
+```
+
+```{r hsc-nhood-graph-pos, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_hsc_obj, milo_hsc_da$mChPos_vs_WT$da_results,
+                    alpha = 0.05, layout = "umap.nn") +
+    labs(title = milo_hsc_da$mChPos_vs_WT$model_contrast,
+         fill = "log2FC") +
+    ggplot2::scale_fill_gradient2(
+        low = "#2166AC",
+        mid          = "white",
+        high         = "#B2182B",
+        limits = c(-10, 10)
+        
+    )
+```
+
+::: {.panel-tabset}
+
+### Het mCh− vs WT
+
+```{r hsc-da-table-neg}
+da_table(milo_hsc$res_neg,
+         caption = "HSC: Milo DA — Het mCh− vs WT (sorted by SpatialFDR)")
+```
+
+### Het mCh+ vs WT
+
+```{r hsc-da-table-pos}
+da_table(milo_hsc$res_pos,
+         caption = "HSC: Milo DA — Het mCh+ vs WT (sorted by SpatialFDR)")
+```
+
+### Het mCh+ vs Het mCh−
+
+```{r hsc-da-table-pos-neg}
+da_table(milo_hsc$res_pos_neg,
+         caption = "HSC: Milo DA — Het mCh+ vs Het mCh− (sorted by SpatialFDR)")
+```
+
+```{r}
+df <- data.frame(mch_neg = milo_hsc_da$mChNeg_vs_WT$da_results$logFC,
+                mch_pos = milo_hsc_da$mChPos_vs_WT$da_results$logFC,
+                 clust = milo_hsc_da$mChNeg_vs_WT$da_results$sNN_pca.SCT_30_res.0.9)
+
+df %>% 
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+  scale_color_viridis_c()+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.position = c(0.85,0.2))
+
+
+```
+
+```{r}
+df %>% 
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+    scale_color_viridis_c()+
+  facet_wrap(~clust)+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.title = element_blank())
+
+
+```
+
+```{r}
+clust_no_enrich <- c("0","11", "12", "10", "13", "15", "17", "13", "19", "18")
+df %>% 
+  filter(clust %in% clust_no_enrich)%>%
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+    scale_color_viridis_c()+
+  facet_wrap(~clust)+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.title = element_blank())
+
+```
+
+
+```{r}
+clust_mut_enrich <- c("14", "16")
+df %>% 
+  filter(clust %in% clust_mut_enrich)%>%
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+    scale_color_viridis_c()+
+  facet_wrap(~clust)+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.title = element_blank())
+
+```
+
+
+```{r}
+clust_ery <- c("7", "9", "3")
+df %>% 
+  filter(clust %in% clust_ery)%>%
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+    scale_color_viridis_c()+
+  facet_wrap(~clust)+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.title = element_blank())
+
+```
+
+```{r}
+clust_mk <- c("1", "4")
+df %>% 
+  filter(clust %in% clust_mk)%>%
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+    scale_color_viridis_c()+
+  facet_wrap(~clust)+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.title = element_blank())
+
+
+```
+
+```{r}
+clust_early <- c("5", "2")
+df %>% 
+  filter(clust %in% clust_early)%>%
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+    scale_color_viridis_c()+
+  facet_wrap(~clust)+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.title = element_blank())
+
+```
+
+```{r}
+clust_blast <- c("6", "8")
+df %>% 
+  filter(clust %in% clust_blast)%>%
+  ggplot()+
+    geom_abline(slope = 1,
+                intercept =  0,
+                colour = "black",
+                linewidth = 0.5,
+                lty = 2)+
+    geom_hline(yintercept = 0,
+               colour = "black", 
+               linewidth = 0.5, 
+               lty = 2) +
+    geom_vline(xintercept = 0,
+               colour = "black",
+               linewidth = 0.5,
+               lty = 2) +
+    ggpointdensity::geom_pointdensity(aes(mch_neg,
+                mch_pos), 
+                size = 0.5,
+                name = "density")+
+    scale_color_viridis_c()+
+  facet_wrap(~clust)+
+  scale_x_continuous(name = "mchNeg_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  scale_y_continuous(name = "mchPos_vs_WT_MiloLFC",
+                     limits = c(-10,10))+
+  theme(legend.title = element_blank())
+
+```
+
+```{r}
+milo_tests_scores_df <- names(milo_hsc_cell_scores) %>%
+  lapply(function(x) {
+    new_name <- paste0("mean_lfc_", x)
+    milo_hsc_cell_scores[[x]] %>% dplyr::rename(!!sym(new_name) := "mean_lfc") }) %>%
+  purrr::reduce(inner_join) %>%
+  column_to_rownames("cell_id")
+
+mpn_processed_hsc_fullcc <- Seurat::AddMetaData(mpn_processed_hsc_fullcc,
+                                                milo_tests_scores_df)
+mpn_processed_hsc_fullcc$mean_lfc_mChPos_vs_WT_all_rank <- mpn_processed_hsc_fullcc@meta.data %>% 
+  mutate(mean_lfc_mChPos_vs_WT_all_rank = rank(mean_lfc_mChPos_vs_WT)) %>% 
+  pull(mean_lfc_mChPos_vs_WT_all_rank)
+mpn_processed_hsc_fullcc$mean_lfc_mChNeg_vs_WT_all_rank <- mpn_processed_hsc_fullcc@meta.data %>% 
+  mutate(mean_lfc_mChNeg_vs_WT_all_rank = rank(mean_lfc_mChNeg_vs_WT)) %>% 
+  pull(mean_lfc_mChNeg_vs_WT_all_rank)
+
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,"mean_lfc_mChPos_vs_WT")+
+  ggplot2::scale_color_gradient2(
+    low    = "blue",
+    mid    =  "white",
+    high   = "red")
+
+
+FeaturePlot(mpn_processed_hsc_fullcc,"mean_lfc_mChNeg_vs_WT")+
+  ggplot2::scale_color_gradient2(
+    low    = "blue",
+    mid    =  "white",
+    high   = "red")
+
+
+FeaturePlot(mpn_processed_hsc_fullcc,"mean_lfc")+
+  scale_color_viridis_c(option = "turbo")
+
+FeatureScatter(mpn_processed_hsc_fullcc, "mean_lfc_mChPos_vs_WT", "mean_lfc_mChNeg_vs_WT")
+
+mpn_processed_hsc_fullcc@meta.data  %>%
+    filter(sNN_pca.SCT_30_res.0.3 == "2") %>% 
+    ggplot(aes(mean_lfc_mChPos_vs_WT_0.3_rank, mean_lfc_mChPos_vs_WT, color = mean_lfc_mChPos_vs_WT))+
+    geom_point()+
+  ggplot2::scale_color_gradient2(
+    low    = "blue",
+    mid    =  "white",
+    high   = "red")
+
+```
+
+
+```{r}
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features <- data.frame(row.names = rownames(mpn_processed_hsc_fullcc[["SCT"]]))
+mpn_processed_hsc_fullcc <- Seurat::GroupCorrelation(mpn_processed_hsc_fullcc,
+                                    assay = "SCT",
+                                    var = "mean_lfc_mChPos_vs_WT_all_rank",
+                                    slot = "data",
+                                    do.plot = FALSE)
+cor_genes <- mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>%
+  tibble::rownames_to_column("gene") %>%
+  mutate(dir = ifelse(mean_lfc_mChPos_vs_WT_all_rank_cor >0,"up", "down")) %>% 
+  dplyr::arrange(dir,desc(abs(mean_lfc_mChPos_vs_WT_all_rank_cor)))%>%
+  filter(!is.na(dir) & gene %in% VariableFeatures(mpn_processed_hsc_fullcc))
+genes <- cor_genes %>% group_by(dir) %>% slice_head(n = 23) %>% pull(gene)
+FeaturePlot(mpn_processed_hsc_fullcc,features =c("mean_lfc_mChPos_vs_WT_all_rank", genes),ncol = 8)&scale_color_viridis_c(option = "turbo")&NoLegend()
+
+```
+
+
+```{r}
+milo_clust <- 5
+mpn_processed_hsc_fullcc$mean_lfc_mChPos_vs_WT_group_rank <- mpn_processed_hsc_fullcc@meta.data %>% 
+  #mutate(sNN_pca.SCT_30_res.0.9 = ifelse(sNN_pca.SCT_30_res.0.9 %in% c("6","8"), "6_8", sNN_pca.SCT_30_res.0.3)) %>%
+  group_by(sNN_pca.SCT_30_res.0.9)%>%
+  mutate(mean_lfc_mChPos_vs_WT_0.9_rank = rank(mean_lfc_mChPos_vs_WT)) %>% 
+  ungroup()%>%
+  pull(mean_lfc_mChPos_vs_WT_0.9_rank)
+
+srt_sub <- subset(mpn_processed_hsc_fullcc,sNN_pca.SCT_30_res.0.9 %in% milo_clust)
+srt_sub <- Seurat::GroupCorrelation(srt_sub,
+                                    assay = "SCT",
+                                    var = "mean_lfc_mChPos_vs_WT_group_rank",
+                                    slot = "data",
+                                    do.plot = FALSE)
+cor_genes <- srt_sub[["SCT"]]@meta.features %>%
+  tibble::rownames_to_column("gene") %>%
+  mutate(dir = ifelse(mean_lfc_mChPos_vs_WT_group_rank_cor >0,"up", "down")) %>% 
+  dplyr::arrange(dir,desc(abs(mean_lfc_mChPos_vs_WT_group_rank_cor)))%>%
+  filter(!is.na(dir) & gene %in% VariableFeatures(mpn_processed_hsc_fullcc))
+genes <- cor_genes %>% group_by(dir) %>% slice_head(n = 25) %>% pull(gene)
+FeaturePlot(mpn_processed_hsc_fullcc,features =c("mean_lfc_mChPos_vs_WT_group_rank", genes),ncol = 9)&scale_color_viridis_c(option = "turbo")
+
+```
+
+
+```{r}
+cov_list <- list(mean_lfc_mChPos_vs_WT = mpn_processed_hsc_fullcc$mean_lfc_mChPos_vs_WT,
+                 mean_lfc_mChNeg_vs_WT = mpn_processed_hsc_fullcc$mean_lfc_mChNeg_vs_WT,
+                 mean_lfc_mChPos_vs_mChNeg = mpn_processed_hsc_fullcc$mean_lfc_mChPos_vs_mChNeg)
+cor_df <- correlate_features_to_covariate(                                                 
+  expr_mat  = GetAssayData(mpn_processed_hsc_fullcc,assay = "SCT"),                                           
+  covariate = lapply(cov_list, winsorize),  
+  method    = "spearman",
+  features = setdiff(VariableFeatures(mpn_processed_hsc_fullcc), sex_degs)
+)                                                                                          
+                                                                                           
+
+```
+
+
+```{r}
+milo_clust <- 5
+mpn_processed_hsc_fullcc$mean_lfc_mChPos_vs_WT_group_rank <- mpn_processed_hsc_fullcc@meta.data %>% 
+  #mutate(sNN_pca.SCT_30_res.0.9 = ifelse(sNN_pca.SCT_30_res.0.9 %in% c("6","8"), "6_8", sNN_pca.SCT_30_res.0.3)) %>%
+  group_by(sNN_pca.SCT_30_res.0.1)%>%
+  mutate(mean_lfc_mChPos_vs_WT_0.1_rank = rank(mean_lfc_mChPos_vs_WT)) %>% 
+  ungroup()%>%
+  pull(mean_lfc_mChPos_vs_WT_0.1_rank)
+
+srt_sub <- subset(mpn_processed_hsc_fullcc,sNN_pca.SCT_30_res.0.1 %in% 2)
+
+
+cor_df <- correlate_features_to_covariate(                                                 
+  expr_mat  = GetAssayData(srt_sub,assay = "SCT"),                                           
+  covariate = winsorize(srt_sub$mean_lfc_mChPos_vs_WT),  
+  method    = "spearman",
+  features = setdiff(VariableFeatures(srt_sub), sex_degs)
+)                                                                                          
+   
+```
+
+```{r }
+design_df <- as.data.frame(SummarizedExperiment::colData(milo_hsc_obj)) %>%
+  dplyr::select(milo_sample, condition) %>%
+  dplyr::distinct()
+rownames(design_df) <- design_df$milo_sample
+test_vars <- list(test_variable = "condition",
+                  test_control = "WT",
+                  test_condition = "Het_mChPos")
+contrast <- format_contrast(test_vars)
+da_res <- milo_hsc_da$mChPos_vs_WT$da_results %>% dplyr::rename(NhoodGroup = Nhood)
+meta_df <- SummarizedExperiment::colData(milo_hsc_obj)
+nhood.dge <- testDiffExp(milo_hsc_obj,
+                         da_res, 
+                         design=~condition,
+                         meta.data=meta_df,
+                         subset.nhoods = NULL,
+                         gene.offset=TRUE)
+
+```
+
+```{r }
+design_df <- as.data.frame(SummarizedExperiment::colData(milo_hsc_obj)) %>%
+  dplyr::select(milo_sample, condition) %>%
+  dplyr::distinct()
+rownames(design_df) <- design_df$milo_sample
+test_vars <- list(test_variable = "condition",
+                  test_control = "WT",
+                  test_condition = "Het_mChPos")
+contrast <- format_contrast(test_vars)
+da_res <- milo_hsc_da$mChPos_vs_WT$da_results %>% dplyr::rename(NhoodGroup = Nhood)
+meta_df <- SummarizedExperiment::colData(milo_hsc_obj)
+nhood.markers <- findNhoodMarkers(milo_hsc_obj,
+                         milo_hsc_da$mChNeg_vs_WT$da_results %>% filter(sNN_pca.SCT_30_res.0.9 == "6") %>% head,  
+                         subset.nhoods = NULL,
+                         gene.offset=TRUE)
+
+```
+
+Group neighborhoods
+```{r}
+da_fdr <- 0.1
+da_pos_groups <- miloR::groupNhoods(milo_hsc_obj,
+                                    milo_hsc_da$mChPos_vs_WT$da_results,
+                                    compute.new = FALSE,
+                                    da.fdr = da_fdr)
+da_neg_groups <- miloR::groupNhoods(milo_hsc_obj,
+                                    milo_hsc_da$mChNeg_vs_WT$da_results,
+                                    compute.new = FALSE,
+                                    da.fdr = da_fdr)
+```
+
+Plot groups on nhood graph
+```{r}
+plt_pos <- plot_nhood_graph_groups(milo_hsc_obj, da_pos_groups,
+                        colour_by = "NhoodGroup", layout = "umap.nn")
+
+plt_neg <- plot_nhood_graph_groups(milo_hsc_obj, da_neg_groups,
+                        colour_by = "NhoodGroup", layout = "umap.nn")
+
+plt_pos+ggtitle("mChPos_vs_WT")|plt_neg+ggtitle("mChNeg_vs_WT")
+```
+
+Plot groups on cell UMAP
+```{r}
+nhood_mat    <- miloR::nhoods(milo_hsc_obj)          # cells × nhoods (sparse)
+n_membership <- Matrix::rowSums(nhood_mat)           # nhoods per cell
+
+grp_vec <- setNames(da_pos_groups$NhoodGroup, as.character(da_pos_groups$Nhood))
+grp_aligned <- as.numeric(grp_vec[as.character(seq_len(ncol(nhood_mat)))])
+
+# Using model.matrix
+grp_mat <- model.matrix(~ factor(grp_aligned) - 1)
+colnames(grp_mat) <- levels(factor(grp_aligned))
+
+cell_grp_mat  <- nhood_mat %*% grp_mat
+cell_grp_vec <- apply(cell_grp_mat,1,which.max)
+
+mpn_processed_hsc_fullcc$milo_ngb_grps <- cell_grp_vec
+DimPlot(mpn_processed_hsc_fullcc, group.by =  "milo_ngb_grps", label = TRUE)& NoLegend()
+```
+
+
+:::
+
+```{r hsc-milo-cleanup}
+rm(milo_hsc); gc()
+```
+
+## MNC
+
+Three pairwise contrasts: `mChNeg − WT`, `mChPos − WT`, and `mChPos − mChNeg`.
+
+```{r mnc-milo-load}
+targets::tar_load(milo_mnc)
+```
+
+```{r mnc-milo, fig.height=12, fig.width=14}
+plot_milo_contrasts(milo_mnc,
+                    label_neg = "mCh− vs WT",
+                    label_pos = "mCh+ vs WT")
+```
+
+```{r mnc-nhood-graph-neg, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_mnc$res_neg$milo, milo_mnc$res_neg$da_results,
+                 alpha = 0.1, layout = "UMAP") +
+  labs(title = "MNC — mCh− vs WT: DA on neighbourhood graph",
+       fill = "log2FC") +
+  theme_bw(base_size = 11)
+```
+
+```{r mnc-nhood-graph-pos, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_mnc$res_pos$milo, milo_mnc$res_pos$da_results,
+                 alpha = 0.1, layout = "UMAP") +
+  labs(title = "MNC — mCh+ vs WT: DA on neighbourhood graph",
+       fill = "log2FC") +
+  theme_bw(base_size = 11)
+```
+
+```{r mnc-nhood-graph-pos-neg, fig.height=6, fig.width=10}
+plot_nhood_graph_da(milo_mnc$res_pos_neg$milo, milo_mnc$res_pos_neg$da_results,
+                 alpha = 0.1, layout = "UMAP") +
+  labs(title = "MNC — mCh+ vs mCh−: DA on neighbourhood graph",
+       fill = "log2FC") +
+  theme_bw(base_size = 11)
+```
+
+::: {.panel-tabset}
+
+### mCh− vs WT
+
+```{r mnc-da-table-neg}
+da_table(milo_mnc$res_neg,
+         caption = "MNC: Milo DA — mCh− vs WT (sorted by SpatialFDR)")
+```
+
+### mCh+ vs WT
+
+```{r mnc-da-table-pos}
+da_table(milo_mnc$res_pos,
+         caption = "MNC: Milo DA — mCh+ vs WT (sorted by SpatialFDR)")
+```
+
+### mCh+ vs mCh−
+
+```{r mnc-da-table-pos-neg}
+da_table(milo_mnc$res_pos_neg,
+         caption = "MNC: Milo DA — mCh+ vs mCh− (sorted by SpatialFDR)")
+```
+
+:::
+
+```{r mnc-milo-cleanup}
+rm(milo_mnc); gc()
+```
+
+:::
+
+---
+
+# Cluster condition purity
+
+For each compartment, `FindClusters` is re-run across a range of resolutions on
+the cached SNN graph. At each resolution and for each cluster, **purity** is the
+fraction of cells belonging to the dominant condition. Points are sized by
+within-resolution rank of cluster size; boxes summarise the purity distribution
+per dominant condition.
+
+```{r purity-setup}
+targets::tar_load(purity_cluster_res)
+
+prep_purity <- function(df) {
+  df %>%
+    dplyr::mutate(
+      resolution = factor(resolution, levels = as.character(purity_cluster_res))
+    ) %>%
+    dplyr::group_by(resolution, cluster) %>%
+    dplyr::summarise(
+      dominant_condition = dominant_condition,
+      n_cells            = n_cells,
+      weighted_purity    = sum(purity * n_cells) / sum(n_cells),
+      .groups            = "drop"
+    ) %>%
+    dplyr::group_by(resolution) %>%
+    dplyr::mutate(
+      n_r      = rank(n_cells),
+      n_scaled = n_r / max(n_r)
+    ) %>%
+    dplyr::ungroup()
+}
+```
+
+::: {.panel-tabset}
+
+## Stroma
+
+```{r purity-stroma-load}
+targets::tar_load(condition_purity_stroma)
+wp2 <- prep_purity(condition_purity_stroma)
+```
+
+```{r purity-stroma-plot, fig.height=4, fig.width=8}
+ggplot(data = wp2,
+       aes(x = as.factor(resolution), y = weighted_purity,
+           fill = dominant_condition)) +
+  geom_boxplot(alpha = 0.3,
+               position = position_dodge(width = 0.9),
+               outliers = FALSE) +
+  geom_jitter(aes(size = n_scaled),
+              alpha = 0.5, shape = 21, color = "black",
+              show.legend = FALSE,
+              position = position_jitterdodge(
+                jitter.width = 0.4, dodge.width = 0.9)) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_size_area(max_size = 3) +
+  labs(x = "Resolution", y = "Weighted mean purity",
+       fill = "Dominant condition") +
+  theme_bw(base_size = 12)
+```
+
+```{r purity-stroma-cleanup}
+rm(condition_purity_stroma, wp2); gc()
+```
+
+## HSC
+
+```{r purity-hsc-load}
+targets::tar_load(names = c(condition_purity_hsc,
+                            mpn_processed_hsc_fullcc,
+                            annotation_recluster_hsc))
+wp2 <- prep_purity(condition_purity_hsc)
+```
+
+```{r}
+mpn_processed_hsc_fullcc <- Seurat::AddMetaData(mpn_processed_hsc_fullcc, 
+                                         annotation_recluster_hsc)
+plot_medoid_pie(mpn_processed_hsc_fullcc,
+                group_var = "res_5",
+                fill_var = "sample.name",
+                pca_name = "pca.SCT", 
+                umap_name = "umap.nn",
+                n_pcs = 50,
+                max_r = 0.5,
+                pie_alpha = 0.5)
+```
+
+
+```{r purity-hsc-plot, fig.height=4, fig.width=8}
+ggplot(data = wp2,
+       aes(x = as.factor(resolution), y = weighted_purity,
+           fill = dominant_condition)) +
+  geom_boxplot(alpha = 0.3,
+               position = position_dodge(width = 0.9),
+               outliers = FALSE) +
+  geom_jitter(aes(size = n_scaled),
+              alpha = 0.5, shape = 21, color = "black",
+              show.legend = FALSE,
+              position = position_jitterdodge(
+                jitter.width = 0.4, dodge.width = 0.9)) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_size_area(max_size = 3) +
+  labs(x = "Resolution", y = "Weighted mean purity",
+       fill = "Dominant condition") +
+  theme_bw(base_size = 12)
+```
+
+```{r}
+ggplot(data = wp2,
+       aes(x = as.factor(resolution), y = weighted_purity,
+           fill = dominant_condition)) +
+  geom_boxplot(alpha = 0.2,color = scales::alpha("black",0.2),
+               position = position_dodge(width = 0.9),
+               outliers = FALSE) +
+  geom_text(aes(size = n_scaled, label = cluster),
+               color = "black",
+              show.legend = FALSE,
+              position = position_jitterdodge(
+                jitter.width = 0.4, dodge.width = 0.9)) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_size_area(max_size = 3) +
+  labs(x = "Resolution", y = "Weighted mean purity",
+       fill = "Dominant condition") +
+  theme_bw(base_size = 12)
+```
+
+```{r purity-hsc-groups-load}
+targets::tar_load(purity_group_hsc)
+```
+
+```{r purity-hsc-groups-umap, fig.height=5, fig.width=14}
+#| fig-cap: "UMAP split by purity group (resolution 10, purity cutoff 0.6). Pure clusters
+#|   are labelled by dominant condition; mixed clusters are labelled Impure."
+groups    <- sort(unique(purity_group_hsc$purity_group))
+group_pal <- c(
+  setNames(scales::hue_pal()(sum(groups != "Impure")), groups[groups != "Impure"]),
+  Impure = "grey70"
+)
+
+ggplot(purity_group_hsc, aes(UMAP1, UMAP2, colour = purity_group)) +
+  geom_point(size = 0.4, stroke = 0, alpha = 0.6) +
+  scale_colour_manual(values = group_pal, name = "Purity group") +
+  facet_wrap(~ purity_group) +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1))) +
+  theme_void(base_size = 11) +
+  theme(strip.text = element_text(size = 10),
+        aspect.ratio = 1)
+```
+
+```{r purity-hsc-cleanup}
+rm(condition_purity_hsc, wp2, purity_group_hsc); gc()
+```
+
+## MNC
+
+```{r purity-mnc-load}
+targets::tar_load(condition_purity_mnc)
+wp2 <- prep_purity(condition_purity_mnc)
+```
+
+```{r purity-mnc-plot, fig.height=4, fig.width=8}
+ggplot(data = wp2,
+       aes(x = as.factor(resolution), y = weighted_purity,
+           fill = dominant_condition)) +
+  geom_boxplot(alpha = 0.3,
+               position = position_dodge(width = 0.9),
+               outliers = FALSE) +
+  geom_jitter(aes(size = n_scaled),
+              alpha = 0.5, shape = 21, color = "black",
+              show.legend = FALSE,
+              position = position_jitterdodge(
+                jitter.width = 0.4, dodge.width = 0.9)) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_size_area(max_size = 3) +
+  labs(x = "Resolution", y = "Weighted mean purity",
+       fill = "Dominant condition") +
+  theme_bw(base_size = 12)
+```
+
+```{r purity-mnc-cleanup}
+rm(condition_purity_mnc, wp2); gc()
+```
+
+:::
+
+---
+
+## References
+
+Dann E, Henderson NC, Teichmann SA, Morgan MD, Marioni JC (2022). *Differential abundance
+testing on single-cell data using k-nearest neighbor graphs.* Nature Methods 19, 747–752.
+<https://doi.org/10.1038/s41592-022-01486-3>

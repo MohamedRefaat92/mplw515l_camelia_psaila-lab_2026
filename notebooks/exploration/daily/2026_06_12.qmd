@@ -1,0 +1,143 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,rownames(mpn_processed_hsc_fullcc) %>% str_subset("^Igf"),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+FeaturePlot(mpn_processed_hsc_fullcc,"Igf1",reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,rownames(mpn_processed_hsc_fullcc) %>% str_subset("^Pdgf"),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c("Ar","Igf1","Vcam1","Pdgfa"),
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.1,
+            order = T)&
+  scale_color_viridis_c(option = "turbo", limits = c(0,3))&
+  RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,rownames(mpn_processed_hsc_fullcc) %>% str_subset("^Col") %>% head(5),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+FeaturePlot(mpn_processed_hsc_fullcc,rownames(mpn_processed_hsc_fullcc) %>% str_subset("^Col") %>% tail(5),reduction = "umap.nn",split.by = "sample.name",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c("HLPDI", "Tgfbi"),
+            reduction = "umap.nn",
+            split.by = "sample.name",pt.size = 0.1, order = T)&
+  scale_color_viridis_c(option = "turbo")&
+  RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c("Kit","Procr","Mecom","Hlf","Mpl","Flt3","Cd34"),
+            reduction = "umap.nn",
+            split.by = "sample.name",
+            pt.size = 0.1,
+            order = T)&
+  scale_color_viridis_c(option = "turbo")&
+  RestoreLegend()
+```
+
+```{r}
+clusts <- c("6", "8","2", "4", "1", "5", "3", "9")
+srt_subset <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.0.9 %in% c(clusts))
+srt_subset <- process_all(srt_subset,
+                  ref_assay     = proc_params$ref_assay,
+                  dims_i        = seq(proc_params$n_pca_dims),
+                  k             = proc_params$k_neighbors,
+                  res           = 0.1,
+                  n_features    = proc_params$n_features,
+                  k.nn          = proc_params$n_umap_neighbors,
+                  exclude_genes = excluded_genes)
+
+
+srt_subset_full_cc <- process_all_cc(srt_subset,
+                  ref_assay     = proc_params$ref_assay,
+                  dims_i        = seq(proc_params$n_pca_dims),
+                  k             = proc_params$k_neighbors,
+                  res           = 0.1,
+                  n_features    = proc_params$n_features,
+                  k.nn          = proc_params$n_umap_neighbors,
+                  exclude_genes = excluded_genes)
+
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.1.5
+x <- FindMarkers(object = mpn_processed_hsc_fullcc, "15", "18")
+```
+
+```{r}
+srt_subset_mchpos <- subset(mpn_processed_hsc_fullcc, sample.name == "HSC_Het_CD41+mCh+" )
+srt_subset_mchpos <- process_all(srt_subset_mchpos,
+                  ref_assay     = proc_params$ref_assay,
+                  dims_i        = seq(proc_params$n_pca_dims),
+                  k             = proc_params$k_neighbors,
+                  res           = 0.1,
+                  n_features    = proc_params$n_features,
+                  k.nn          = proc_params$n_umap_neighbors,
+                  exclude_genes = excluded_genes)
+
+
+srt_subset_mchpos_full_cc <- process_all_cc(srt_subset_mchpos,
+                  ref_assay     = proc_params$ref_assay,
+                  dims_i        = seq(proc_params$n_pca_dims),
+                  k             = proc_params$k_neighbors,
+                  res           = 0.1,
+                  n_features    = proc_params$n_features,
+                  k.nn          = proc_params$n_umap_neighbors,
+                  exclude_genes = excluded_genes)
+
+```
+
+```{r}
+srt_subset_mchneg<- subset(mpn_processed_hsc_fullcc, sample.name == "HSC_Het_CD41+mCh-" )
+srt_subset_mchneg <- process_all(srt_subset_mchneg,
+                  ref_assay     = proc_params$ref_assay,
+                  dims_i        = seq(proc_params$n_pca_dims),
+                  k             = proc_params$k_neighbors,
+                  res           = 0.1,
+                  n_features    = proc_params$n_features,
+                  k.nn          = proc_params$n_umap_neighbors,
+                  exclude_genes = excluded_genes)
+
+
+srt_subset_mchneg_full_cc <- process_all_cc(srt_subset_mchneg,
+                  ref_assay     = proc_params$ref_assay,
+                  dims_i        = seq(proc_params$n_pca_dims),
+                  k             = proc_params$k_neighbors,
+                  res           = 0.1,
+                  n_features    = proc_params$n_features,
+                  k.nn          = proc_params$n_umap_neighbors,
+                  exclude_genes = excluded_genes)
+
+```
+
+```{r}
+clust <- "sNN_pca.SCT_30_res.0.9"
+mpn_processed_hsc_wt_fullcc <- AddMetaData(mpn_processed_hsc_wt_fullcc, 
+                                           mpn_processed_hsc_fullcc@meta.data[colnames(mpn_processed_hsc_wt_fullcc),])
+DimPlot(mpn_processed_hsc_wt_fullcc, group.by = clust, label = TRUE,reduction = "umap.nn")+NoLegend()|DimPlot(srt_subset_mchneg_full_cc, group.by = clust, label = TRUE,reduction = "umap.nn")+NoLegend()|DimPlot(srt_subset_mchpos_full_cc, group.by = clust, label = TRUE,reduction = "umap.nn")+NoLegend()|
+  DimPlot(mpn_processed_hsc_fullcc, group.by = clust, label = TRUE,reduction = "umap.nn")+NoLegend()
+```
+
+```{r}
+mpn_processed_hsc_fullcc$clust_0.9_sample <- paste0(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.0.9,"_",
+                                                    mpn_processed_hsc_fullcc$sample.name)
+Idents(mpn_processed_hsc_fullcc) <- mpn_processed_hsc_fullcc$clust_0.9_sample 
+x <- FindMarkers(object = mpn_processed_hsc_fullcc, 
+                 c("2_HSC_Het_CD41+mCh+", "2_HSC_WT_CD41+"))
+```

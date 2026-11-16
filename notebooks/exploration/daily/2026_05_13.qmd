@@ -1,0 +1,33 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(Seurat)
+```
+
+```{r}
+targets::tar_load(mpn_processed_hsc_fullcc)
+x <- read.csv(file.path("data/sanjuan-pla_2013/41586_2013_BFnature12495_MOESM15_ESM.csv"))
+sets <- ç %>% mutate(dir = ifelse(Ratio>0, "up", "down" ))%>%with(split(Symbol, dir))
+mpn_processed_hsc_fullcc <- AddModuleScore(mpn_processed_hsc_fullcc, features = sets)
+FeaturePlot(mpn_processed_hsc_fullcc,
+            features = c("Cluster1", "Cluster2"),
+            split.by = "sample.name")&
+  RestoreLegend()&
+  scale_color_viridis_c(option = "turbo")
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            features = sets$up[sets$up %in% rownames(mpn_processed_hsc_fullcc)],
+            pt.size = 0.01,
+            ncol = 6)&
+  scale_color_viridis_c(option = "turbo")&
+  theme(title = element_text(size = 4),legend.position = "none")&
+  theme_void()&NoLegend()
+
+```
+
+

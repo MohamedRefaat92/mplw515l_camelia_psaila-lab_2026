@@ -1,0 +1,45 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Ctss"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Sptb"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Blvrb", "Abcb4", "Ces2g", "Aqp1"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+Nebulosa::plot_density(subset(mpn_processed_hsc_fullcc,sample.name == "HSC_Het_CD41+mCh+"),features = c("Ces2g", "Aqp1"),joint = TRUE)/Nebulosa::plot_density(subset(mpn_processed_hsc_fullcc,sample.name == "HSC_Het_CD41+mCh-"),features = c("Ces2g", "Aqp1"),joint = TRUE)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Blvrb", "Abcb4"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo", limit = c(0,2))&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Csf3", "Errfi1", "Itgav", "Fosl2"),reduction = "umap.nn",pt.size = 0.01, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Socs2", "Socs3"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Raph1", "Mir22hg", "Tgfbi"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Fgf3","Fgfr1","Fgf12"),reduction = "umap.nn",pt.size = 0.1, order = T,split.by = "sample.name")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Cxcr4")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)
+```

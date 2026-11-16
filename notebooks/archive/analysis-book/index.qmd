@@ -1,0 +1,72 @@
+---
+title: "Overview"
+---
+
+```{r setup}
+#| include: false
+library(knitr)
+library(yaml)
+cfg <- yaml::read_yaml(file.path("metadata/project_config.yaml"))
+```
+
+## Run parameters
+
+All values read directly from `metadata/project_config.yaml`.
+
+```{r params}
+flatten_config <- function(x, prefix = "") {
+  rows <- list()
+  for (nm in names(x)) {
+    key <- if (nzchar(prefix)) paste0(prefix, ".", nm) else nm
+    val <- x[[nm]]
+    if (is.list(val) && !is.null(names(val))) {
+      rows <- c(rows, flatten_config(val, key))
+    } else {
+      rows <- c(rows, list(data.frame(
+        Parameter = key,
+        Value     = paste(unlist(val), collapse = ", "),
+        stringsAsFactors = FALSE
+      )))
+    }
+  }
+  rows
+}
+
+cfg_df <- do.call(rbind, flatten_config(cfg))
+knitr::kable(cfg_df, row.names = FALSE)
+```
+
+## Chapters
+
+| Chapter | Samples | Description |
+|---|---|---|
+| Full cohort | Rx_1–8 | All samples processed together |
+| Stroma | Rx_1, Rx_2 | Stromal compartment |
+| HSC | Rx_3, Rx_4, Rx_5 | Haematopoietic stem cells |
+| MNC | Rx_6, Rx_7, Rx_8 | Mononuclear cells |
+| HSC + MNC | Rx_3–8 | Combined haematopoietic compartment |
+
+## Pipeline summary
+
+```{r pipeline-summary}
+#| results: asis
+cat("
+**Data loading**: CellRanger output read per sample and merged.
+
+**QC**: Mitochondrial, ribosomal and haemoglobin percentages computed.
+Cells filtered on `nFeature_RNA`, `percent.mt`, `percent.rp`, `percent.hb`.
+
+**HTO demultiplexing**: deMULTIplex2 run on raw HTO counts.
+Classes removed: **", paste(unlist(cfg$qc$remove_hto_classes), collapse = ", "), "**
+(empty = all retained).
+
+**Doublet detection**: scDblFinder run per sample on QC-filtered cells.
+Doublets", if (cfg$qc$remove_doublets) "**removed**" else "**retained**", ".
+
+**Processing**: Normalisation (", if (cfg$processing$ref_assay == "SCT") "SCTransform" else "lognorm", ") → HVG selection → PCA →
+Harmony batch correction (`batch_factor =", cfg$processing$batch_factor, "`) →
+SNN graph → Leiden clustering → UMAP.
+
+**Markers**: FindAllMarkers (Wilcoxon, presto) on res 0.3 clusters.
+")
+```

@@ -1,0 +1,283 @@
+---
+output: html_document
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+# Cell Cycle
+
+Phase distribution per sample, and comparison of regression strategies.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(targets)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r load}
+targets::tar_load(proc_params)
+targets::tar_load(excluded_genes)
+
+SUBSET_NAMES  <- c("stroma", "hsc", "mnc")
+CC_STRATEGIES <- c("none", "full", "diff")
+REF_ASSAY     <- proc_params$ref_assay
+PCA_NAME      <- paste0("pca.", REF_ASSAY)
+N_DIMS        <- proc_params$n_pca_dims
+K             <- proc_params$k_neighbors
+K_UMAP        <- proc_params$n_umap_neighbors
+RES_TARGET    <- proc_params$marker_resolution
+PHASE_COLS    <- c("G1" = "#4daf4a", "S" = "#225ea8", "G2M" = "#e41a1c")
+RES_PAT       <- paste0("_res\\.", gsub("\\.", "\\\\.", RES_TARGET), "$")
+```
+
+```{r helpers}
+# Run one CC strategy on a clean Seurat object.
+# Returns a minimal list with only what is needed for plotting:
+#   - metadata: Phase, sample.name, cluster column
+#   - umap embeddings
+run_strategy <- function(srt, strategy) {
+  if (strategy == "diff")
+    srt[["CC.Difference"]] <- srt$S.Score - srt$G2M.Score
+
+  vars_reg <- switch(strategy,
+    "none" = NULL,
+    "full" = c("S.Score", "G2M.Score"),
+    "diff" = "CC.Difference"
+  )
+
+  suppressMessages(invisible(
+    srt <- preprocess_seurat(srt,
+                              ref_assay       = REF_ASSAY,
+                              n_features      = proc_params$n_features,
+                              exclude_genes   = excluded_genes,
+                              vars_to_regress = vars_reg)
+  ))
+
+  suppressMessages(invisible(
+    srt <- find_neighbors_clusters(srt,
+                                    dims_i    = seq(N_DIMS),
+                                    ref_assay = REF_ASSAY,
+                                    k         = K,
+                                    res       = RES_TARGET)
+  ))
+
+  nn_name <- paste0("neighbors_", PCA_NAME, "_", K)
+  suppressMessages(invisible(
+    srt <- Seurat::RunUMAP(srt,
+                            nn.name        = nn_name,
+                            n.neighbors    = K_UMAP,
+                            reduction.name = "umap.nn",
+                            return.model   = FALSE,
+                            verbose        = FALSE)
+  ))
+
+  clust_col <- grep(RES_PAT, colnames(srt@meta.data), value = TRUE)[1]
+  umap_emb  <- as.data.frame(Seurat::Embeddings(srt, "umap.nn"))
+  colnames(umap_emb) <- c("UMAP_1", "UMAP_2")
+
+  result <- list(
+    meta = srt@meta.data[, c("sample.name", "Phase", clust_col)],
+    umap = umap_emb,
+    clust_col = clust_col
+  )
+  rm(srt); gc()
+  result
+}
+```
+
+```{r run-all, message=FALSE, warning=FALSE, results='hide'}
+# Process one subset at a time: load → run 3 strategies → extract → discard.
+# Only lightweight metadata + UMAP coordinates are kept in all_results.
+all_results   <- list()
+phase_meta_list <- list()   # for section 1 (phase bar, needs only raw meta)
+
+for (subset_name in SUBSET_NAMES) {
+  message("=== ", subset_name, " ===")
+
+  tar_target_name <- paste0("mpn_clean_", subset_name)
+  targets::tar_load(tar_target_name)
+  srt_clean <- get(tar_target_name)
+
+  # Section 1 data: raw metadata before any processing
+  phase_meta_list[[subset_name]] <- srt_clean@meta.data[, c("sample.name", "Phase")]
+
+  # Run all strategies, keeping only extracted results
+  all_results[[subset_name]] <- lapply(
+    setNames(CC_STRATEGIES, CC_STRATEGIES),
+    function(strat) {
+      message("  strategy: ", strat)
+      run_strategy(srt_clean, strat)
+    }
+  )
+
+  rm(srt_clean, list = tar_target_name)
+  gc()
+}
+```
+
+## 1. Phase distribution per sample
+
+`Phase` was scored inside `add_qc_flags()` on the full merged object, so it is
+already present on each clean subset.
+
+::: {.panel-tabset}
+
+```{r phase-bar, results='asis', echo=FALSE, fig.width=7, fig.height=4}
+for (subset_name in SUBSET_NAMES) {
+  cat("###", subset_name, "\n\n")
+
+  p <- phase_meta_list[[subset_name]] |>
+    count(sample.name, Phase) |>
+    group_by(sample.name) |>
+    mutate(pct = 100 * n / sum(n)) |>
+    ungroup() |>
+    ggplot(aes(x = sample.name, y = pct, fill = Phase)) +
+    geom_col(alpha = 0.85) +
+    scale_fill_manual(values = PHASE_COLS) +
+    labs(title = paste0("Cell-cycle phase distribution — ", subset_name),
+         x = NULL, y = "% cells") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  print(p)
+  cat("\n\n")
+}
+```
+
+:::
+
+## 2. Phase on UMAP (pipeline run)
+
+UMAP from the pipeline (`processed_<subset>`) can be loaded here if available,
+but the regression comparison below runs its own UMAP for fair comparison.
+Skip this section if the pipeline hasn't been run yet.
+
+```{r phase-umap}
+#| eval: TRUE
+# Load pipeline-processed objects for a given subset (edit subset_name as needed)
+subset_name <- "stroma"   # "stroma" | "hsc" | "mnc"
+umap_name <- "umap.nn"
+targets::tar_load(paste0("mpn_processed_", subset_name))
+srt_proc <- get(paste0("mpn_processed_", subset_name))
+
+p_phase_raw <- Seurat::DimPlot(
+  srt_proc, group.by = "Phase",
+  cols      = PHASE_COLS,
+  reduction = umap_name, pt.size = 0.3
+)
+lean_dimplot(p_phase_raw, colour_col = "Phase",
+             cols = PHASE_COLS,
+             legend_title = "Phase")
+```
+
+## 3. Regression comparison
+
+Compare three strategies for handling the cell-cycle signal.
+Each strategy runs `preprocess_seurat()` with different regression choices,
+then clusters and plots.
+
+Strategies:
+
+- `"none"`: no regression (pipeline default)
+- `"full"`: regress out `S.Score` and `G2M.Score`
+- `"diff"`: regress out the difference score only (`S.Score - G2M.Score`)
+
+### Phase on UMAP
+
+::: {.panel-tabset}
+
+```{r cc-umap-panel, results='asis', echo=FALSE, fig.width=12, fig.height=4}
+for (subset_name in SUBSET_NAMES) {
+  cat("###", subset_name, "\n\n")
+
+  plots <- list()
+  for (strat in CC_STRATEGIES) {
+    res        <- all_results[[subset_name]][[strat]]
+    df         <- cbind(res$umap, Phase = res$meta$Phase)
+    plots[[strat]] <- ggplot(df, aes(x = UMAP_1, y = UMAP_2, colour = Phase)) +
+      geom_point(size = 0.3, alpha = 0.6) +
+      scale_colour_manual(values = PHASE_COLS) +
+      labs(title = paste0("Phase (CC regression: ", strat, ")")) +
+      theme_bw() +
+      theme(legend.position = "bottom")
+  }
+  print(wrap_plots(plots, ncol = length(CC_STRATEGIES)))
+  cat("\n\n")
+}
+```
+
+:::
+
+### Clusters on UMAP
+
+::: {.panel-tabset}
+
+```{r cc-cluster-panel, results='asis', echo=FALSE, fig.width=12, fig.height=4}
+for (subset_name in SUBSET_NAMES) {
+  cat("###", subset_name, "\n\n")
+
+  plots <- list()
+  for (strat in CC_STRATEGIES) {
+    res      <- all_results[[subset_name]][[strat]]
+    clust    <- res$meta[[res$clust_col]]
+    n_cl     <- nlevels(factor(clust))
+    df       <- cbind(res$umap, cluster = clust)
+    plots[[strat]] <- ggplot(df, aes(x = UMAP_1, y = UMAP_2, colour = cluster)) +
+      geom_point(size = 0.3, alpha = 0.6) +
+      labs(title = paste0(strat, "  (", n_cl, " clusters)")) +
+      theme_bw() +
+      theme(legend.position = "none")
+  }
+  print(wrap_plots(plots, ncol = length(CC_STRATEGIES)))
+  cat("\n\n")
+}
+```
+
+:::
+
+## 4. Phase composition per cluster
+
+Compare how phase mix differs across clusters in the no-regression run.
+
+::: {.panel-tabset}
+
+```{r phase-per-cluster, results='asis', echo=FALSE, fig.width=7, fig.height=4}
+for (subset_name in SUBSET_NAMES) {
+  cat("###", subset_name, "\n\n")
+  res       <- all_results[[subset_name]][["none"]]
+  clust_col <- res$clust_col
+
+  p <- res$meta |>
+    count(.data[[clust_col]], Phase) |>
+    rename(cluster = 1) |>
+    group_by(cluster) |>
+    mutate(pct = round(100 * n / sum(n), 1)) |>
+    ungroup() |>
+    ggplot(aes(x = cluster, y = pct, fill = Phase)) +
+    geom_col(alpha = 0.85) +
+    scale_fill_manual(values = PHASE_COLS) +
+    labs(title = paste0("Phase composition per cluster — ", subset_name,
+                        paste0(" (no CC regression, res ", RES_TARGET, ")")),
+         x = "Cluster", y = "% cells") +
+    theme_bw()
+  print(p)
+  cat("\n\n")
+}
+```
+
+:::
+
+{{< include ../_session-info.qmd >}}

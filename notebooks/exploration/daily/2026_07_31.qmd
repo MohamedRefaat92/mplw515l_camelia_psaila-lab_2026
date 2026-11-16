@@ -1,0 +1,94 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+# remotes::install_github("da-bar/JASPAR")   # R packages come from renv (scripts/R/install-r-packages.R)
+
+```
+
+```{r}
+library(JASPAR)
+library(RSQLite)
+library(TFBSTools)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(EnsDb.Mmusculus.v79)
+JASPAR <- JASPAR()
+JASPARConnect <- RSQLite::dbConnect(RSQLite::SQLite(), db(JASPAR))
+
+pfm_set <- TFBSTools::getMatrixSet(
+  x    = JASPARConnect,
+  opts = list(collection  = "CORE",
+              tax_id      = list(10090),   # Mus musculus
+              all_versions = FALSE,
+              matrixtype  = "PFM")
+)
+dbDisconnect(JASPARConnect)
+
+cat("Motifs loaded:", length(pfm_set), "\n")
+
+```
+
+```{r}
+EnsDb = EnsDb.Mmusculus.v79::EnsDb.Mmusculus.v79
+```
+
+```{r}
+species_genome = "mm10"
+motif_genes = rownames(mpn_processed_hsc_fullcc)
+```
+
+```{r}
+
+gene.promoters <- ensembldb::promoters(EnsDb)
+gene.coords <- ensembldb::genes(EnsDb)
+#gene.promoters <- gene.promoters[gene.promoters$tx_biotype == "protein_coding"]
+#gene.coords <- gene.coords[gene.coords$gene_biotype == "protein_coding"]
+gene.promoters <- gene.promoters[as.character(GenomeInfoDb::seqnames(gene.promoters)) %in% c(1:100, "X", "Y")]
+gene.coords <- gene.coords[as.character(GenomeInfoDb::seqnames(gene.coords)) %in% c(1:22, "X", "Y")]
+gene.promoters$symbol <- gene.coords$symbol[base::match(gene.promoters$gene_id, names(gene.coords))]
+gene.promoters <- GenomeInfoDb::keepSeqlevels(gene.promoters, 
+                                              value = levels(droplevels(GenomeInfoDb::seqnames(gene.promoters))))
+old_levels <- levels(GenomeInfoDb::seqnames(gene.promoters))
+new_levels <- paste0("chr", old_levels)
+gene.promoters <- GenomeInfoDb::renameSeqlevels(gene.promoters, new_levels)
+GenomeInfoDb::genome(gene.promoters) <- species_genome
+my_promoters <- GRanges(seqnames = droplevels(GenomeInfoDb::seqnames(gene.promoters)), 
+                        IRanges(start = start(gene.promoters), 
+                                end = end(gene.promoters)), 
+                        symbol = gene.promoters$symbol,
+                        biotype = gene.promoters$tx_biotype,
+                        genome = species_genome)
+
+my_promoters <- my_promoters[my_promoters$symbol %in% motif_genes]
+
+print("Matching motifs...")
+motif_ix <- motifmatchr::matchMotifs(pfm_set,
+                                     my_promoters,
+                                     genome = species_genome)
+tf_match <- motifmatchr::motifMatches(motif_ix)
+motif_df <- purrr::map_df(pfm_set, function(x){
+  data.frame(motif_name = x@name, motif_ID = x@ID)
+  })
+
+rownames(tf_match) <- my_promoters$symbol
+colnames(tf_match) <- motif_df$motif_ID
+
+print("Getting putative TF target genes...")
+motif_gene_symbols <- rownames(tf_match)
+tf_targets <- apply(tf_match, 2, function(x){ unique(motif_gene_symbols[x]) })
+n_targets <- lengths(tf_targets)
+
+motif_df <- motif_df %>% 
+  add_column(n_targets = n_targets[motif_df$motif_ID]) %>%
+  mutate(gene_name = motif_name) %>%
+  separate_longer_delim(cols = gene_name,
+                        delim = "::")
+```
+
+
+

@@ -1,0 +1,815 @@
+---
+title: "Differential Expression — Stroma"
+author:
+  - name: Mohamed R. Shoeb
+    email: mohamed.shoeb@ludwig.ox.ac.uk
+date: today
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+    include-after-body:
+      text: |
+        <style>
+        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
+        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
+        </style>
+        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
+        <script>
+        document.addEventListener('DOMContentLoaded',function(){
+          document.addEventListener('click',function(e){
+            var img=e.target;
+            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
+              document.getElementById('ql-img').src=img.src;
+              document.getElementById('ql-overlay').style.display='block';
+              e.preventDefault();
+            }
+          });
+          document.addEventListener('keydown',function(e){
+            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
+          });
+        });
+        </script>
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+# Introduction
+
+This notebook explores the output of cluster-based differential expression analysis for bone marrow stromal cells (Stroma) to achieve the following goals:
+
+-   Identify and order a set of unique genes that mark each cluster.
+
+-   Find condition-specific gene activity in each cluster (heterozygous *Mpl* mutant vs WT).
+
+The notebook is organized into three sections:
+
+1.  Data preview: since the notebook explores a cluster-based analysis, I start by showing the clusters on the UMAP embedding of the data and provide context based on the conditions and expression of canonical markers.
+
+2.  Cluster markers: prioritize and identify a set of unique genes for each cluster by looking at the number of potential markers and their statistics, then look at their expression pattern across clusters.
+
+3.  Condition markers: identify genes that are differentially expressed in the Het condition with respect to WT within each cluster.
+
+Notes:
+-   The notebook is shipped with the data that can be downloaded.
+-   The tool I used for differential expression analysis is [DElegate](https://github.com/cancerbits/DElegate) from my previous lab to make use of pseudo-bulk and pseudo-replicate testing.
+-   Visualizing gene expression on a UMAP with large number of cells can be obscured or biased by overplotting or cluster order. To mitigate this effect, I randomly shuffle the order of cells in the expression plot. Additionally, I add another version of the plots with cells ordered by expression to make low expressed genes more visible.
+-   Each plot has the source data that can be downloaded and explored outside the notebook.
+-   Click on the figures to zoom in for better readability of the labels.
+
+```{r setup, cache=FALSE}
+library(Seurat)
+library(ggplot2)
+library(ggrepel)
+library(plotly)
+library(htmltools)
+library(dplyr)
+library(tidyr)
+library(DT)
+library(targets)
+library(tidyverse)
+library(patchwork)
+library(stringr)
+library(dendsort)
+library(ggwordcloud)
+
+ggplot2::theme_set(cowplot::theme_cowplot())
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r helpers}
+tar_load(gradientn_pals)
+
+dl_btn <- function(df, filename = "data.csv", label = "⬇ Source data") {
+  invisible(NULL)
+}
+```
+
+# Data preview
+
+To aid interpretation of the downstream results, I start by giving a quick preview of Stroma UMAP colored and labelled at the clustering resolution used in differential expression testing throughout the notebook.
+
+```{r}
+clust_marker_res <- "sNN_pca.SCT_30_res.0.9"
+clust_marker_0.9 <- targets::tar_read(cluster_markers_res_lst_stroma)[[clust_marker_res]]
+targets::tar_load(mpn_processed_stroma)
+clust_0.9_order <- sort(unique(as.character(mpn_processed_stroma@meta.data[[clust_marker_res]])),
+                         method = "radix")
+mpn_processed_stroma$sNN_pca.SCT_30_res.0.9 <- factor(
+  mpn_processed_stroma$sNN_pca.SCT_30_res.0.9, levels = rev(clust_0.9_order))
+clust_n    <- sort(unique(mpn_processed_stroma@meta.data[[clust_marker_res]]))
+pal_n      <- scales::hue_pal()(length(clust_n))
+clust_cols <- setNames(pal_n, clust_n)
+```
+
+```{r, fig.width=9, fig.height=8}
+plot_umap_groups_ext(mpn_processed_stroma, clust_marker_res, label = TRUE, label_size = 6) &
+  NoLegend()
+```
+
+And how the cells of the different conditions are distributed across the clusters.
+
+```{r, fig.width=14, fig.height=8}
+plot_umap_groups_ext(mpn_processed_stroma, clust_marker_res,
+                     split.by = "sample.name", label = TRUE, label_size = 5, bg.size = 0) &
+  NoLegend()
+```
+
+Finally, let's also visualize the expression of a short list of canonical stromal markers to guide our understanding of what each cluster might represent.
+
+```{r, fig.width=14, fig.height=14}
+markers_canonical_short <- c(
+  "Col1a1",  # Fibroblast / MSC
+  "Col1a2",  # Fibroblast / MSC
+  "Pdgfra",  # MSC / adipogenic
+  "Lepr",    # MSC / LepR+ niche
+  "Cxcl12",  # MSC / niche
+  "Kitl",    # MSC / niche
+  "Acta2",   # Pericyte / smooth muscle
+  "Pecam1",  # Endothelial
+  "Cdh5",    # Endothelial
+  "Runx2",   # Osteoblast
+  "Bglap",   # Osteoblast
+  "Pparg"    # Adipocyte
+)
+
+plot_srt_ctr_stacked_vln(mpn_processed_stroma,
+                         clust_id = clust_marker_res,
+                         feats    = markers_canonical_short,
+                         cols     = clust_cols)
+```
+
+UMAP plots of the normalized expression of the set of canonical markers ...
+
+```{r, fig.width=14, fig.height=11}
+plot_umap_feature_ext(mpn_processed_stroma, features = markers_canonical_short,
+                      cell_order = "shuffle", outline = FALSE, ncol = 4) &
+  scale_color_viridis_c(option = "turbo")
+```
+
+...and another version of the same set of plots with cells ordered by expression.
+
+```{r, fig.width=14, fig.height=11}
+plot_umap_feature_ext(mpn_processed_stroma, features = markers_canonical_short,
+                      cell_order = "expression", outline = FALSE, ncol = 4) &
+  scale_color_viridis_c(option = "turbo")
+```
+
+# Cluster markers
+
+The idea is instead of identifying markers by comparing the cells of each cluster to the rest (each vs rest), we do it by running comparisons against each other cluster individually. Thus, a good marker of a cluster is expected to come out as differentially up-regulated compared to the majority of other clusters. The rational for this approach is that comparing individual clusters is more meaningful because they represent homogeneous group of cells and are of comparable sizes.
+
+Start by setting the significance cutoffs for cluster markers comparisons based on the log2 fold change, p-adjusted value, and the number of cells in which the gene is expressed in the reference cluster.
+
+```{r}
+marker_logfc  <- 1
+marker_padj   <- 1e-5
+marker_n_expr <- 20
+```
+
+Let's load the raw output of differential expression analysis and apply the significance thresholding...
+
+```{r}
+clust_sizes <- table(mpn_processed_stroma@meta.data[[clust_marker_res]]) |>
+  as.integer() |>
+  setNames(names(table(mpn_processed_stroma@meta.data[[clust_marker_res]])))
+
+clust_marker_0.9 <- clust_marker_0.9 %>%
+  mutate(group1 = factor(group1, levels = clust_0.9_order),
+         n_cells = clust_sizes[as.character(group1)],
+         n_expr  = round(rate1 * n_cells),
+         n_cells = NULL,
+         sig = log_fc >= marker_logfc & padj <= marker_padj & n_expr >= marker_n_expr)
+```
+
+then summarize the comparisons per gene in each reference cluster.
+
+```{r}
+marker_delegate_summary <- clust_marker_0.9 %>%
+  group_by(feature, group1) %>%
+  summarize(rate1         = unique(rate1),
+            rate2_median  = median(rate2),
+            rate2_max     = max(rate2),
+            group1_is_max = rate1 > rate2_max,
+            n             = dplyr::n(),
+            n_sig         = sum(sig),
+            sig_groups    = paste0(unique(group2[sig]),    collapse = ","),
+            notsig_groups = paste0(unique(group2[!sig]),   collapse = ","),
+            prop_sig      = n_sig / n,
+            median_padj   = median(padj),
+            median_logfc  = median(log_fc),
+            min_padj      = min(padj),
+            max_logfc     = max(log_fc),
+            rel_rate      = rate1 / rate2_median) %>%
+  ungroup() %>%
+  group_by(feature) %>%
+  mutate(n_sig_other = sum(n_sig) - n_sig,
+         n_sig_rel   = n_sig / (1 + n_sig_other)) %>%
+  ungroup() %>%
+  arrange(-(median_logfc * n_sig))
+```
+
+Significant markers across all clusters — filterable and downloadable as CSV.
+
+```{r marker-clust-sig-dt, echo=FALSE}
+DT::datatable(
+  marker_delegate_summary %>%
+    filter(n_sig >= 3, median_logfc > 0) %>%
+    select(cluster = group1, gene = feature, n_sig, prop_sig,
+           median_logfc, median_padj, rate_ref = rate1, sig_vs = sig_groups) %>%
+    mutate(across(c(prop_sig, median_logfc, median_padj, rate_ref), ~round(.x, 3))) %>%
+    arrange(cluster, desc(n_sig)),
+  rownames = FALSE, filter = "top", extensions = "Buttons",
+  options = list(pageLength = 20, scrollX = TRUE, dom = "Bfrtip",
+                 buttons = list(list(extend = "csv", filename = "cluster_markers_sig_stroma")))
+)
+```
+
+## Marker numbers
+
+We first start by generally exploring the number of hits resulting from the different comparisons.
+
+```{r marker-clust-nsig-wide-table}
+nsig_wide <- marker_delegate_summary %>%
+  dplyr::select(feature, group1, n_sig) %>%
+  mutate(group1 = factor(group1, levels = clust_0.9_order)) %>%
+  arrange(group1, -n_sig) %>%
+  pivot_wider(names_from = group1, values_from = n_sig)
+
+DT::datatable(
+  nsig_wide,
+  rownames   = FALSE, filter = "top", extensions = "Buttons",
+  options    = list(pageLength = 20, scrollX = TRUE, dom = "Bfrtip",
+                    buttons = list(list(extend = "csv", filename = "marker_nsig_wide")))
+)
+```
+
+```{r, echo=FALSE}
+dl_btn(nsig_wide, "nsig_wide.csv")
+```
+
+For each reference cluster, the heatmap below shows how many genes are significantly upregulated against exactly N compared clusters.
+
+```{r clust-markers-nsig-heatmap, fig.width=11, fig.height=7}
+nsig_hm_base <- marker_delegate_summary %>%
+  filter(median_logfc > 0) %>%
+  count(group1, n_sig, name = "n_genes") %>%
+  complete(group1, n_sig = 0:max(n_sig), fill = list(n_genes = 0L)) %>%
+  group_by(group1) %>%
+  mutate(pct = n_genes / sum(n_genes)) %>%
+  ungroup()
+
+make_nsig_hm <- function(df) {
+  df %>%
+    mutate(n_sig = factor(n_sig, levels = sort(unique(n_sig), decreasing = TRUE))) %>%
+    ggplot(aes(x = group1, y = n_sig, fill = pct)) +
+    geom_tile(colour = "white", linewidth = 0.4) +
+    geom_text(aes(label = n_genes), size = 2.8, colour = "black") +
+    scale_fill_viridis_c(option = "mako", direction = -1,
+                         name = "Fraction\nwithin\ncluster",
+                         labels = scales::percent_format(accuracy = 1)) +
+    labs(x = "Reference cluster", y = "Significant in N compared clusters") +
+    theme_bw(base_size = 11) +
+    theme(panel.grid = element_blank(), axis.text.x = element_text(hjust = 0.5))
+}
+
+make_nsig_hm(filter(nsig_hm_base, n_sig > 0))
+```
+
+```{r, echo=FALSE}
+dl_btn(nsig_hm_base, "nsig_heatmap.csv")
+```
+
+Pairwise overlap of up-regulated marker genes significant in ≥ 10 comparisons — each cell shows how many genes are shared markers between two clusters.
+
+```{r clust-markers-overlap-heatmap, fig.width=11, fig.height=9}
+sig_10 <- marker_delegate_summary %>%
+  filter(n_sig >= 10, median_logfc > 0) %>%
+  select(feature, group1)
+
+overlap_mat <- sig_10 %>%
+  inner_join(sig_10, by = "feature", suffix = c("_A", "_B"), relationship = "many-to-many") %>%
+  count(group1_A, group1_B, name = "n_overlap") %>%
+  tidyr::complete(group1_A = clust_0.9_order, group1_B = clust_0.9_order,
+                  fill = list(n_overlap = 0L)) %>%
+  tidyr::pivot_wider(names_from = group1_B, values_from = n_overlap, values_fill = 0L) %>%
+  tibble::column_to_rownames("group1_A") %>%
+  as.matrix()
+overlap_mat <- overlap_mat[clust_0.9_order, clust_0.9_order]
+
+as.data.frame(as.table(overlap_mat)) %>%
+  dplyr::rename(clust_A = Var1, clust_B = Var2, n = Freq) %>%
+  dplyr::mutate(clust_A = factor(clust_A, levels = rev(clust_0.9_order)),
+                clust_B = factor(clust_B, levels = clust_0.9_order)) %>%
+  ggplot(aes(x = clust_B, y = clust_A, fill = n)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  geom_text(aes(label = n), size = 2.5, colour = "black") +
+  scale_fill_viridis_c(option = "mako", direction = -1, name = "Shared\ngenes") +
+  labs(x = "Cluster", y = "Cluster", caption = "Upregulated marker genes with n_sig ≥ 10") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(hjust = 0.5))
+```
+
+```{r, echo=FALSE}
+dl_btn(as.data.frame(as.table(overlap_mat)), "overlap_nsig10.csv")
+```
+
+## Marker statistics
+
+After looking at the number of markers passing hard cutoffs, we can now move on to explore their statistics.
+
+```{r}
+marker_prop         <- 0.05
+marker_median_logfc <- 0
+
+marker_clust_sig <- marker_delegate_summary %>%
+  filter(prop_sig >= marker_prop & median_logfc >= marker_median_logfc) %>%
+  group_by(group1) %>%
+  mutate(padj_r        = rank(-median_padj),
+         padj_r_scaled = (padj_r / max(padj_r))^2) %>%
+  ungroup()
+```
+
+
+```{r, fig.width=20, fig.height=10}
+marker_top_lfc <- 4
+marker_clust_sig %>%
+  arrange(prop_sig) %>%
+  ggplot(aes(group1, median_logfc, label = feature)) +
+  geom_jitter(aes(size = padj_r_scaled, color = prop_sig), width = 0.3, alpha = 0.5) +
+  scale_color_viridis_c(option = "turbo", name = "Proportion\nof significant\ntests") +
+  scale_size(range = c(0.1, 1), name = "Scaled rank\nof median\npadj value") +
+  ggrepel::geom_text_repel(data = . %>% filter(median_logfc > marker_top_lfc),
+                           size = 3, segment.color = scales::alpha("grey40", 0.5),
+                           min.segment.length = 0, max.overlaps = 20,
+                           point.size = NA, force = 0.3) +
+  xlab("Reference cluster") + ylab("Gene median logFC")
+```
+
+```{r, echo=FALSE}
+dl_btn(marker_clust_sig, "cluster_markers_jitter.csv")
+```
+
+::: panel-tabset
+```{r clust-markers-volcano-prep}
+vol_marker_df <- marker_delegate_summary %>%
+  mutate(sig       = median_logfc >= marker_logfc & median_padj <= marker_padj,
+         neg_log_p = pmin(-log10(median_padj), 50))
+label_n <- 100
+```
+
+```{r clust-markers-volcano-tabs, results="asis", fig.height=8, fig.width=12}
+for (cl in clust_0.9_order) {
+  cat("##", cl, "\n\n")
+  df_cl <- filter(vol_marker_df, group1 == cl, median_logfc >= 0)
+  p <- ggplot(df_cl, aes(x = median_logfc, y = neg_log_p)) +
+    geom_vline(xintercept = marker_logfc,      colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    geom_hline(yintercept = -log10(marker_padj), colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    geom_point(data = ~filter(.x, !sig), aes(size = rate1),
+               fill = "grey80", colour = "white", shape = 21, alpha = 0.5) +
+    geom_point(data = ~filter(.x, sig),  aes(size = rate1),
+               fill = "#D73027", colour = "white", shape = 21, alpha = 0.5) +
+    ggrepel::geom_text_repel(
+      data         = ~.x %>% filter(sig) %>% slice_max(median_logfc, n = label_n),
+      aes(label    = feature),
+      size         = 2.5, max.overlaps = label_n, show.legend = FALSE,
+      segment.size = 0.3, segment.colour = "grey60",
+      xlim         = c(marker_logfc, Inf), ylim = c(-log10(marker_padj), Inf)
+    ) +
+    scale_x_continuous(expand = expansion(mult = 0.05)) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_size_continuous(name = "Detection\nrate (cluster)", range = c(0.3, 2)) +
+    labs(x = "Median log FC", y = "-log₁₀(median padj)", title = paste("Cluster", cl),
+         caption = paste0("Dashed: log FC = ", marker_logfc, ", padj = ", marker_padj,
+                          "  |  Labels: top ", label_n, " sig by log FC")) +
+    theme_bw(base_size = 11) + theme(legend.position = "right")
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r, echo=FALSE}
+dl_btn(filter(vol_marker_df, sig), "cluster_markers_volcano_sig.csv")
+```
+
+::: panel-tabset
+```{r clust-markers-wordcloud, results="asis", fig.width=10, fig.height=7}
+wc_df <- vol_marker_df %>%
+  filter(sig, median_logfc >= 0) %>%
+  group_by(group1) %>%
+  mutate(padj_r        = rank(-median_padj),
+         padj_r_scaled = (padj_r / max(padj_r))^2) %>%
+  slice_max(median_logfc, n = label_n / 2) %>%
+  ungroup()
+
+for (cl in clust_0.9_order) {
+  cat("##", cl, "\n\n")
+  df_cl <- filter(wc_df, group1 == cl)
+  if (nrow(df_cl) == 0) { cat("*No genes passed the significance threshold.*\n\n"); next }
+  set.seed(42)
+  p <- ggplot(df_cl, aes(label = feature, size = padj_r_scaled, color = prop_sig)) +
+    geom_text_wordcloud(rm_outside = TRUE) +
+    scale_size(range = c(5, 13)) +
+    scale_color_viridis_c(option = "mako", name = "Proportion\nsignificant") +
+    labs(title = paste("Cluster", cl)) +
+    theme_minimal(base_size = 11)
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r, echo=FALSE}
+dl_btn(wc_df, "cluster_markers_wordcloud.csv")
+```
+
+## Marker expression
+
+```{r}
+mpn_processed_stroma$sNN_pca.SCT_30_res.0.9 <- factor(
+  mpn_processed_stroma$sNN_pca.SCT_30_res.0.9, levels = rev(clust_0.9_order))
+```
+
+Pick top candidate cluster marker per group based on the number of significant comparisons and average logfc.
+
+```{r clust-markers-stacked-vln, fig.width=25, fig.height=18}
+n_marker  <- 3
+min_rate  <- 0.05
+gene_clust_df <- marker_delegate_summary %>%
+  filter(group1_is_max, rate1 >= min_rate) %>%
+  arrange(group1) %>%
+  group_by(group1) %>%
+  slice_head(n = n_marker) %>%
+  ungroup() %>%
+  select(feature, group1) %>%
+  distinct(feature, .keep_all = TRUE)
+marker_cluster_top <- gene_clust_df$feature
+
+clust_n    <- sort(unique(mpn_processed_stroma@meta.data[[clust_marker_res]]))
+pal_n      <- scales::hue_pal()(length(clust_n))
+clust_cols <- setNames(pal_n, clust_n)
+
+plot_srt_ctr_stacked_vln(mpn_processed_stroma,
+                         clust_id = clust_marker_res,
+                         feats    = marker_cluster_top,
+                         cols     = clust_cols)
+```
+
+```{r, echo=FALSE}
+dl_btn(marker_delegate_summary %>% arrange(group1) %>% group_by(group1) %>%
+         slice_head(n = n_marker) %>% ungroup() %>%
+         filter(feature %in% marker_cluster_top),
+       "top_marker_stats.csv")
+```
+
+```{r clust-markers-pseudobulk-heatmap, fig.width=10, fig.height=8}
+#| include: false
+avg_mat <- Seurat::AverageExpression(
+  mpn_processed_stroma,
+  assays   = "SCT", features = marker_cluster_top,
+  group.by = clust_marker_res, layer = "data"
+)$SCT
+
+col_ids <- gsub("^g", "", colnames(avg_mat))
+col_use <- clust_0.9_order[clust_0.9_order %in% col_ids]
+avg_mat <- avg_mat[, match(col_use, col_ids), drop = FALSE]
+colnames(avg_mat) <- col_use
+
+mat_pb <- t(scale(t(as.matrix(avg_mat))))
+mat_pb[!is.finite(mat_pb)] <- 0
+mat_pb <- pmin(pmax(mat_pb, -2), 2)
+
+gene_clust_df <- filter(gene_clust_df, feature %in% rownames(mat_pb))
+
+o_genes <- gene_clust_df %>%
+  group_by(group1) %>%
+  group_map(function(df, key) {
+    gns <- intersect(df$feature, rownames(mat_pb))
+    if (length(gns) <= 2L) return(gns)
+    sub <- mat_pb[gns, , drop = FALSE]
+    tryCatch({
+      o <- seriation::seriate(sub, method = "PCA") %>% seriation::get_order(1L)
+      gns[o]
+    }, error = function(e) gns)
+  }) %>% unlist(use.names = FALSE)
+
+row_split <- factor(
+  setNames(as.character(gene_clust_df$group1), gene_clust_df$feature)[o_genes],
+  levels = col_use
+)
+
+ComplexHeatmap::draw(ComplexHeatmap::Heatmap(
+  mat_pb[o_genes, ],
+  name              = "z-score",
+  col               = circlize::colorRamp2(c(-2, 0, 2), c("#2166ac", "white", "#b2182b")),
+  cluster_rows      = FALSE, cluster_columns   = FALSE,
+  row_split         = row_split, row_title_gp = grid::gpar(fontsize = 0),
+  show_row_names    = TRUE, show_column_names = TRUE,
+  row_names_gp      = grid::gpar(fontsize = 9), column_names_gp = grid::gpar(fontsize = 9),
+  column_names_rot  = 45, use_raster = FALSE
+))
+```
+
+```{r, echo=FALSE}
+dl_btn(as.data.frame(mat_pb[o_genes, ], check.names = FALSE), "pseudobulk_heatmap.csv")
+```
+
+```{r clust-markers-pseudobulk-bubble, fig.height=10, fig.width=7}
+dp_data <- Seurat::DotPlot(mpn_processed_stroma,
+                           features = marker_cluster_top,
+                           group.by = clust_marker_res, assay = "SCT")$data %>%
+  dplyr::rename(feature = features.plot, cluster = id) %>%
+  dplyr::select(feature, cluster, pct.exp) %>%
+  dplyr::mutate(cluster = gsub("^g", "", as.character(cluster)))
+
+bubble_df <- mat_pb[o_genes, ] %>%
+  as.data.frame() %>% tibble::rownames_to_column("feature") %>%
+  tidyr::pivot_longer(-feature, names_to = "cluster", values_to = "z_score") %>%
+  dplyr::left_join(dp_data, by = c("feature", "cluster")) %>%
+  dplyr::mutate(feature = factor(feature, levels = rev(o_genes)),
+                cluster = factor(cluster, levels = col_use))
+
+ggplot(bubble_df, aes(x = cluster, y = feature, size = pct.exp, fill = z_score)) +
+  geom_point(shape = 21, colour = "white", stroke = 0.3) +
+  scale_fill_gradientn(colours = c("#2166ac", "white", "#b2182b"),
+                       limits = c(-2, 2), oob = scales::squish, name = "z-score") +
+  scale_size_continuous(name = "Detection\nrate (%)", range = c(0, 6)) +
+  labs(x = "Cluster", y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 8),
+        panel.grid  = element_line(colour = "grey92"),
+        legend.position = "right")
+```
+
+```{r, echo=FALSE}
+dl_btn(bubble_df %>% mutate(across(where(is.factor), as.character)), "pseudobulk_bubble.csv")
+```
+
+```{r, fig.width=14, fig.height=26}
+plot_umap_feature_ext(mpn_processed_stroma, features = marker_cluster_top,
+                      cell_order = "shuffle", outline = FALSE, ncol = 4) &
+  scale_color_viridis_c(option = "turbo")
+```
+
+```{r, fig.width=14, fig.height=26}
+plot_umap_feature_ext(mpn_processed_stroma, features = marker_cluster_top,
+                      cell_order = "expression", outline = FALSE, ncol = 4) &
+  scale_color_viridis_c(option = "turbo")
+```
+
+# Condition markers
+
+Now I'll shift gears from identifying potential markers to finding differentially expressed genes between the two conditions (Het vs WT) within each cluster and looking at both up- and down-regulated genes.
+
+Set the significance cutoffs.
+
+```{r}
+padj_allvsall       <- 0.001
+logfc_allvsall      <- 1
+logfc_allvsall_high <- 3
+rate_cutoff         <- 0.2
+```
+
+Load data and exclude sex-related genes.
+
+```{r allvsall-stroma}
+stroma_clust_level <- "res_0.9"
+
+tar_load(delegate_pairwise_markers_stroma)
+tar_load(sex_degs)
+sex_degs   <- c(targets::tar_read(sex_degs), "ENSMUSG00000121395")
+stroma_raw <- delegate_pairwise_markers_stroma[["res_0.9"]]$het_vs_wt |>
+  dplyr::filter(!feature %in% sex_degs)
+rm(delegate_pairwise_markers_stroma)
+```
+
+Prepare data for volcano plots.
+
+```{r allvsall-stroma-volcano-prep}
+volcano_df <- stroma_raw |>
+  dplyr::mutate(
+    neg_log_p  = -log10(pmax(padj, 1e-30)),
+    sig        = (padj <= padj_allvsall & log_fc >=  logfc_allvsall & rate1 >= rate_cutoff) |
+                 (padj <= padj_allvsall & log_fc <= -logfc_allvsall & rate2 >= rate_cutoff),
+    max_rate   = pmax(rate1, rate2)
+  )
+
+volcano_clusters <- sort(unique(volcano_df$cluster))
+n_cl             <- length(volcano_clusters)
+cl_cols_vol      <- setNames(scales::hue_pal()(n_cl), volcano_clusters)
+```
+
+```{r, echo=FALSE}
+dl_btn(filter(volcano_df, sig), "allvsall_volcano_sig.csv")
+```
+
+### Static volcano — all clusters {.unnumbered}
+
+```{r allvsall-stroma-volcano-all, fig.height=7, fig.width=11}
+vol_lfc_cap       <- 8
+volcano_df_capped <- volcano_df %>%
+  mutate(log_fc = if_else(abs(log_fc) > vol_lfc_cap, sign(log_fc) * vol_lfc_cap, log_fc))
+
+top_n_volcano_sig <- function(df, n = 40) {
+  df %>% filter(sig) %>%
+    mutate(score = rank(abs(log_fc)) + rank(neg_log_p)) %>%
+    slice_max(score, n = n)
+}
+
+top_n_volcano_notsig <- function(df, n = 40) {
+  df %>% filter(!sig & (abs(log_fc) > logfc_allvsall_high & neg_log_p > 3)) %>%
+    mutate(score = rank(abs(log_fc)) + rank(neg_log_p)) %>%
+    slice_max(score, n = n)
+}
+
+df_label_vol_all <- volcano_df_capped %>%
+  filter(sig) %>%
+  mutate(score     = rank(abs(log_fc)) + rank(neg_log_p),
+         direction = if_else(log_fc > 0, "up", "down")) %>%
+  group_by(direction) %>% slice_max(score, n = 30) %>% ungroup() %>%
+  mutate(feature_lab = glue::glue("{feature}({cluster})"))
+
+y_max <- max(volcano_df_capped$neg_log_p, na.rm = TRUE) * 1.05
+
+ggplot(volcano_df_capped, aes(x = log_fc, y = neg_log_p)) +
+  geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = c(-logfc_allvsall, logfc_allvsall),
+             colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+  geom_hline(yintercept = -log10(padj_allvsall),
+             colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+  geom_point(data = ~filter(.x, !sig), aes(size = max_rate),
+             fill = "grey80", colour = "white", shape = 21, alpha = 0.3) +
+  geom_point(data = ~filter(.x,  sig), aes(fill = cluster, size = max_rate),
+             colour = "white", shape = 21, alpha = 0.5) +
+  ggrepel::geom_text_repel(data = filter(df_label_vol_all, direction == "up"),
+                           aes(label = feature_lab, colour = cluster),
+                           size = 2.3, max.overlaps = 30, show.legend = FALSE,
+                           segment.size = 0.2, segment.colour = "grey60",
+                           xlim = c(logfc_allvsall, vol_lfc_cap), ylim = c(0, y_max)) +
+  ggrepel::geom_text_repel(data = filter(df_label_vol_all, direction == "down"),
+                           aes(label = feature_lab, colour = cluster),
+                           size = 2.3, max.overlaps = 30, show.legend = FALSE,
+                           segment.size = 0.2, segment.colour = "grey60",
+                           xlim = c(-vol_lfc_cap, -logfc_allvsall), ylim = c(0, y_max)) +
+  scale_fill_manual(values = cl_cols_vol, breaks = volcano_clusters, name = "Cluster") +
+  scale_colour_manual(values = cl_cols_vol, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = 0.05)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_size_continuous(name = "Max expression\nrate", range = c(0.3, 2)) +
+  labs(x = "log FC  (Het vs WT)", y = "-log₁₀ (padj)", title = "Stroma — all clusters",
+       caption = paste0("log FC capped at ±", vol_lfc_cap,
+                        "  |  Colour = cluster  |  Size = max(rate1, rate2)",
+                        "  |  Labels: top 30 up/down")) +
+  theme_bw(base_size = 11) + theme(legend.position = "right")
+```
+
+```{r allvsall-stroma-volcano-interactive, fig.height=6, fig.width=8}
+set.seed(42)
+vol_plt_df <- bind_rows(
+  filter(volcano_df_capped,  sig),
+  filter(volcano_df_capped, !sig) %>% slice_sample(n = min(8000, sum(!volcano_df_capped$sig)))
+) %>%
+  dplyr::select(log_fc, neg_log_p, sig, cluster, max_rate, feature) %>%
+  mutate(point_col  = if_else(sig, cl_cols_vol[cluster], "grey80"),
+         hover_text = if_else(sig, paste0(feature, "(", cluster, ")"), ""),
+         point_size = scales::rescale(max_rate, to = c(3, 10)))
+
+plot_ly() |>
+  add_trace(data = filter(vol_plt_df, !sig), x = ~log_fc, y = ~neg_log_p,
+            type = "scattergl", mode = "markers",
+            marker = list(color = "rgba(200,200,200,0.3)", size = 3),
+            hoverinfo = "none", showlegend = FALSE) |>
+  add_trace(data = filter(vol_plt_df,  sig), x = ~log_fc, y = ~neg_log_p,
+            type = "scattergl", mode = "markers",
+            marker = list(color = ~point_col, size = ~point_size,
+                          line = list(color = "white", width = 0.5), opacity = 0.7),
+            text = ~hover_text,
+            hovertemplate = "<b>%{text}</b><br>log FC: %{x:.2f}<br>-log₁₀(p): %{y:.2f}<extra></extra>",
+            showlegend = FALSE) |>
+  layout(title  = list(text = "Stroma — Het vs WT", font = list(size = 12)),
+         xaxis  = list(title = "log FC  (Het vs WT)", range = c(-vol_lfc_cap, vol_lfc_cap) * 1.05,
+                       zeroline = TRUE, zerolinecolor = "grey70", showgrid = FALSE),
+         yaxis  = list(title = "-log₁₀ (padj)", showgrid = FALSE),
+         shapes = list(
+           list(type = "line", x0 = -logfc_allvsall, x1 = -logfc_allvsall,
+                y0 = 0, y1 = 1, yref = "paper",
+                line = list(color = "grey50", dash = "dash", width = 1)),
+           list(type = "line", x0 =  logfc_allvsall, x1 =  logfc_allvsall,
+                y0 = 0, y1 = 1, yref = "paper",
+                line = list(color = "grey50", dash = "dash", width = 1)),
+           list(type = "line", x0 = -vol_lfc_cap, x1 = vol_lfc_cap,
+                y0 = -log10(padj_allvsall), y1 = -log10(padj_allvsall),
+                line = list(color = "grey50", dash = "dash", width = 1))),
+         plot_bgcolor = "white", paper_bgcolor = "white")
+```
+
+### Static volcano — by cluster {.unnumbered}
+
+::: panel-tabset
+```{r allvsall-stroma-volcano-tabs, results="asis", fig.height=8, fig.width=10}
+for (cl in clust_0.9_order[clust_0.9_order %in% volcano_clusters]) {
+  cat("##", cl, "\n\n")
+  df_cl <- filter(volcano_df_capped, cluster == cl)
+  p <- ggplot(df_cl, aes(x = log_fc, y = neg_log_p)) +
+    geom_vline(xintercept = 0, colour = "grey70", linewidth = 0.3) +
+    geom_vline(xintercept = c(-logfc_allvsall, logfc_allvsall),
+               colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    geom_hline(yintercept = -log10(padj_allvsall),
+               colour = "grey50", linewidth = 0.3, linetype = "dashed") +
+    geom_point(data = ~filter(.x, !sig), aes(size = max_rate),
+               fill = "grey80", colour = "white", shape = 21, alpha = 0.5) +
+    geom_point(data = ~filter(.x,  sig), aes(size = max_rate),
+               fill = "#D73027", colour = "white", shape = 21, alpha = 0.5) +
+    ggrepel::geom_text_repel(
+      data = ~top_n_volcano_sig(.x, n = 100) %>% filter(log_fc > 0),
+      aes(label = feature), size = 2.5, colour = "#D73027",
+      max.overlaps = 30, show.legend = FALSE, segment.size = 0.3, segment.colour = "grey60",
+      xlim = c(logfc_allvsall, Inf), ylim = c(-log10(padj_allvsall), Inf)) +
+    ggrepel::geom_text_repel(
+      data = ~top_n_volcano_sig(.x, n = 100) %>% filter(log_fc < 0),
+      aes(label = feature), size = 2.5, colour = "#4575B4",
+      max.overlaps = 30, show.legend = FALSE, segment.size = 0.3, segment.colour = "grey60",
+      xlim = c(-Inf, -logfc_allvsall), ylim = c(-log10(padj_allvsall), Inf)) +
+    ggrepel::geom_text_repel(
+      data = ~top_n_volcano_notsig(.x, n = 40), aes(label = feature),
+      color = "grey60", size = 2.5, max.overlaps = 30, show.legend = FALSE,
+      segment.size = 0.3, segment.colour = "grey60") +
+    scale_x_continuous(expand = expansion(mult = 0.05)) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_size_continuous(name = "Max expression\nrate", range = c(0.3, 2)) +
+    labs(x = "log FC  (Het vs WT)", y = "-log₁₀ (padj)", title = paste("Cluster", cl)) +
+    theme_bw(base_size = 11) + theme(legend.position = "right")
+  print(p)
+  cat("\n\n")
+}
+```
+:::
+
+```{r allvsall-stroma-cleanup, eval=FALSE}
+rm(volcano_df, volcano_df_capped, stroma_raw); gc()
+```
+
+# Limitations
+
+# Conclusion
+
+# Extra
+
+## Marker specificity across distantly related clusters {.unnumbered}
+
+For each gene, quantify how specifically it marks a group of clusters relative to the overlap those clusters share with each other — a proxy for how "exclusive" the marker is to that cell-state combination.
+
+```{r extra-cross-clust-prep}
+feat_grp2_n <- clust_marker_0.9 %>%
+  filter(sig & rate1 >= 0.05) %>%
+  group_by(feature, group2) %>%
+  summarize(n      = dplyr::n(),
+            groups = paste0(unique(group1[sig]) %>% stringr::str_sort(numeric = TRUE), collapse = ","),
+            avg_lfc = mean(log_fc),
+            .groups = "drop") %>%
+  group_by(feature, n, groups) %>%
+  dplyr::summarise(nn = dplyr::n(), avg_lfc = mean(avg_lfc), .groups = "drop") %>%
+  filter(n > 1, nn > n) %>%
+  slice_max(order_by = nn, n = 1, by = "feature") %>%
+  rowwise() %>%
+  mutate(
+    y = { labs <- str_split(groups, ",")[[1]]; sub <- overlap_mat[labs, labs]; min(diag(sub)) },
+    z = { labs <- str_split(groups, ",")[[1]]; sub <- overlap_mat[labs, labs]; min(sub[upper.tri(sub)]) },
+    x = 1 - (z / y)
+  )
+```
+
+```{r extra-cross-clust-table}
+DT::datatable(
+  feat_grp2_n %>% ungroup() %>% mutate(across(where(is.numeric), ~round(.x, 3))),
+  rownames   = FALSE, filter = "top", extensions = "Buttons",
+  options    = list(pageLength = 20, scrollX = TRUE, dom = "Bfrtip",
+                    buttons = list(list(extend = "csv", filename = "marker_exclusivity_stroma")))
+)
+```
+
+```{r extra-cross-clust-table-dl, echo=FALSE}
+dl_btn(feat_grp2_n %>% ungroup(), "marker_exclusivity_stroma.csv")
+```
+
+```{r extra-cross-clust-plot, fig.width=8, fig.height=6, eval=FALSE}
+feat_grp2_n %>%
+  filter(x > 0.6) %>%
+  ggplot(aes(avg_lfc, x, label = feature, color = nn)) +
+  geom_point(alpha = 0.5) +
+  ggrepel::geom_text_repel() +
+  scale_color_viridis_c(option = "turbo") +
+  labs(x = "Average log FC", y = "Marker exclusivity (x)", color = "N compared\nclusters") +
+  theme_bw(base_size = 11)
+```

@@ -1,0 +1,104 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(plyranges)
+```
+
+Download from (https://shendure.curve.space/articles/evolutionary-transfer-learning/data)
+```{r}
+bed_path <- "data/STEAM-v1/mm10/Supplementary_File_3_Evolution_Augmented_Model_Predict_On_Mouse_Genome.bed"
+std_chr <- paste0("chr",c(1:22, "X", "Y"))
+mm10_pred_enh_gr <- read.delim(bed_path) %>% 
+  dplyr::rename("seqnames"="chr") %>%
+  filter(seqnames %in% std_chr) %>%
+  plyranges::as_granges() %>%
+  GenomicRanges::sort()
+
+```
+
+```{r}
+mm10_pred_enh_gr_lst <- split(mm10_pred_enh_gr, mm10_pred_enh_gr$cell_class)
+cell_classes <- names(mm10_pred_enh_gr_lst)
+n <- length(cell_classes)
+lengths(mm10_pred_enh_gr_lst) %>%
+  enframe()%>%
+  ggplot(aes(x = value))+
+  geom_histogram()
+```
+
+```{r cross-tissues-overlap}
+
+cell_classes <- names(mm10_pred_enh_gr_lst)
+n <- length(cell_classes)
+
+jaccard_gr <- function(a, b) {
+  inter <- GenomicRanges::intersect(a, b)
+  uni   <- GenomicRanges::union(a, b)
+  w_uni <- sum(GenomicRanges::width(uni))
+  if (w_uni == 0) return(0)
+  sum(GenomicRanges::width(inter)) / w_uni
+}
+
+count_mat   <- matrix(0L, n, n, dimnames = list(cell_classes, cell_classes))
+jaccard_mat <- matrix(0,  n, n, dimnames = list(cell_classes, cell_classes))
+
+for (i in seq_len(n)) {
+  for (j in seq_len(i)) {
+    gr_i <- mm10_pred_enh_gr_lst[[i]]
+    gr_j <- mm10_pred_enh_gr_lst[[j]]
+    n_ov <- length(plyranges::find_overlaps(gr_i, gr_j))
+    jac  <- jaccard_gr(gr_i, gr_j)
+    count_mat[i, j]   <- count_mat[j, i]   <- n_ov
+    jaccard_mat[i, j] <- jaccard_mat[j, i] <- jac
+  }
+}
+
+pheatmap::pheatmap(
+  count_mat,
+  main          = "Peak overlap counts",
+  color         = colorRampPalette(c("white", "#08519c"))(50),
+  cluster_rows  = TRUE, cluster_cols = TRUE
+)
+
+pheatmap::pheatmap(
+  jaccard_mat,
+  main          = "Jaccard similarity (bp-level)",
+  color         = colorRampPalette(c("white", "#a50f15"))(50),
+  cluster_rows  = TRUE, cluster_cols = TRUE
+)
+```
+
+```{r}
+targets::tar_load(yoshida_2020_ocr_gr)
+```
+
+```{r}
+l <- lapply(mm10_pred_enh_gr_lst, function(x){
+  plyranges::find_overlaps(x,
+                         yoshida_2020_ocr_gr) %>% 
+    plyranges::reduce_ranges()
+  })
+```
+
+```{r}
+c(lengths(l)/lengths(mm10_pred_enh_gr_lst)) %>%
+  sort %>% 
+  enframe() %>%
+  mutate(name = factor(name, levels = name))%>%
+  ggplot(aes(name, value))+
+  geom_col(fill = "steelblue")+
+  ylab("Proportion of overlapping core-enhancers peaks")+
+  xlab("")+
+  coord_flip()
+```
+
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Itgav", "Fn1")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+

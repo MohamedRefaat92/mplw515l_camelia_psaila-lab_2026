@@ -1,0 +1,105 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+stem_clusters <- c("7", "8")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters & Phase == "G1")
+gene_detection <- Matrix::rowSums(GetAssayData(srt_sub, "RNA", layer = "counts")>=1)
+srt_sub <- srt_sub[gene_detection>=10,]
+
+```
+
+```{r}
+options(future.globals.maxSize = 8 * 1024^3)
+srt_sub <- srt_sub %>% 
+  SCTransform(assay = "RNA",) %>% 
+  RunPCA(assay = "SCT") %>%
+   FindNeighbors(dims = 1:10) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:10,
+           min.dist = 0.05, 
+           n.neighbors = 15)
+
+```
+
+```{r}
+srt_sub <- Seurat::RunICA(srt_sub)
+```
+
+```{r}
+ferchen_annot_df <- proj_ferchen_26_mm_bm_hsc[colnames(srt_sub),
+                                                 str_subset(colnames(proj_ferchen_26_mm_bm_hsc), "pred|mapping")]
+srt_sub <- AddMetaData(srt_sub, 
+                       ferchen_annot_df)
+srt_sub@meta.data  <- srt_sub@meta.data %>%
+    rownames_to_column("cell.id") %>% 
+    group_by(predicted.Level4)%>%
+    mutate(n = dplyr::n()) %>%
+    ungroup() %>% 
+    mutate(predicted.Level4_other = ifelse(n<20, "others", predicted.Level4))%>%
+    as.data.frame() %>% 
+      column_to_rownames("cell.id")
+    
+```
+
+```{r}
+srt_sub <- AddMetaData(srt_sub, proj_zeng_25_hs_bm_hsc[colnames(srt_sub),c("predicted.CellType_Broad"),drop = FALSE])
+
+```
+
+```{r}
+
+stem_clusters <- c("7", "8")
+srt_sub <- subset(mpn_processed_hsc_fullcc, 
+                  sNN_pca.SCT_30_res.0.5 %in% stem_clusters & Phase == "G1")
+gene_detection <- Matrix::rowSums(GetAssayData(srt_sub, "RNA", layer = "counts")>=1)
+rna_counts <- GetAssayData(srt_sub, "RNA", layer = "counts")[gene_detection>=10,]
+rna_counts[rna_counts>=1] <- 1
+
+options(future.globals.maxSize = 8 * 1024^3)
+srt_sub <- srt_sub %>% 
+  SCTransform(assay = "RNA",) %>% 
+  RunPCA(assay = "SCT") %>%
+   FindNeighbors(dims = 1:10) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:10,
+           min.dist = 0.05, 
+           n.neighbors = 15)
+
+
+
+
+
+```
+
+```{r}
+rna_counts <- GetAssayData(srt_sub, "RNA", layer = "counts")
+rna_counts[rna_counts>=1] <- 1
+
+glmPCA_coa<- glmpca::glmpca(rna_counts[VariableFeatures(srt_sub,nfeatures = 1000),],
+                            L=10,
+                            fam="poi")
+glmPCA_coa$factors %>% 
+    mutate(grp = srt_sub$sample.name[rownames(.)]) %>%
+    ggplot(aes(dim1, dim3, color = grp))+
+    geom_point(size=0.5)
+glmPCA_coa$factors %>% 
+    mutate(grp = srt_sub$sample.name[rownames(.)]) %>%
+    ggplot(aes(dim3, dim5, color = grp))+
+    geom_point(size=0.5)
+srt_sub[["pca_"]] <- Seurat::CreateDimReducObject(mc_umap_coords %>% column_to_rownames("metacell_id") %>% as.matrix(),key = "UMAP")
+
+```
+
+```{r}
+BiocManager::install("ade4")
+coa_ade4<-ade4::dudi.coa(GetAssayData(srt_sub,assay = "SCT",layer = "counts")[VariableFeatures(srt_sub,nfeatures = 1000),],
+                         scannf = FALSE,
+                         n=10)
+
+
+```

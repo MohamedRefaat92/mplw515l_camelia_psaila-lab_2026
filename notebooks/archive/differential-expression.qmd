@@ -1,0 +1,14 @@
+---
+title: "Differential Expression"
+format:
+  html:
+    embed-resources: false
+---
+
+This notebook has been split into three compartment-specific notebooks:
+
+- [differential-expression-hsc.qmd](differential-expression-hsc.qmd) — HSC cluster markers, Het vs all volcanos/scatters, and miloDE neighbourhood-level DE
+- [differential-expression-mnc.qmd](differential-expression-mnc.qmd) — MNC Het vs all volcanos and scatter
+- [differential-expression-stroma.qmd](differential-expression-stroma.qmd) — Stroma Het vs WT volcanos
+
+For pathway enrichment (ORA / GSEA) see [degs_gsea.qmd](degs_gsea.qmd).

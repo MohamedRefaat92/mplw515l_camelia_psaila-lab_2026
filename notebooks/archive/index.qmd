@@ -1,0 +1,32 @@
+# Overview {.unnumbered}
+
+This book collects exploratory analyses, method benchmarks, and drafts for the
+**MPN 10x Camélia** project. Nothing here is guaranteed to end up in the final
+pipeline — it's a working space for thinking through alternatives.
+
+## What lives here
+
+| Chapter | Purpose |
+|---|---|
+| QC exploration | Parameter sweeps for filtering thresholds |
+| Demultiplex (pre-QC) | HTO demultiplexing exploration before cell filtering |
+| Demultiplex (post-QC) | HTO class distribution after QC flags applied |
+| Dim reduction & clustering | Resolution scans, batch factor and k sweeps, UMAP flavours |
+| PCA GSEA | Gene set enrichment on PCA loadings |
+| Marker benchmarks | FindAllMarkers settings, presto vs wilcox timing |
+| Cell cycle | Scoring strategies, regression trade-offs |
+
+## What lives elsewhere
+
+- **`_targets.R`** — the production R pipeline
+- **`pipeline.py`** — the production Python pipeline
+- **`analysis/analysis.qmd`** — the final report rendered by the pipeline
+
+## Setup
+
+Notebooks load all data via `targets::tar_load()` from the targets store.
+A complete pipeline run (`tar_make()`) must be done before rendering.
+
+```r
+library(targets)
+```

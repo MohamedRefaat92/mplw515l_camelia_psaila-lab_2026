@@ -1,0 +1,229 @@
+---
+title: "SuperCell Exploration — HSC"
+format:
+  html:
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(igraph)
+library(ggraph)
+library(DT)
+
+
+theme_set(theme_cowplot())
+
+targets::tar_load(supercells_hsc)
+targets::tar_load(supercell_meta_hsc)
+
+# ── Condition mapping ────────────────────────────────────────────────────────
+supercell_meta_hsc <- supercell_meta_hsc %>%
+  dplyr::mutate(condition = dplyr::case_when(
+    grepl("mCh\\+", sample) ~ "Het_mChPos",
+    grepl("mCh-",   sample) ~ "Het_mChNeg",
+    grepl("WT",     sample) ~ "WT",
+    TRUE ~ sample
+  ))
+
+# ── Supercell graph with metadata as vertex attributes ───────────────────────
+g <- supercells_hsc$graph.supercells
+sc_ids <- as.integer(igraph::V(g)$name)
+idx    <- match(sc_ids, supercell_meta_hsc$supercell)
+
+igraph::V(g)$majority_cluster <- supercell_meta_hsc$majority_cluster[idx]
+igraph::V(g)$sample           <- supercell_meta_hsc$sample[idx]
+igraph::V(g)$condition        <- supercell_meta_hsc$condition[idx]
+igraph::V(g)$size_sc          <- supercell_meta_hsc$size[idx]
+igraph::V(g)$UMAP1            <- supercell_meta_hsc$UMAP1[idx]
+igraph::V(g)$UMAP2            <- supercell_meta_hsc$UMAP2[idx]
+
+layout_mat <- matrix(c(igraph::V(g)$UMAP1, igraph::V(g)$UMAP2), ncol = 2)
+
+# ── Neighbour proportion per sample ─────────────────────────────────────────
+# For each supercell, the weighted fraction of its graph neighbours that
+# belong to each sample — a continuous [0,1] mixing score.
+adj      <- igraph::as_adjacency_matrix(g, attr = "weight", sparse = FALSE)
+row_sums <- rowSums(adj)
+row_sums[row_sums == 0] <- 1
+adj_norm <- adj / row_sums
+
+samples <- sort(unique(supercell_meta_hsc$sample))
+sc_sample_vec <- supercell_meta_hsc$sample[idx]   # ordered by vertex
+
+nprop_df <- purrr::map_dfc(
+  setNames(samples, paste0("nprop_", samples)),
+  ~ as.numeric(adj_norm %*% (sc_sample_vec == .x))
+)
+nprop_df$supercell <- sc_ids
+
+supercell_meta_hsc <- dplyr::left_join(supercell_meta_hsc, nprop_df, by = "supercell")
+
+# ── Colour palettes ──────────────────────────────────────────────────────────
+clusters   <- sort(unique(supercell_meta_hsc$majority_cluster))
+clust_pal  <- setNames(
+  scales::hue_pal()(length(clusters)),
+  clusters
+)
+
+cond_pal <- c(WT = "#4DAF4A", Het_mChNeg = "#377EB8", Het_mChPos = "#E41A1C")
+```
+
+## Summary
+
+```{r summary-table}
+supercell_meta_hsc %>%
+  dplyr::count(sample, condition, majority_cluster, name = "n_supercells") %>%
+  dplyr::arrange(sample, majority_cluster) %>%
+  DT::datatable(rownames = FALSE, filter = "top",
+                options = list(pageLength = 15, scrollY = "350px",
+                               scrollCollapse = TRUE))
+```
+
+```{r size-distribution, fig.height=4, fig.width=8}
+ggplot(supercell_meta_hsc, aes(size, fill = condition)) +
+  geom_histogram(bins = 40, colour = "white", linewidth = 0.2) +
+  scale_fill_manual(values = cond_pal) +
+  facet_wrap(~ sample, nrow = 1) +
+  labs(x = "Cells per supercell", y = "Count",
+       title = "Supercell size distribution by sample") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(size = 8))
+```
+
+---
+
+## Graph — majority cluster label
+
+Each node is a supercell positioned at the average UMAP coordinates of its
+member cells. Node size reflects supercell size. Edges connect supercells
+whose member cells were adjacent in the single-cell kNN graph; edge width
+is proportional to the number of shared single-cell edges.
+
+```{r graph-cluster, fig.height=7, fig.width=9}
+ggraph(g, layout = layout_mat) +
+  geom_edge_link0(aes(width = weight),
+                  colour = "grey75", alpha = 0.25,
+                  show.legend = FALSE) +
+  geom_node_point(aes(fill = majority_cluster, size = size_sc),
+                  shape = 21, stroke = 0.15, colour = "grey20") +
+  scale_fill_manual(values = clust_pal, name = "Majority\ncluster") +
+  scale_size(range = c(0.8, 5), name = "Cells\nper SC") +
+  scale_edge_width(range = c(0.1, 1.5)) +
+  labs(title = "SuperCell graph — HSC",
+       subtitle = paste0(igraph::vcount(g), " supercells  ·  γ = 10  ·  split by sample.name")) +
+  theme_void(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+---
+
+## Graph — sample identity
+
+Each supercell is pure (split by sample during construction), so sample label
+is a hard assignment. This panel confirms that supercells from different
+samples interleave in shared transcriptional space vs. form separate islands.
+
+```{r graph-sample, fig.height=7, fig.width=9}
+sample_pal <- scales::hue_pal()(length(samples))
+names(sample_pal) <- samples
+
+ggraph(g, layout = layout_mat) +
+  geom_edge_link0(aes(width = weight),
+                  colour = "grey75", alpha = 0.2,
+                  show.legend = FALSE) +
+  geom_node_point(aes(fill = sample, size = size_sc),
+                  shape = 21, stroke = 0.15, colour = "grey20") +
+  scale_fill_manual(values = sample_pal, name = "Sample") +
+  scale_size(range = c(0.8, 5), name = "Cells\nper SC") +
+  scale_edge_width(range = c(0.1, 1.5)) +
+  theme_void(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+---
+
+## Graph — neighbour condition proportion
+
+For each supercell the proportion of its **graph neighbours** that belong to
+each sample is computed from the weighted adjacency matrix. A supercell in a
+region dominated by one sample will score close to 1 for that sample and near
+0 for the others — revealing where conditions are segregated vs. mixed in
+transcriptional space.
+
+```{r graph-nprop, fig.height=5, fig.width=16}
+nprop_plots <- purrr::map(samples, function(s) {
+  col <- paste0("nprop_", s)
+  node_df <- data.frame(
+    UMAP1 = igraph::V(g)$UMAP1,
+    UMAP2 = igraph::V(g)$UMAP2,
+    size  = igraph::V(g)$size_sc,
+    prop  = supercell_meta_hsc[[col]][idx]
+  )
+
+  ggraph(g, layout = layout_mat) +
+    geom_edge_link0(aes(width = weight),
+                    colour = "grey80", alpha = 0.15,
+                    show.legend = FALSE) +
+    geom_node_point(aes(fill = node_df$prop, size = node_df$size),
+                    shape = 21, stroke = 0.1, colour = "grey30") +
+    scale_fill_viridis_c(name = "Neighbour\nprop.", limits = c(0, 1),
+                         option = "magma") +
+    scale_size(range = c(0.5, 4), guide = "none") +
+    scale_edge_width(range = c(0.1, 1)) +
+    labs(title = s) +
+    theme_void(base_size = 10) +
+    theme(legend.position = "right",
+          plot.title = element_text(size = 9, hjust = 0.5))
+})
+
+patchwork::wrap_plots(nprop_plots, nrow = 1) +
+  patchwork::plot_annotation(
+    title = "SuperCell graph — neighbour condition proportion",
+    subtitle = "Each panel: fraction of graph neighbours belonging to that sample"
+  )
+```
+
+---
+
+## Neighbour proportion distributions
+
+```{r nprop-violin, fig.height=5, fig.width=10}
+nprop_long <- supercell_meta_hsc %>%
+  dplyr::select(supercell, majority_cluster, dplyr::starts_with("nprop_")) %>%
+  tidyr::pivot_longer(
+    cols      = dplyr::starts_with("nprop_"),
+    names_to  = "query_sample",
+    values_to = "neighbour_prop"
+  ) %>%
+  dplyr::mutate(query_sample = stringr::str_remove(query_sample, "^nprop_"))
+
+ggplot(nprop_long, aes(majority_cluster, neighbour_prop, fill = majority_cluster)) +
+  geom_violin(scale = "width", linewidth = 0.3, colour = "grey30") +
+  geom_boxplot(width = 0.15, outlier.size = 0.3, fill = "white",
+               colour = "grey20", linewidth = 0.3) +
+  scale_fill_manual(values = clust_pal, guide = "none") +
+  facet_wrap(~ query_sample, nrow = 1) +
+  labs(x = "Majority cluster", y = "Neighbour proportion",
+       title = "Condition neighbour proportion by majority cluster") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text  = element_text(size = 8))
+```
+
+```{r cleanup}
+rm(supercells_hsc, g, adj, adj_norm); gc()
+```
+
+{{< include ../_session-info.qmd >}}

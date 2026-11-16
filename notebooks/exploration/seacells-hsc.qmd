@@ -1,0 +1,332 @@
+---
+title: "SEACells Metacells — HSC"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+execute:
+  echo: true
+  warning: false
+  message: false
+jupyter: mplw515l_camelia_psaila-lab_2026-py
+---
+
+## Overview
+
+SEACells constructs metacells using a diffusion kernel on the cell–cell graph,
+then identifies metacell seeds via archetypal analysis (NNLS). Each cell is
+assigned to its nearest seed. Unlike KNN aggregation (hdWGCNA) or community
+detection (MC2), SEACells metacells are geometrically spread across the manifold.
+
+**Input:** `output/objects/hsc.h5ad`
+**Output:** `output/objects/metacells/seacells_hsc_metacells.h5ad` — metacell AnnData with:
+
+- `X` — summed raw counts per metacell
+- `obs` — metacell metadata (size, majority cluster/condition)
+- `obsm["X_umap"]` — median UMAP coordinates of constituent cells
+
+---
+
+## 1 — Setup
+
+```{python setup}
+import sys
+
+import numpy  as np
+import pandas as pd
+import anndata as ad
+import scanpy  as sc
+import SEACells
+import scipy.sparse as sp
+from pathlib import Path
+
+H5AD_IN  = Path('output/objects/hsc.h5ad')
+OUT_DIR  = Path('output/objects/metacells')
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+H5AD_OUT = OUT_DIR / 'seacells_hsc_metacells.h5ad'
+
+# Approximate target: n_cells / SEA_CELLS_N ≈ cells per metacell
+SEA_CELLS_N      = None   # set to None to auto-compute from target size
+TARGET_MC_SIZE   = 50     # target cells per metacell (used if SEA_CELLS_N is None)
+N_WAYPOINTS      = 1000   # diffusion map waypoints
+N_JOBS           = 8
+EXCLUDED_GENES   = ['mCherry', 'DRE']
+RANDOM_SEED      = 42
+
+print(f"SEACells version: {SEACells.__version__}")
+```
+
+---
+
+## 2 — Load data
+
+```{python load}
+adata = ad.read_h5ad(H5AD_IN)
+print(adata)
+print("\nobs columns:", adata.obs.columns.tolist())
+```
+
+---
+
+## 3 — Preprocessing
+
+SEACells operates on a PCA + kernel graph. It expects:
+1. Normalised log-counts in `X` (for PCA)
+2. Raw counts in `layers["counts"]` (for metacell aggregation)
+
+```{python preprocess}
+# Store raw counts for aggregation
+if 'counts' in adata.layers:
+    print("Raw counts already in layers['counts']")
+elif sp.issparse(adata.X) and np.allclose(adata.X.data, adata.X.data.astype(int)):
+    adata.layers['counts'] = adata.X.copy()
+    print("Stored integer X as layers['counts']")
+else:
+    raise ValueError("No integer count layer found. layers: " +
+                     str(list(adata.layers.keys())))
+
+# Exclude reporter genes
+keep = [g for g in adata.var_names if g not in EXCLUDED_GENES]
+adata = adata[:, keep].copy()
+
+# Normalise for PCA (SEACells uses this to build the kernel)
+sc.pp.normalize_total(adata, target_sum=1e4)
+sc.pp.log1p(adata)
+
+# HVGs — exclude cell-cycle / stress genes
+sc.pp.highly_variable_genes(adata, n_top_genes=3000, flavor='seurat_v3',
+                             layer='counts')
+cc_pattern = r'^(Hsp|Rps|Rpl|Malat1)'
+cc_mask    = adata.var_names.str.match(cc_pattern)
+adata.var.loc[cc_mask, 'highly_variable'] = False
+
+n_hvg = adata.var['highly_variable'].sum()
+print(f"HVGs after CC/stress exclusion: {n_hvg}")
+
+sc.pp.scale(adata, max_value=10)
+sc.tl.pca(adata, n_comps=50, use_highly_variable=True)
+print("PCA done")
+```
+
+---
+
+## 4 — Build SEACells kernel
+
+```{python kernel}
+# Determine number of metacells
+n_cells = adata.n_obs
+n_mc    = SEA_CELLS_N if SEA_CELLS_N is not None else max(10, n_cells // TARGET_MC_SIZE)
+print(f"Cells: {n_cells}  →  target metacells: {n_mc}  (≈{n_cells/n_mc:.0f} cells each)")
+
+model = SEACells.core.SEACells(
+    adata,
+    build_kernel_on = 'X_pca',
+    n_SEACells      = n_mc,
+    n_waypoint_eigs = N_WAYPOINTS,
+    convergence_epsilon = 1e-3,
+    verbose         = True
+)
+
+model.construct_kernel_matrix()
+model.initialize_archetypes()
+```
+
+---
+
+## 5 — Fit SEACells
+
+```{python fit}
+#| output: asis
+
+if H5AD_OUT.exists():
+    print(f"Output already exists — loading {H5AD_OUT}")
+    mc_adata = ad.read_h5ad(H5AD_OUT)
+else:
+    model.fit(min_iter=10, max_iter=100)
+
+    # ── Summarise assignments ────────────────────────────────────────────────
+    # Assignment: adata.obs['SEACell'] — string ID per cell
+    SEACells.core.summarize_by_SEACell(
+        adata,
+        SEACells_label = 'SEACell',
+        summarize_layer = 'counts'
+    )
+
+    mc_adata = adata.uns['SEACell_anndata'].copy()
+    mc_adata.obs_names = mc_adata.obs_names.astype(str)
+
+    # ── Metacell size ────────────────────────────────────────────────────────
+    size_series = adata.obs['SEACell'].value_counts().rename('metacell_size')
+    mc_adata.obs = mc_adata.obs.join(size_series, how='left')
+
+    # ── Majority cluster & condition ─────────────────────────────────────────
+    clust_col = [c for c in adata.obs.columns if 'res.0.9' in c and 'pca' in c][0]
+
+    for meta_col, src_col in [('majority_cluster', clust_col),
+                               ('condition', 'condition'),
+                               ('sample.name', 'sample.name')]:
+        if src_col not in adata.obs.columns:
+            continue
+        mc_adata.obs[meta_col] = (
+            adata.obs[[src_col, 'SEACell']]
+            .groupby('SEACell')[src_col]
+            .agg(lambda x: x.value_counts().idxmax())
+            .reindex(mc_adata.obs_names)
+            .values
+        )
+
+    # ── Median UMAP coordinates ───────────────────────────────────────────────
+    if 'X_umap' in adata.obsm:
+        umap_df = pd.DataFrame(adata.obsm['X_umap'],
+                               columns=['UMAP1','UMAP2'],
+                               index=adata.obs_names)
+        umap_df['SEACell'] = adata.obs['SEACell'].values
+        mc_umap = umap_df.groupby('SEACell')[['UMAP1','UMAP2']].median()
+        mc_adata.obsm['X_umap'] = mc_umap.reindex(mc_adata.obs_names).values
+
+    mc_adata.write_h5ad(H5AD_OUT)
+    print(f"\nSaved → {H5AD_OUT}")
+
+print(mc_adata)
+```
+
+---
+
+## 6 — Convergence diagnostics
+
+```{python convergence}
+try:
+    model.plot_convergence()
+except Exception as e:
+    print(f"Convergence plot unavailable: {e}")
+```
+
+---
+
+## 7 — Metacell size distribution
+
+```{python size-dist}
+import matplotlib.pyplot as plt
+
+sizes = mc_adata.obs['metacell_size'].astype(float)
+
+fig, ax = plt.subplots(figsize=(7, 3))
+ax.hist(sizes, bins=30, color='#e76f51', edgecolor='white')
+ax.axvline(sizes.median(), color='black', linestyle='--', label=f'median={sizes.median():.0f}')
+ax.set_xlabel('Cells per metacell')
+ax.set_ylabel('Count')
+ax.set_title('SEACells — metacell size distribution')
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 8 — Metacell UMAP
+
+```{python umap-plot}
+if 'X_umap' in mc_adata.obsm:
+    umap_df = pd.DataFrame(mc_adata.obsm['X_umap'],
+                           columns=['UMAP1','UMAP2'],
+                           index=mc_adata.obs_names)
+    umap_df = umap_df.join(mc_adata.obs[['majority_cluster','condition']])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    cond_pal = {'WT': '#888888', 'mCh-': '#2a9d8f', 'mCh+': '#e76f51'}
+
+    for ax, col, title in zip(
+        axes,
+        ['majority_cluster', 'condition'],
+        ['Majority cluster', 'Condition']
+    ):
+        groups = sorted(umap_df[col].dropna().unique())
+        for g in groups:
+            sub = umap_df[umap_df[col] == g]
+            color = cond_pal.get(g) if col == 'condition' else None
+            ax.scatter(sub['UMAP1'], sub['UMAP2'], s=8, alpha=0.7,
+                       label=str(g), color=color)
+        ax.set_title(title)
+        ax.set_xlabel('UMAP1'); ax.set_ylabel('UMAP2')
+        ax.legend(markerscale=2, fontsize=7, bbox_to_anchor=(1,1))
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No UMAP in mc_adata.obsm")
+```
+
+---
+
+## 9 — Metacells per cluster × condition
+
+```{python counts-plot}
+counts = (mc_adata.obs
+          .groupby(['majority_cluster', 'condition'])
+          .size()
+          .reset_index(name='n'))
+
+cond_order = ['WT', 'mCh-', 'mCh+']
+cond_pal   = {'WT': '#888888', 'mCh-': '#2a9d8f', 'mCh+': '#e76f51'}
+
+fig, ax = plt.subplots(figsize=(10, 4))
+clusters = sorted(counts['majority_cluster'].unique(),
+                  key=lambda x: (int(x) if str(x).isdigit() else x))
+x     = np.arange(len(clusters))
+width = 0.25
+
+for i, cond in enumerate(cond_order):
+    sub  = counts[counts['condition'] == cond].set_index('majority_cluster')
+    vals = [sub.loc[c, 'n'] if c in sub.index else 0 for c in clusters]
+    ax.bar(x + i * width, vals, width, label=cond, color=cond_pal.get(cond, 'grey'))
+
+ax.set_xticks(x + width)
+ax.set_xticklabels(clusters)
+ax.set_xlabel('Cluster'); ax.set_ylabel('Metacells')
+ax.set_title('SEACells metacells per cluster × condition')
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## 10 — Export for R comparison
+
+```{python export}
+# Log-normalise for expression comparison
+mc_norm = mc_adata.copy()
+sc.pp.normalize_total(mc_norm, target_sum=1e4)
+sc.pp.log1p(mc_norm)
+
+expr_df = pd.DataFrame(
+    mc_norm.X.toarray() if sp.issparse(mc_norm.X) else mc_norm.X,
+    index   = mc_norm.obs_names,
+    columns = mc_norm.var_names
+).T  # genes × metacells
+
+expr_df.to_csv(OUT_DIR / 'seacells_hsc_expr.csv.gz', compression='gzip')
+mc_adata.obs.to_csv(OUT_DIR / 'seacells_hsc_obs.csv')
+
+print("Exported:")
+print(f"  seacells_hsc_expr.csv.gz — {expr_df.shape[0]} genes × {expr_df.shape[1]} metacells")
+print(f"  seacells_hsc_obs.csv     — metacell metadata")
+```
+
+---
+
+## Session info
+
+```{python session}
+import importlib, sys
+for pkg in ['SEACells', 'scanpy', 'anndata', 'numpy', 'pandas', 'scipy']:
+    try:
+        mod = importlib.import_module(pkg)
+        print(f"{pkg}: {mod.__version__}")
+    except Exception as e:
+        print(f"{pkg}: {e}")
+print(f"Python: {sys.version}")
+```

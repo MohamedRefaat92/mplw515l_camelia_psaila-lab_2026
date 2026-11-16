@@ -1,0 +1,129 @@
+---
+title: "PCA — Cell Distribution Along Principal Components"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+Distribution of cells along the top principal components for each processed
+subset. Parallel coordinates and PC scores on UMAP reveal batch structure
+and proliferative gradients captured by each PC.
+
+```{r setup}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(GGally)
+library(targets)
+
+source(file.path("src/R/scrna-seq_utilities.R"))
+```
+
+```{r params}
+targets::tar_load(proc_params)
+
+N_PCS      <- proc_params$n_pca_dims
+cc_palette <- c("S" = "#4393c3", "G2M" = "#e41a1c", "G1" = "#999999")
+```
+
+## 1. Parallel coordinates over PCs {.tabset}
+
+Each line is one cell; axes are the top `r N_PCS` PC embeddings. Panels coloured
+by **sample**, **cell cycle phase**, and **Seurat cluster** (active identity).
+
+::: {.panel-tabset}
+
+## HSC
+
+```{r pc-parcoor-hsc, fig.width=14, fig.height=15}
+targets::tar_load(pca_df_hsc)
+p_samp  <- plot_pc_parcoor(pca_df_hsc, "sample.name",
+                            title = "HSC — by sample")
+p_phase <- plot_pc_parcoor(pca_df_hsc, "Phase",
+                            title   = "HSC — by cell cycle phase",
+                            palette = cc_palette)
+p_clust <- plot_pc_parcoor(pca_df_hsc, "cluster",
+                            title = "HSC — by Seurat cluster")
+p_samp / p_phase / p_clust
+rm(pca_df_hsc); gc()
+```
+
+## MNC
+
+```{r pc-parcoor-mnc, fig.width=14, fig.height=15}
+targets::tar_load(pca_df_mnc)
+p_samp  <- plot_pc_parcoor(pca_df_mnc, "sample.name",
+                            title = "MNC — by sample")
+p_phase <- plot_pc_parcoor(pca_df_mnc, "Phase",
+                            title   = "MNC — by cell cycle phase",
+                            palette = cc_palette)
+p_clust <- plot_pc_parcoor(pca_df_mnc, "cluster",
+                            title = "MNC — by Seurat cluster")
+p_samp / p_phase / p_clust
+rm(pca_df_mnc); gc()
+```
+
+## Stroma
+
+```{r pc-parcoor-stroma, fig.width=14, fig.height=15}
+targets::tar_load(pca_df_stroma)
+p_samp  <- plot_pc_parcoor(pca_df_stroma, "sample.name",
+                            title = "Stroma — by sample")
+p_phase <- plot_pc_parcoor(pca_df_stroma, "Phase",
+                            title   = "Stroma — by cell cycle phase",
+                            palette = cc_palette)
+p_clust <- plot_pc_parcoor(pca_df_stroma, "cluster",
+                            title = "Stroma — by Seurat cluster")
+p_samp / p_phase / p_clust
+rm(pca_df_stroma); gc()
+```
+
+:::
+
+---
+
+## 2. PC scores on UMAP {.tabset}
+
+Each cell coloured by its score along each of the top `r N_PCS` PCs, projected
+onto the UMAP. Blue = negative loading direction; red = positive.
+
+::: {.panel-tabset}
+
+## HSC
+
+```{r pc-umap-hsc, fig.width=14, fig.height=12}
+targets::tar_load(pca_df_hsc)
+plot_pc_umap_grid(pca_df_hsc, n_pcs = N_PCS)
+rm(pca_df_hsc); gc()
+```
+
+## MNC
+
+```{r pc-umap-mnc, fig.width=14, fig.height=12}
+targets::tar_load(pca_df_mnc)
+plot_pc_umap_grid(pca_df_mnc, n_pcs = N_PCS)
+rm(pca_df_mnc); gc()
+```
+
+## Stroma
+
+```{r pc-umap-stroma, fig.width=14, fig.height=12}
+targets::tar_load(pca_df_stroma)
+plot_pc_umap_grid(pca_df_stroma, n_pcs = N_PCS)
+rm(pca_df_stroma); gc()
+```
+
+:::
+
+{{< include ../_session-info.qmd >}}

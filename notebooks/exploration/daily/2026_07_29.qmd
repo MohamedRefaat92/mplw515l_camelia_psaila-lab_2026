@@ -1,0 +1,49 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+p <- FeaturePlot(mpn_processed_hsc_fullcc,c("Csf3", "Mecom"), order = TRUE)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+
+Seurat::CellSelector(p)
+
+"Rx_4_AAGGACTAGGTGAACG-1" "Rx_4_CTACGACAGGCACTCG-1"
+```
+
+```{r}
+x <- read.csv("output/objects/dpt/dpt_cell_table.csv")
+mpn_processed_hsc_fullcc$dpt_pseudotime <- setNames(x$dpt_pseudotime,x$X)
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Epor", "Epo", "Igf1", "Igf1r"),split.by = "sample.name", order = TRUE)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Tagln2"),split.by = "sample.name", order = TRUE)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Tgm2"),split.by = "sample.name", order = TRUE)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Serpine1","Wwtr1"),split.by = "sample.name", order = TRUE)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+dc <- read_csv("output/objects/dpt/diffmap_components_pipeline_snn_seurat_k_30.csv") |> column_to_rownames("cell_id")
+mpn_processed_hsc_fullcc[["diffmap"]] <- CreateDimReducObject(
+  embeddings = as.matrix(dc[,-1]),
+  key = "DC_", 
+  assay = "SCT"
+)
+```
+
+```{r}
+clusts <- c("4","8","1","6","5","2","3")
+srt_sub <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.0.9 %in% clusts)
+
+```

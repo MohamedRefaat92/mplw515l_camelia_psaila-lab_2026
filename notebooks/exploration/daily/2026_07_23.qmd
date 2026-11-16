@@ -1,0 +1,122 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            c( "Hif1a", "Matn4"),
+            split.by = "sample.name",
+            reduction = "umap.nn",
+            pt.size = 0.1, order = T)&
+  scale_color_viridis_c(option = "turbo")&
+  RestoreLegend()
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Matn4_data <- mpn_processed_hsc_fullcc[["SCT"]]@data["Matn4",]
+mpn_processed_hsc_fullcc <- Seurat::GroupCorrelation(
+  mpn_processed_hsc_fullcc,
+  assay   = "SCT",
+  var     = "Matn4_data",
+  slot    = "data",
+  do.plot = FALSE
+  )
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% head
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% View
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c( "Hif1a", "Matn4", "Bcl2l1", "Meg3", "Cd14")  ,split.by = "sample.name",reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+Nebulosa::plot_density(subset(mpn_processed_hsc_fullcc,sample.name == "HSC_Het_CD41+mCh+"),features = c("Bcl2l1", "Hif1a"),joint = TRUE)
+
+```
+
+```{r}
+Nebulosa::plot_density(subset(mpn_processed_hsc_fullcc,sample.name == "HSC_Het_CD41+mCh+"),features = c("Bcl2l1", "Matn4"),joint = TRUE)
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Meg3_data <- mpn_processed_hsc_fullcc[["SCT"]]@data["Meg3",]
+mpn_processed_hsc_fullcc <- Seurat::GroupCorrelation(
+  mpn_processed_hsc_fullcc,
+  assay   = "SCT",
+  var     = "Meg3_data",
+  slot    = "data",
+  do.plot = FALSE
+  )
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% head
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% View
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c( "Meg3","Glis1", "Meis2", "Lif")  ,split.by = "sample.name",,reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c( "Lif")  ,split.by = "sample.name",,reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Glis1_data <- mpn_processed_hsc_fullcc[["SCT"]]@data["Glis1",]
+mpn_processed_hsc_fullcc <- Seurat::GroupCorrelation(
+  mpn_processed_hsc_fullcc,
+  assay   = "SCT",
+  var     = "Glis1_data",
+  slot    = "data",
+  do.plot = FALSE
+  )
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% head
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% View
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c( "Hbegf", "Itga3", "Glis1")  ,split.by = "sample.name",,reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c( "Hif1a", "Tm4sf1", "Meg3", "Lif")  ,split.by = "sample.name",,reduction = "umap.nn",pt.size = 0.1, order = T)&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+Nebulosa::plot_density(subset(mpn_processed_hsc_fullcc,sample.name == "HSC_Het_CD41+mCh+"),features = c("Vwf"),joint = TRUE)|Nebulosa::plot_density(subset(mpn_processed_hsc_fullcc,sample.name == "HSC_WT_CD41+"),features = c("Vwf"),joint = TRUE)
+
+```
+
+```{r}
+mpn_processed_hsc_fullcc$Hif1a_data <- mpn_processed_hsc_fullcc[["SCT"]]@data["Hif1a",]
+mpn_processed_hsc_fullcc <- Seurat::GroupCorrelation(
+  mpn_processed_hsc_fullcc,
+  assay   = "SCT",
+  var     = "Hif1a_data",
+  slot    = "data",
+  do.plot = FALSE
+  )
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% head
+mpn_processed_hsc_fullcc[["SCT"]]@meta.features %>% View
+```
+
+```{r}
+hif1a_expr <- as.numeric(mpn_processed_hsc_fullcc[["SCT"]]@data["Hif1a", ])
+
+x <- correlate_features_to_covariate(
+  mpn_processed_hsc_fullcc[["SCT"]]@data,
+  hif1a_expr,
+  method = "spearman"
+)
+```
+
+```{r}
+hif1a_expr <- as.numeric(mpn_processed_hsc_fullcc[["SCT"]]@data["Hif1a", ])
+
+x <- correlate_features_to_covariate(
+  mpn_processed_hsc_fullcc[["SCT"]]@data,
+  hif1a_expr,
+  method = "kendall",
+  features = VariableFeatures(mpn_processed_hsc_fullcc)
+)
+```

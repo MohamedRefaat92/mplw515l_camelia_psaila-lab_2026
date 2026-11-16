@@ -1,0 +1,302 @@
+---
+title: "PCA — Gene Set Enrichment Analysis"
+editor_options:
+  chunk_output_type: console
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+For each subset and principal component, genes are ranked by their feature
+loading score and tested for enrichment using `fgsea`. Positive loadings drive
+one end of the component; negative loadings drive the other.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+library(targets)
+
+library(fgsea)
+library(msigdbr)
+```
+
+```{r load}
+targets::tar_load(proc_params)
+targets::tar_load(mpn_processed_stroma)
+targets::tar_load(mpn_processed_hsc)
+targets::tar_load(mpn_processed_mnc)
+targets::tar_load(mpn_processed_hsc_mnc)
+
+PCA_REDUCTION <- paste0("pca.", proc_params$ref_assay)
+```
+
+```{r extract-loadings}
+# Extract PCA loadings (genes × PCs) from each subset, then drop the heavy
+# Seurat objects immediately to free memory.
+LOADINGS <- list(
+  stroma  = Seurat::Loadings(mpn_processed_stroma,  reduction = PCA_REDUCTION),
+  hsc     = Seurat::Loadings(mpn_processed_hsc,     reduction = PCA_REDUCTION),
+  mnc     = Seurat::Loadings(mpn_processed_mnc,     reduction = PCA_REDUCTION),
+  hsc_mnc = Seurat::Loadings(mpn_processed_hsc_mnc, reduction = PCA_REDUCTION)
+)
+
+rm(mpn_processed_stroma, mpn_processed_hsc, mpn_processed_mnc, mpn_processed_hsc_mnc)
+gc()
+```
+
+---
+
+## 1. Parameters
+
+```{r params}
+# ── Edit these ────────────────────────────────────────────────
+PCS_TO_TEST  <- seq_len(proc_params$n_pca_dims)
+MIN_SIZE     <- 15
+MAX_SIZE     <- 500
+NPERM        <- 1000
+PADJ_THRESH  <- 0.05
+N_TOP_SETS   <- 10
+# ──────────────────────────────────────────────────────────────
+
+# Two-letter abbreviations for MSigDB collection prefixes
+COLLECTION_ABBREV <- c(
+  "^HALLMARK_"    = "HM_",
+  "^KEGG_"        = "KG_",
+  "^REACTOME_"    = "RE_",
+  "^WP_"          = "WP_",
+  "^GOBP_"       = "BP_"
+)
+
+abbreviate_pathway <- function(x) {
+  for (pat in names(COLLECTION_ABBREV)) {
+    x <- sub(pat, COLLECTION_ABBREV[[pat]], x)
+  }
+  x
+}
+
+for (nm in names(LOADINGS)) {
+  message(nm, ": ", ncol(LOADINGS[[nm]]), " PCs available in ", PCA_REDUCTION)
+}
+```
+
+---
+
+## 2. Gene sets
+
+Databases: Hallmark, CP:KEGG, CP:REACTOME, CP:WIKIPATHWAYS, GO:BP.
+
+```{r gene-sets}
+MSIG_COLLECTIONS <- list(
+  list(collection = "H",  subcollection = NULL),
+  list(collection = "C2", subcollection = "CP:KEGG_LEGACY"),
+  list(collection = "C2", subcollection = "CP:REACTOME"),
+  list(collection = "C2", subcollection = "CP:WIKIPATHWAYS"),
+  list(collection = "C5", subcollection = "GO:BP")
+)
+
+msig_parts <- list()
+for (col in MSIG_COLLECTIONS) {
+  msig_parts[[length(msig_parts) + 1]] <- msigdbr::msigdbr(
+    species       = "Mus musculus",
+    collection    = col$collection,
+    subcollection = col$subcollection)
+}
+msig_df   <- do.call(rbind, msig_parts)
+gene_sets <- split(msig_df$gene_symbol, msig_df$gs_name)
+message(length(gene_sets), " gene sets loaded")
+rm(msig_parts)
+```
+
+---
+
+## 3. Run fgsea (all subsets)
+
+```{r run-fgsea}
+#| cache: true
+subset_gsea <- list()
+for (nm in names(LOADINGS)) {
+  loadings_mat <- LOADINGS[[nm]]
+  pcs          <- intersect(PCS_TO_TEST, seq_len(ncol(loadings_mat)))
+  loadings_mat <- loadings_mat[, pcs, drop = FALSE]
+
+  pc_results <- list()
+  for (pc in colnames(loadings_mat)) {
+    ranked         <- sort(loadings_mat[, pc], decreasing = TRUE)
+    res            <- fgsea::fgsea(pathways    = gene_sets,
+                                   stats       = ranked,
+                                   minSize     = MIN_SIZE,
+                                   maxSize     = MAX_SIZE,
+                                   nPermSimple = NPERM)
+    res$PC         <- pc
+    pc_results[[pc]] <- res
+  }
+
+  gsea_all    <- do.call(rbind, pc_results)
+  gsea_all$PC <- factor(gsea_all$PC, levels = colnames(loadings_mat))
+
+  message(nm, ": ", sum(gsea_all$padj < PADJ_THRESH, na.rm = TRUE),
+          " significant results (padj < ", PADJ_THRESH, ")")
+
+  subset_gsea[[nm]] <- list(results = pc_results, gsea_all = gsea_all,
+                            loadings_mat = loadings_mat)
+}
+```
+
+---
+
+## 4. Significant sets per PC {.tabset}
+
+::: {.panel-tabset}
+
+```{r sig-table-tabs}
+#| results: asis
+
+for (nm in names(subset_gsea)) {
+  cat("\n\n### ", nm, "\n\n")
+
+  gsea_sig <- subset_gsea[[nm]]$gsea_all |>
+    dplyr::filter(padj < PADJ_THRESH) |>
+    dplyr::arrange(PC, padj) |>
+    dplyr::select(PC, pathway, NES, padj, size, leadingEdge)
+
+  print(DT::datatable(
+    dplyr::select(gsea_sig, -leadingEdge) |>
+      dplyr::mutate(NES  = round(NES, 3),
+                    padj = signif(padj, 3)),
+    caption  = paste0(nm, " — significant gene sets (padj < ", PADJ_THRESH, ")"),
+    rownames = FALSE,
+    filter   = "top",
+    options  = list(pageLength = 20, scrollX = TRUE)
+  ))
+
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 5. NES heatmap — top sets across PCs {.tabset}
+
+Top `r N_TOP_SETS` sets per PC by |NES| (padj < threshold), union across all PCs.
+Grey = not significant.
+
+::: {.panel-tabset}
+
+```{r nes-heatmap-tabs}
+#| results: asis
+#| fig-width: 10
+
+for (nm in names(subset_gsea)) {
+  cat("\n\n### ", nm, "\n\n")
+
+  gsea_all <- subset_gsea[[nm]]$gsea_all
+  gsea_sig <- dplyr::filter(gsea_all, padj < PADJ_THRESH)
+
+  top_sets <- gsea_sig |>
+    dplyr::group_by(PC) |>
+    dplyr::slice_max(order_by = abs(NES), n = N_TOP_SETS) |>
+    dplyr::ungroup() |>
+    dplyr::pull(pathway) |>
+    unique()
+
+  if (length(top_sets) == 0) {
+    cat("No significant sets.\n\n")
+    next
+  }
+
+  heatmap_df <- gsea_all |>
+    dplyr::filter(pathway %in% top_sets) |>
+    dplyr::mutate(NES_plot = ifelse(padj < PADJ_THRESH, NES, NA_real_)) |>
+    dplyr::select(PC, pathway, NES_plot)
+
+  nes_wide <- tidyr::pivot_wider(heatmap_df,
+                                  names_from  = PC,
+                                  values_from = NES_plot)
+  nes_mat  <- as.matrix(tibble::column_to_rownames(nes_wide, "pathway"))
+  nes_mat  <- nes_mat[rowSums(!is.na(nes_mat)) > 0, , drop = FALSE]
+  rownames(nes_mat) <- stringr::str_trunc(abbreviate_pathway(rownames(nes_mat)), 55)
+
+  nes_for_clust <- nes_mat
+  nes_for_clust[is.na(nes_for_clust)] <- 0
+  row_order <- hclust(dist(nes_for_clust))
+
+  pheatmap::pheatmap(
+    nes_mat,
+    cluster_rows = row_order,
+    cluster_cols = FALSE,
+    color        = colorRampPalette(c("#2166ac", "white", "#d73027"))(101),
+    breaks       = seq(-3, 3, length.out = 102),
+    na_col       = "grey90",
+    fontsize_row = 7,
+    fontsize_col = 8,
+    angle_col    = 0,
+    main         = paste0(nm, " — NES heatmap, top ", N_TOP_SETS, " sets per PC")
+  )
+
+  cat("\n\n")
+}
+```
+
+:::
+
+---
+
+## 6. Per-PC enrichment plots (top 3 positive + negative) {.tabset}
+
+::: {.panel-tabset}
+
+```{r per-pc-plots-tabs}
+#| results: asis
+#| fig-height: 4
+
+for (nm in names(subset_gsea)) {
+  cat("\n\n### ", nm, "\n\n")
+
+  results      <- subset_gsea[[nm]]$results
+  loadings_mat <- subset_gsea[[nm]]$loadings_mat
+
+  for (pc in names(results)) {
+    res_pc <- results[[pc]] |>
+      dplyr::filter(padj < PADJ_THRESH) |>
+      dplyr::arrange(NES)
+
+    if (nrow(res_pc) == 0) next
+
+    top_neg <- head(res_pc$pathway, 3)
+    top_pos <- tail(res_pc$pathway, 3)
+    show    <- unique(c(top_neg, top_pos))
+    ranked  <- sort(loadings_mat[, pc], decreasing = TRUE)
+
+    plots <- list()
+    for (pw in show) {
+      nes_val  <- round(res_pc$NES[res_pc$pathway == pw], 2)
+      padj_val <- signif(res_pc$padj[res_pc$pathway == pw], 2)
+      plots[[pw]] <- fgsea::plotEnrichment(gene_sets[[pw]], ranked) +
+        labs(title    = stringr::str_trunc(abbreviate_pathway(pw), 50),
+             subtitle = paste0(pc, "  NES=", nes_val, "  padj=", padj_val)) +
+        theme_bw(base_size = 9) +
+        theme(plot.title    = element_text(size = 7),
+              plot.subtitle = element_text(size = 7))
+    }
+
+    print(patchwork::wrap_plots(plots, ncol = 3) +
+            patchwork::plot_annotation(title = paste0(nm, " — ", pc)))
+  }
+
+  cat("\n\n")
+}
+```
+
+:::

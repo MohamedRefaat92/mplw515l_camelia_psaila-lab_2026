@@ -1,0 +1,309 @@
+---
+title: "2026_05_19"
+format: html
+editor: visual
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(miloDE)
+```
+
+```{r}
+targets::tar_load(milo_hsc_obj)
+targets::tar_load(milo_within_ngb_pos_de)
+targets::tar_load(milo_hsc_da)
+
+de_stat = miloDE::convert_de_stat(milo_within_ngb_pos_de)
+milo_within_ngb_pos_de$pval_corrected_across_nhoods <- milo_within_ngb_pos_de$pval_corrected_across_genes
+hood_annot <-     miloR::annotateNhoods(milo_hsc_obj,
+                                        da.res = milo_hsc_da$mChPos_vs_WT$da_results,
+                                        coldata_col = "sNN_pca.SCT_30_res.0.9")
+```
+
+```{r}
+stat_de_magnitude = miloDE::rank_neighbourhoods_by_DE_magnitude(de_stat)
+
+ miloDE::plot_milo_by_single_metric(milo_hsc_obj,
+                            stat_de_magnitude, 
+                            colour_by = "n_DE_genes",
+                            layout = "umap.nn" ,
+                            size_range = c(1.5,3) ,
+                            edge_width = c(0.2,0.5)) + 
+  scale_fill_viridis_c(name = "# DE genes",option = "turbo")
+ 
+  miloDE::plot_milo_by_single_metric(milo_hsc_obj,
+                            stat_de_magnitude, 
+                            colour_by = "n_specific_DE_genes",
+                            layout = "umap.nn" ,
+                            size_range = c(1.5,3) ,
+                            edge_width = c(0.2,0.5)) + 
+  scale_fill_viridis_c(name = "# specific DE genes",option = "turbo")
+  
+miloDE::plot_DE_single_gene(milo_hsc_obj,
+                            milo_within_ngb_pos_de,
+                            gene = "Klf1",
+                            layout = "umap.nn",
+                            alpha = 1)& 
+    ggplot2::scale_fill_gradient2(
+        low    = "blue",
+        mid    =  "white",
+        high   = "red")
+```
+
+```{r}
+hoods_6_8 <- hood_annot %>% filter(sNN_pca.SCT_30_res.0.9 %in% c("6", "8")) %>% pull(Nhood) %>%  unique()
+milo_within_ngb_pos_de  %>%
+  filter(Nhood %in% hoods_6_8) %>%
+  head()
+
+```
+
+```{r}
+
+srt_sub <- mpn_processed_hsc_fullcc %>%
+  subset(sNN_pca.SCT_30_res.0.9 %in% c("6"))%>%
+  FindVariableFeatures() %>%
+   ScaleData() %>%
+   RunPCA() %>%
+   FindNeighbors(dims = 1:10) %>%
+   FindClusters(resolution = c(0.5,0.9)) %>%
+   RunUMAP(dims = 1:10,
+           min.dist = 0.05, 
+           n.neighbors = 15)
+
+
+```
+
+```{r}
+  genes_use <- intersect(                                                                  
+    VariableFeatures(mpn_processed_hsc_fullcc),                                            
+    rownames(milo_hsc_obj)                                                                   
+  )                                                                                        
+                                                                                         
+  nhood_markers <- miloR::findNhoodMarkers(                                                
+    milo_hsc_obj[genes_use, ],
+    da.res            = milo_hsc_da$mChPos_vs_WT$da_results,                                  
+    assay             = "logcounts",                                                     
+    aggregate.samples = TRUE,                   
+    sample_col        = "dm2_class",      
+    da.fdr            = 1,  
+    overlap =1,
+    return.groups = TRUE
+  )                                                                                      
+ 
+```
+
+```{r}
+hood_groups_res <-   miloR::groupNhoods(milo_hsc_obj[genes_use, ],
+                                        da.res            = milo_hsc_da$mChPos_vs_WT$da_results,
+                                        da.fdr = 1,
+                                        merge.discord = TRUE,
+                                        overlap = 20
+                                        )                                                                                    
+
+hood_groups_res %>%
+  dplyr::count(NhoodGroup)
+
+hood_groups_res %>%
+  dplyr::count(sNN_pca.SCT_30_res.0.9,NhoodGroup)
+
+nhood_markers <- miloR::findNhoodGroupMarkers(                                                
+  milo_hsc_obj[genes_use, ],
+  da.res            = hood_groups_res,                                  
+  assay             = "logcounts",                                                     
+  aggregate.samples = TRUE,                   
+  sample_col        = "dm2_class",
+)                                                                                      
+
+group_hood_annot <- hood_groups_res %>%
+    dplyr::distinct(sNN_pca.SCT_30_res.0.9,NhoodGroup) %>%
+  group_by(NhoodGroup)%>%
+  summarize(x = paste(sNN_pca.SCT_30_res.0.9,collapse = ","))%>%
+  ungroup()
+
+nhood_markers %>%
+  pivot_longer(-GeneID) %>% 
+  separate_wider_delim(cols = name,delim = "_",names = c("stat","group")) %>% 
+  pivot_wider(names_from = stat, values_from = value) %>%
+  inner_join(group_hood_annot,by = c("group" = "NhoodGroup"))
+
+```
+
+```{r}
+mpn_processed_hsc_fullcc$mix <- Seurat::MixingMetric(
+  object       = mpn_processed_hsc_fullcc,
+  grouping.var = "sNN_pca.SCT_30_res.1.5",
+  reduction    = "umap.nn",
+  k = 500,max.k = 500)
+
+
+VlnPlot(mpn_processed_hsc_fullcc, features = "mix",group.by = "sample.name")
+
+Seurat::FeaturePlot(mpn_processed_hsc_fullcc,
+                    "mix",
+                    reduction = "umap.nn")
+
+
+reduction <- "umap.nn"
+verbose <- TRUE
+dims <- 1:2
+eps <- 0
+k <- 5
+grouping.var <- "grp"
+my.sapply <- ifelse(test = verbose && nbrOfWorkers() == 1,
+                    yes = pbapply::pbsapply, 
+                    no = future_sapply)
+embeddings <- Embeddings(object = mpn_processed_hsc_fullcc[[reduction]])[, 
+    dims]
+nn <- RANN::nn2(data = embeddings, k = max.k, eps = )
+group.info <- mpn_processed_hsc_fullcc[[grouping.var, drop = TRUE]]
+groups <- unique(x = group.info)
+mixing <- my.sapply(X = 1:ncol(x = mpn_processed_hsc_fullcc), FUN = function(x) {
+    sapply(X = groups, FUN = function(y) {
+        which(x = group.info[nn$nn.idx[x, ]] == y)[k]
+    })
+})
+mixing[is.na(x = mixing)] <- max.k
+mpn_processed_hsc_fullcc$mix  <- apply(X = mixing, MARGIN = 2, FUN = median)
+
+
+VlnPlot(mpn_processed_hsc_fullcc, features = "mix",group.by = "sample.name")
+
+```
+
+neighbors expression entropy
+
+```{r}
+nn_index <- mpn_processed_hsc_fullcc@neighbors$neighbors_pca.SCT_30@nn.idx
+genes <- VariableFeatures(mpn_processed_hsc_fullcc)
+expr_matrix <- GetAssayData(mpn_processed_hsc_fullcc, 
+                            assay = "SCT", 
+                            layer = "data")[genes,]
+n_cells <- ncol(expr_matrix)
+local_entropy_per_cell <- sapply(seq_len(n_cells), function(i) {
+  neighbors <- nn_index[i, ]
+  expr_local <- expr_matrix[, neighbors]
+  # For each gene, variance in the local neighborhood
+  apply(expr_local, 1, var)
+  }) %>%
+  t()
+rownames(local_entropy_per_cell) <- colnames(expr_matrix)
+mpn_processed_hsc_fullcc <- AddMetaData(mpn_processed_hsc_fullcc,local_entropy_per_cell)
+mpn_processed_hsc_fullcc$avg_entropy <- apply(local_entropy_per_cell,1,mean)
+FeaturePlot(mpn_processed_hsc_fullcc,features = c("Pf4", "sct_Pf4"))&
+  scale_color_viridis_c()
+FeaturePlot(mpn_processed_hsc_fullcc,
+            features = "avg_entropy")+
+  scale_color_viridis_c(option = "turbo")
+```
+
+local distance
+
+```{r}
+nn_dist <- mpn_processed_hsc_fullcc@neighbors$neighbors_pca.SCT_30@nn.dist %>% apply(1,mean)
+names(nn_dist) <- mpn_processed_hsc_fullcc@neighbors$neighbors_pca.SCT_30@cell.names
+mpn_processed_hsc_fullcc$nn_dist <- nn_dist
+VlnPlot(mpn_processed_hsc_fullcc, features = "nn_dist",group.by = "sNN_pca.SCT_30_res.0.9",alpha = 0.2,sort = TRUE)
+VlnPlot(mpn_processed_hsc_fullcc, features = "nn_dist",group.by = "sample.name",alpha = 0.2,sort = TRUE)
+```
+
+```{r}
+BiocManager::install('OmnipathR')
+BiocManager::install('saezlab/decoupleR')
+net <- decoupleR::get_progeny(organism = 'mouse', top = 500)
+
+genes <- VariableFeatures(mpn_processed_hsc_fullcc)
+mat <- GetAssayData(mpn_processed_hsc_fullcc, 
+                            assay = "SCT", 
+                            layer = "data")[genes,]%>%
+  as.matrix()
+
+# Run mlm
+acts <- decoupleR::run_mlm(mat = mat, 
+                           net = net, 
+                           .source = 'source', 
+                           .target = 'target',
+                           .mor = 'weight', 
+                           minsize = 5)
+
+# Extract mlm and store it in pathwaysmlm in data
+mpn_processed_hsc_fullcc[['pathwaysmlm']] <- acts %>%
+                         tidyr::pivot_wider(id_cols = 'source', 
+                                            names_from = 'condition',
+                                            values_from = 'score') %>%
+                         tibble::column_to_rownames(var = 'source') %>%
+                         Seurat::CreateAssayObject(.)
+
+# Change assay
+Seurat::DefaultAssay(object = mpn_processed_hsc_fullcc) <- "pathwaysmlm"
+
+# Scale the data
+mpn_processed_hsc_fullcc <- Seurat::ScaleData(mpn_processed_hsc_fullcc,assay = "pathwaysmlm")
+
+FeaturePlot(mpn_processed_hsc_fullcc,
+            features = rownames(mpn_processed_hsc_fullcc[["pathwaysmlm"]]),
+            assay ="pathwaysmlm",
+            slot = "scale.data" ,
+            order = F)&
+  scale_color_viridis_c(option = "turbo")
+
+```
+
+```{r}
+net <- decoupleR::get_collectri(organism = 'mouse', 
+                                split_complexes = FALSE)
+
+acts <- decoupleR::run_ulm(mat = mat, 
+                           net = net, 
+                           .source = 'source', 
+                           .target = 'target',
+                           .mor='mor', 
+                           minsize = 5)
+
+```
+
+```{r}
+srt_sub <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.0.9 %in% c("6", "8"))
+bin_counts <- GetAssayData(srt_sub,assay = "SCT",layer = "counts")>1
+bin_sum <- aggregate(t(bin_counts),
+                     list(Region = srt_sub$sample.name), 
+                     sum) %>%
+  column_to_rownames("Region") %>%
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("gene")
+
+bin_sum %>%
+    filter(`HSC_WT_CD41+` <=1) %>% 
+    pivot_longer(-gene)%>%
+    group_by(gene) %>% 
+    filter(!all(value == 0)) %>%
+    ungroup() %>% 
+    filter(name != "HSC_WT_CD41+") %>% 
+    ggplot(aes(log10(value+1), fill = name))+
+    geom_histogram(bins = 100)+
+    facet_wrap(~name)+
+    scale_x_continuous()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,
+            features = c("Mansc1", "Apold1", "Sptbn4", "Pls1"),split.by = "sample.name",order =T)
+```
+
+```{r}
+https://saezlab.github.io/kinase_tf_mini_tuto/
+  
+dorothea_hs <- decoupleR::get_dorothea(organism='human', levels=c('A', 'B', 'C'))
+
+acts <- decoupleR::run_ulm(mat = mat, 
+                           net = dorothea_hs, 
+                           .source = 'source', 
+                           .target = 'target',
+                           .mor='mor', 
+                           minsize = 5)
+
+
+```

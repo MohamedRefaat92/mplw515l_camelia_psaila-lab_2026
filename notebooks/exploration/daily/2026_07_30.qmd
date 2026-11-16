@@ -1,0 +1,137 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{r}
+srt_sub2 <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.1.5 == "2")
+
+srt_sub2 <- find_neighbors_clusters(srt_sub2,
+                               dims_i    = 1:50,
+                               ref_assay = "SCT",
+                               k         = 30,
+                               res       = c(0.2,0.5))
+
+srt_sub2 <- Seurat::RunUMAP(srt_sub2,
+                  n.neighbors    = 30,
+                  nn.name        = Seurat::Neighbors(srt_sub),
+                  reduction.name = "umap",
+                  return.model   = FALSE)
+
+```
+
+```{r}
+FeaturePlot(srt_sub2,c("Igf1","Glis1", "Csf3"), order = TRUE,reduction = "umap")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+DimPlot(srt_sub2, label = TRUE,reduction = "umap",split.by = "sample.name")
+```
+
+```{r}
+x <- FindAllMarkers(srt_sub2)
+```
+
+```{r}
+srt_sub <- subset(mpn_processed_hsc_fullcc, sNN_pca.SCT_30_res.1.5 == "2")
+
+srt_sub <- process_all_cc(srt_sub,
+                  ref_assay     = proc_params$ref_assay,
+                  dims_i        = seq(proc_params$n_pca_dims),
+                  k             = proc_params$k_neighbors,
+                  res           = c(0.2,0.5),
+                  n_features    = proc_params$n_features,
+                  k.nn          = proc_params$n_umap_neighbors,
+                  exclude_genes = excluded_genes)
+
+```
+
+```{r}
+FeaturePlot(srt_sub,c("Igf1","Glis1", "Csf3"), order = TRUE,reduction = "umap.nn")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+x <- FindAllMarkers(srt_sub,
+                    group.by = "sNN_pca.SCT_30_res.0.5")
+clust_sub <- as.character(srt_sub$sNN_pca.SCT_30_res.0.5)
+names(clust_sub) <- names(srt_sub$sNN_pca.SCT_30_res.0.5)
+```
+
+```{r}
+clust <- as.character(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.1.5)
+names(clust) <- names(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.1.5)
+clust[names(clust_sub)] <- paste0(clust_sub,"_sub")
+mpn_processed_hsc_fullcc$clust <- clust
+```
+
+```{r}
+mpn_processed_hsc_fullcc$clust_cond <- paste0(mpn_processed_hsc_fullcc$clust,mpn_processed_hsc_fullcc$sample.name)
+```
+
+```{r}
+x <- FindMarkers(mpn_processed_hsc_fullcc,
+                    group.by = "clust",ident.1 = "0_sub")
+x2 <- FindMarkers(mpn_processed_hsc_fullcc,
+                    group.by = "clust_cond",ident.1 = "0_subHSC_Het_CD41+mCh+")
+```
+
+```{r}
+var_feats <- FindVariableFeatures_filt(cg_srt,
+                                       exclude_genes    = exclude_genes,
+                                       selection.method = "vst",
+                                       nfeatures        = n_features)
+```
+
+```{r}
+clust_marker_0.9 %>%
+    filter(sig) %>%
+    ggplot(aes(rate1,log_fc, color = group1))+
+    geom_point(size = 0.5)+
+    facet_wrap(~group1)
+```
+
+```{r}
+pos     <- Embeddings(srt_sub, "pca.SCT")[, 1:10]
+genes   <- VariableFeatures(srt_sub2)
+genes <- c(genes, "Igf1", "Meg3")
+data    <- as.matrix(GetAssayData(srt_sub, assay = "SCT", layer = "data")[genes, ])
+res     <- Seurat::RunMoransI(data = data, pos = pos)
+x <- tibble::tibble(
+  gene      = rownames(res),
+  morans_i  = res$observed,
+  p_value   = res$p.value,
+  p_adj     = p.adjust(res$p.value, method = "BH"),
+) |> dplyr::arrange(dplyr::desc(morans_i))
+
+```
+
+```{r}
+Idents(mpn_processed_hsc_fullcc) <- "sNN_pca.SCT_30_res.1.5"
+mpn_processed_hsc_fullcc <- Seurat::FindSubCluster(mpn_processed_hsc_fullcc,
+                                                   cluster = "2")
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Spp1","Eml1", "Hoxb8"), order = TRUE,reduction = "umap.nn", split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+FeaturePlot(mpn_processed_hsc_fullcc,c("Spp1"), order = TRUE,reduction = "umap.nn", split.by = "sample.name")&scale_color_viridis_c(option = "turbo")&RestoreLegend()
+```
+
+```{r}
+x3 <- FindMarkers(mpn_processed_hsc_fullcc,
+                    group.by = "sNN_pca.SCT_30_res.1.5",ident.1 = "2")
+```
+
+```{r}
+mpn_processed_hsc_fullcc$clust_1.5_cond <- paste0(mpn_processed_hsc_fullcc$sNN_pca.SCT_30_res.1.5,mpn_processed_hsc_fullcc$sample.name)
+
+
+```
+
+```{r}
+x2 <- FindMarkers(mpn_processed_hsc_fullcc,
+                    group.by = "clust_1.5_cond",ident.1 = "2HSC_Het_CD41+mCh+")
+```

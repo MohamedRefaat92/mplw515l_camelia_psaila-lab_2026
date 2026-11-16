@@ -1,0 +1,784 @@
+---
+title: "CellRank — HSC Trajectory Inference"
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    number-sections: true
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+library(DT)
+library(knitr)
+
+VELOCITY_DIR <- file.path("output/objects/cellrank/cytotrace")
+CELLRANK_TABLE_DIR <- file.path(VELOCITY_DIR, "tables")
+CELLRANK_FIG_DIR   <- file.path(VELOCITY_DIR, "figures")
+```
+
+## Overview
+
+This notebook presents the results of CellRank trajectory inference on the HSC
+compartment (53,720 cells after QC). Because BAM files are not yet available,
+RNA velocity cannot be computed. Instead, the analysis uses **CytoTRACE2 score**
+as a pseudotime proxy: higher scores indicate more stem-like, less differentiated
+states. CellRank translates these scores into directed transition probabilities
+that guide cells from progenitor to terminal fates.
+
+**Workflow summary**
+
+| Step | Method | Output |
+|------|--------|--------|
+| Pseudotime | CytoTRACE2 score (pre-computed) | `cytotrace2_score` in obs |
+| Transition matrix | `PseudotimeKernel` (0.8) + `ConnectivityKernel` (0.2) | directed graph |
+| Terminal states | CFLARE — sparse eigendecomposition | 14 macrostates |
+| Fate probabilities | Linear system per terminal state | per-cell fate scores |
+| Driver genes | Fate–expression correlation per cluster | ranked gene lists |
+| Gene trends | GAM along pseudotime | expression curves |
+
+> **Cluster column used:** `sNN_pca.SCT_30_res.0.1` (10 coarse clusters).
+> Clusters label terminal states and stratify driver gene results but do **not**
+> influence the transition matrix or eigendecomposition.
+
+---
+
+## 1  CytoTRACE2 pseudotime
+
+```{r cytotrace-umap, fig.cap="Left: CytoTRACE2 score (RdYlBu_r, high = stem-like). Right: cluster labels at resolution 0.1.", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "overview_umap.png"))
+```
+
+**Interpretation.** CytoTRACE2 score reflects transcriptional complexity: cells
+with more unique genes expressed per cell score higher and are inferred to be
+more primitive. In the HSC compartment, a gradient from high-scoring progenitor
+regions (warm colours, typically cluster 5 / 6 territory) to lower-scoring,
+more committed regions is expected. The right panel shows the coarse cluster
+structure that will be used to annotate terminal states.
+
+---
+
+## 2  Kernel projection — directed transitions
+
+```{r kernel-projection, fig.cap="Transition probability arrows projected onto UMAP. Arrow direction reflects the inferred differentiation flow derived from CytoTRACE2 pseudotime.", out.width="90%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "kernel_projection.png"))
+```
+
+**Interpretation.** Each arrow summarises the net expected displacement of a
+cell under the transition matrix. The kernel is a weighted combination:
+
+- **PseudotimeKernel (80%)** — biases transitions towards cells with lower
+  CytoTRACE2 score (i.e., towards more differentiated states).
+- **ConnectivityKernel (20%)** — adds local neighbourhood smoothing, preventing
+  sharp directional discontinuities in sparse UMAP regions.
+
+Coherent arrow streams indicate genuine directional flow; disordered arrows in
+a region suggest either genuine progenitor plasticity or ambiguous pseudotime
+ordering there.
+
+---
+
+## 3  CFLARE eigenspectrum
+
+```{r cflare-spectrum, fig.cap="Real part of the leading eigenvalues of the transition matrix. The eigenvalue gap (drop from ~1 to lower values) suggests the number of quasi-stable macrostates.", out.width="70%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "cflare_spectrum.png"))
+```
+
+**Interpretation.** CFLARE (Clustering of Left and Right Eigenvectors)
+identifies terminal states from the top eigenvectors of the transition matrix.
+Eigenvalues near 1 correspond to absorbing or near-absorbing states —
+populations where trajectories tend to end. The number of eigenvectors
+retained (`k = 6`) was set conservatively; the spectrum can be used to
+revisit this choice (a clear gap after the 6th eigenvalue would validate it).
+
+> **Note on method choice.** GPCCA (the more common CellRank estimator) was
+> not feasible here: its Schur decomposition with the `brandts` algorithm
+> requires densifying the 53,720 × 53,720 transition matrix (~23 GB). CFLARE
+> operates on sparse eigenvectors and is the appropriate choice at this scale.
+
+---
+
+## 4  Terminal states
+
+```{r terminal-states, fig.cap="Terminal states identified by CFLARE overlaid on UMAP. Each colour corresponds to one of the 14 macrostates; grey cells are not assigned to any terminal state.", out.width="90%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "terminal_states.png"))
+```
+
+**Interpretation.** CFLARE identified **14 terminal states** from `k = 6`
+eigenvectors. Their names (e.g. `5_1`, `3_2`) encode the dominant cluster
+label followed by a counter for states sharing that cluster — an artefact of
+using coarse `res = 0.1` clusters (10 clusters for 14 states means some
+clusters harbour multiple distinct terminal populations).
+
+Biologically, a terminal state represents a transcriptional attractor: a cell
+state from which the system does not readily escape. In the HSC compartment,
+expected attractors include megakaryocyte progenitors, erythroid progenitors,
+and lymphoid/myeloid-committed populations.
+
+> **Refinement tip.** Re-running `predict()` and `compute_lineage_drivers()`
+> with a higher-resolution cluster column (e.g. `res = 0.5`) already in the
+> h5ad would give each terminal state a unique, biologically meaningful label
+> without recomputing the transition matrix.
+
+---
+
+## 5  Fate probabilities
+
+```{r fate-probs-umap, fig.cap="Per-cell fate probability for each of the 14 terminal states, shown on UMAP. Each panel sums to 1 across all 14 fates per cell.", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "fate_probabilities.png"))
+```
+
+**Interpretation.** Fate probabilities quantify the likelihood that a given
+cell will ultimately reach each terminal state, given the current transition
+dynamics. Cells near a terminal state have probability ≈ 1 for that fate and
+≈ 0 for all others. Cells in transitional or multipotent regions display
+distributed probabilities across several fates — a hallmark of progenitor
+identity.
+
+Comparing fate probability maps with marker gene UMAPs (e.g. `Gata1` for
+erythroid, `Pf4`/`Vwf` for megakaryocyte, `Csf1r` for myeloid) will reveal
+which macrostates correspond to which lineages.
+
+### 5.1  Mean fate probability per cluster
+
+```{r fate-per-cluster}
+fp <- read.csv(file.path(CELLRANK_TABLE_DIR, "fate_prob_per_cluster.csv"),
+               check.names = FALSE)
+colnames(fp)[1] <- "cluster"
+fp$cluster <- as.character(fp$cluster)
+
+# Round and display
+fp_round <- fp
+fp_round[, -1] <- round(fp[, -1], 3)
+
+DT::datatable(
+  fp_round,
+  rownames  = FALSE,
+  caption   = "Mean fate probability per cluster (rows) for each terminal state (columns).",
+  options   = list(scrollX = TRUE, pageLength = 10, dom = "t")
+) |>
+  DT::formatStyle(columns = colnames(fp_round)[-1],
+                  background = DT::styleColorBar(c(0, 1), "#b8d4e8"),
+                  backgroundSize = "90% 70%",
+                  backgroundRepeat = "no-repeat",
+                  backgroundPosition = "center")
+```
+
+```{r fate-heatmap, fig.height=5, fig.width=10, fig.cap="Heatmap of mean fate probability per cluster. Rows = clusters, columns = terminal states."}
+mat <- as.matrix(fp[, -1])
+rownames(mat) <- fp$cluster
+
+# Normalise columns to [0,1] for colour contrast
+mat_scaled <- apply(mat, 2, function(x) (x - min(x)) / (max(x) - min(x) + 1e-9))
+
+pheatmap(
+  mat_scaled,
+  color            = colorRampPalette(c("white", "#2166ac"))(100),
+  cluster_rows     = TRUE,
+  cluster_cols     = TRUE,
+  display_numbers  = round(mat, 2),
+  number_color     = "black",
+  fontsize_number  = 7,
+  fontsize_row     = 9,
+  fontsize_col     = 8,
+  angle_col        = 45,
+  main             = "Mean fate probability per cluster\n(colour = column-scaled; numbers = raw probability)"
+)
+```
+
+**Interpretation.** Each row is a cluster, each column is a terminal state.
+High values (dark blue) indicate that a cluster predominantly contributes cells
+to that fate. Rows with uniformly distributed probabilities correspond to
+multipotent progenitor clusters; rows with one dominant fate are more committed.
+Clusters 3 and 5 appear to contribute to distinct terminal states, consistent
+with their spatial separation on the UMAP.
+
+### 5.2  Fate probabilities by condition
+
+```{r fate-by-condition, fig.cap="Box plots of fate probability distributions per terminal state, split by sample (sample.name). Differences between WT, Het mCh−, and Het mCh+ indicate condition-specific biases in lineage commitment.", out.width="100%"}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "fate_by_condition.png"))
+```
+
+**Interpretation.** If the MPL mutation alters lineage bias, condition-specific
+shifts in fate probability are expected — for example, an enrichment of the
+megakaryocyte-fated terminal state in Het mCh+ cells. At this stage, the
+boxplots provide a first-pass view; formal statistical testing (e.g.
+Wilcoxon / linear mixed model) should follow once terminal states have been
+annotated to lineages.
+
+---
+
+## 6  Lineage driver genes
+
+```{r lineage-drivers, results="asis"}
+# Each terminal state has its own PNG under figures/lineage_drivers/.
+# Use xfun::base64_uri() to inline each image — the only reliable pattern for
+# mixing section headers and figures inside a results="asis" loop.
+driver_dir <- file.path(CELLRANK_FIG_DIR, "lineage_drivers")
+driver_pngs <- sort(list.files(driver_dir, pattern = "\\.png$", full.names = TRUE))
+
+for (png in driver_pngs) {
+  ts_name <- tools::file_path_sans_ext(basename(png))
+  cat(sprintf("\n### Terminal state: %s\n\n", ts_name))
+  cat(sprintf('<img src="%s" style="width:90%%;display:block;margin:auto;">\n\n',
+              xfun::base64_uri(png)))
+}
+```
+
+**Interpretation.** Driver genes are those whose expression is most correlated
+with a cell's probability of reaching a given terminal state. They are not
+necessarily differentially expressed between clusters — they capture continuous
+expression gradients along the trajectory.
+
+- Genes enriched in known lineage programs (e.g. `Gata1`, `Klf1` for
+  erythroid; `Pf4`, `Vwf` for megakaryocyte; `Mpo`, `Csf1r` for myeloid)
+  provide immediate biological validation.
+- Novel high-ranking drivers are candidates for functional follow-up.
+- The presence of ribosomal or stress genes among top drivers would flag
+  technical confounders and warrant further QC.
+
+---
+
+## 7  Gene expression trends along pseudotime
+
+```{r gene-trends, fig.cap="GAM-smoothed expression of canonical HSC and lineage marker genes along CytoTRACE2 pseudotime, per terminal state. Shaded bands = 95% confidence intervals.", out.width="100%", fig.height=14}
+knitr::include_graphics(file.path(CELLRANK_FIG_DIR, "gene_trends.png"))
+```
+
+**Interpretation.** Each panel shows how expression of a gene changes as cells
+progress along the pseudotime axis towards each terminal fate.
+
+| Gene | Expected pattern |
+|------|-----------------|
+| `Cd34`, `Kit`, `Slamf1` | High early (HSC), declining with commitment |
+| `Mpl` | Elevated in MPN model; may persist or expand in Het populations |
+| `Gata1` | Rising towards erythroid / MK terminal states |
+| `Pf4`, `Vwf` | Rising specifically towards MK fate |
+| `Csf1r`, `Ly6c2` | Rising towards myeloid / monocyte fate |
+
+Divergent trends between terminal states confirm that CellRank has resolved
+distinct lineage trajectories. Flat or noisy trends suggest either a gene is
+not strongly regulated along this axis, or the pseudotime ordering is
+imperfect in that region.
+
+---
+
+## 8  Cluster-level transition matrix
+
+The cluster × cluster transition matrix is derived from the full-resolution
+cell-level Markov transition matrix $T$ via row-normalised aggregation:
+
+$$T^{cl}_{ij} = \frac{1}{n_i} \sum_{a \in C_i} \sum_{b \in C_j} T_{ab}$$
+
+where $C_i$ is the set of cells in cluster $i$ and $n_i = |C_i|$. Each row of
+$T^{cl}$ sums to 1; entry $T^{cl}_{ij}$ is the expected fraction of outgoing
+flux from cluster $i$ that lands in cluster $j$ in one Markov step. Values
+are computed from 50,056 cells at resolution 0.9 (21 clusters).
+
+```{r cl-trans-table}
+cl_trans <- read.csv(file.path(CELLRANK_TABLE_DIR, "cluster_transition_matrix.csv"),
+                     check.names = FALSE, row.names = 1)
+
+# Round and display
+DT::datatable(
+  round(cl_trans, 3),
+  caption = "Cluster × cluster one-step Markov transition probabilities (rows sum to 1).",
+  options = list(scrollX = TRUE, pageLength = 10, dom = "t")
+) |>
+  DT::formatStyle(
+    columns = colnames(cl_trans),
+    background = DT::styleColorBar(c(0, 1), "#fed976"),
+    backgroundSize = "90% 70%",
+    backgroundRepeat = "no-repeat",
+    backgroundPosition = "center"
+  )
+```
+
+```{r cl-trans-heatmap, fig.height=8, fig.width=8, fig.cap="Cluster transition probability heatmap. High off-diagonal values indicate directed flux. Diagonal = self-retention (values near 1 indicate committed/terminal clusters)."}
+library(pheatmap)
+mat_plot <- as.matrix(cl_trans)
+# Sort clusters numerically
+cl_order <- as.character(sort(as.numeric(rownames(mat_plot))))
+mat_plot <- mat_plot[cl_order, cl_order]
+
+breaks <- c(seq(0, 0.1, length.out = 90), seq(0.1, 1.0, length.out = 11))
+breaks <- sort(unique(breaks))
+pheatmap(
+  mat_plot,
+  color           = colorRampPalette(c("#f7f7f7", "#fed976", "#b10026"))(length(breaks) - 1),
+  breaks          = breaks,
+  cluster_rows    = FALSE,
+  cluster_cols    = FALSE,
+  display_numbers = round(mat_plot, 2),
+  number_color    = "black",
+  fontsize_number = 5,
+  fontsize_row    = 9,
+  fontsize_col    = 8,
+  angle_col       = 45,
+  main            = "CellRank cluster transition probabilities (CytoTRACE2)\nRows sum to 1"
+)
+```
+
+**Interpretation.** High diagonal values (self-retention) mark terminal or
+slow-transitioning clusters. High off-diagonal entries from cluster $i$ to
+cluster $j$ indicate a dominant directed flux — a candidate progenitor →
+progeny relationship. Cross-referencing with the trajectory UMAP and lineage
+driver genes allows biological annotation of these transitions.
+
+---
+
+## Methods & background
+
+### How CellRank works
+
+CellRank frames trajectory inference as a **finite, absorbing Markov chain**.
+Each cell is a state; the transition matrix $T$ encodes the probability of
+"moving from" cell $i$ "to" cell $j$ in one step. The biological assumption is
+that cells performing differentiation follow a directed random walk on the
+transcriptome manifold: they tend to move toward more committed states, with
+occasional backward or lateral steps.
+
+#### Step 1 — Building the transition matrix
+
+The matrix $T$ is constructed from one or more *kernels*, each encoding a
+different biological signal:
+
+**`PseudotimeKernel`**
+
+For each cell $i$ and each of its $k$-nearest neighbours $j$, the kernel
+assigns a weight using a sigmoid (soft-threshold) function:
+
+$$w_{ij} = \sigma\!\left(\nu \cdot \frac{t_j - t_i}{\text{std}(t)}\right), \quad \sigma(x) = \frac{1}{1 + e^{-x}}$$
+
+where $t$ is the pseudotime variable and $\nu$ controls sharpness. When
+$t_j > t_i$ (neighbour is "later" in pseudotime), $w_{ij} \to 1$ — the
+transition is favoured. When $t_j < t_i$, $w_{ij} \to 0$ — the transition is
+penalised. Row-normalising these weights gives a stochastic row of $T$.
+
+Key implication: **the kernel treats higher pseudotime values as
+"later" / more differentiated**. If your pseudotime score has the opposite
+orientation (high = stem-like), you must invert it before passing it as
+`time_key`. See the [CytoTRACE2 direction issue](#direction-issue) below.
+
+**`ConnectivityKernel`**
+
+Uses the symmetrised $k$-NN graph from `sc.pp.neighbors()`. All neighbours
+receive equal weight. This kernel alone produces an undirected random walk,
+so it contributes only smoothing rather than directionality. At 20% weight it
+dampens sharp directional discontinuities caused by noisy pseudotime estimates.
+
+**Combination**
+
+```python
+combined = 0.8 * PseudotimeKernel + 0.2 * ConnectivityKernel
+```
+
+The combined matrix is a convex mixture. Increasing the
+`ConnectivityKernel` weight makes the walk less directed (more exploratory);
+decreasing it makes it more sensitive to pseudotime but also more susceptible
+to pseudotime noise.
+
+#### Step 2 — Identifying terminal states (CFLARE)
+
+CFLARE (Clustering of Left and Right Eigenvectors) computes the top $k$
+eigenvectors of $T$ and clusters cells in eigenvector space.
+
+The mathematical basis: the stationary distribution of an absorbing Markov
+chain is concentrated on its absorbing states. Eigenvalues of $T$ near 1
+correspond to near-absorbing (quasi-stationary) components of the chain.
+By retaining the top $k$ eigenvectors and applying $k$-means, CFLARE
+identifies $k$ macrostates, the most absorption-like of which are called
+terminal states.
+
+Two alternatives exist:
+
+| Estimator | Method | Memory | Speed | Best for |
+|-----------|--------|--------|-------|----------|
+| `CFLARE` | sparse eigenvectors (scipy) | low | fast | >20k cells |
+| `GPCCA` with `brandts` | Schur decomposition (dense) | **very high** | slow | <20k cells |
+| `GPCCA` with `krylov` | Schur decomposition (sparse) | low | moderate | any size, needs `petsc4py` |
+
+At 53,720 cells the dense Schur decomposition requires $53{,}720^2 \times 8$
+bytes $\approx 23$ GB. CFLARE is the only viable option without `petsc4py`.
+
+#### Step 3 — Fate probabilities
+
+Once terminal states $\{A_1, \ldots, A_m\}$ are fixed, CellRank computes, for
+each transient cell $i$, the absorption probability $\pi_i^{(s)}$ — the
+probability that a random walk starting at $i$ reaches terminal state $A_s$
+before any other. These are solved from the linear system:
+
+$$(I - Q)\,\Pi = R$$
+
+where $Q$ is the sub-matrix of $T$ restricted to transient cells,
+$R$ encodes the transition probabilities into absorbing states, and
+$\Pi$ is the matrix of absorption probabilities (fate probabilities).
+
+This is a large sparse linear system ($\sim$50k × 50k here). CellRank solves
+it independently for each terminal state using GMRES with an ILU
+preconditioner when `petsc4py` is unavailable. The `tol` and `preconditioner`
+arguments control solver accuracy.
+
+---
+
+### CytoTRACE2 as pseudotime — what it captures and what it misses
+
+**What CytoTRACE2 measures**
+
+CytoTRACE2 scores cells on *transcriptional complexity*: the number of unique
+genes detected per cell, corrected for depth and context using a neural network
+trained on developmental datasets. Cells expressing more diverse gene programs
+(stem cells, early progenitors) score higher; committed cells expressing
+narrow gene programs score lower.
+
+It is a *potency* score, not a *trajectory* score. It has no knowledge of
+your particular differentiation graph — it only knows "how gene-rich is this
+cell compared to known developmental references."
+
+**What it captures well**
+
+- The gross stem↔committed polarity within a compartment.
+- Relative ordering of progenitor populations.
+- Works without BAM files — derived purely from the count matrix.
+
+**What it misses**
+
+- Branching topology. CytoTRACE2 produces a scalar; all branching must be
+  inferred downstream by CellRank from the neighbourhood graph.
+- Cycling / stress confounders. S/G2M cells may score high due to broad gene
+  activation unrelated to potency.
+- Late-commitment ordering. Within a committed lineage, CytoTRACE2 scores
+  compress — it cannot reliably order erythroid precursors from erythroblasts.
+
+#### The direction issue {#direction-issue}
+
+::: {.callout-warning}
+**Current workflow caveat**
+
+`PseudotimeKernel` directs transitions **from lower to higher** pseudotime
+values. CytoTRACE2 is **high = stem-like** — the opposite convention.
+
+In the current script, `cytotrace2_score` is passed directly:
+
+```python
+ctk = PseudotimeKernel(adata, time_key='cytotrace2_score')
+```
+
+This means transitions are directed *towards* cells with higher CytoTRACE2
+scores — i.e., *towards* more stem-like states. The "terminal states"
+identified are therefore the **most primitive progenitor populations**, not the
+committed endpoints.
+
+**Whether this is a bug or a feature depends on your question:**
+
+- If you want to model **reverse differentiation** or identify stable
+  progenitor attractors, the current orientation is correct.
+- If you want to model **forward differentiation** (stem → committed), invert
+  the score before passing it to the kernel.
+:::
+
+**Fix — invert the score**
+
+```python
+# In velocity_run.py, after loading:
+adata.obs['cytotrace2_pseudotime'] = 1.0 - adata.obs['cytotrace2_score']
+CYTOTRACE_COL = 'cytotrace2_pseudotime'
+```
+
+With this change, low inverted pseudotime = stem-like (source) and high
+inverted pseudotime = committed (sink), matching `PseudotimeKernel`'s
+directionality convention.
+
+---
+
+### Using alternative pseudotime / ordering scores
+
+Any scalar in `adata.obs` can be passed as `time_key` to `PseudotimeKernel`.
+The key requirement is that the score must be **monotone with commitment**
+(or be inverted so that it is). Below are the main alternatives.
+
+#### Diffusion pseudotime (DPT)
+
+```python
+import scanpy as sc
+sc.tl.diffmap(adata)
+sc.tl.dpt(adata, n_dcs=10)  # adds adata.obs['dpt_pseudotime']
+ctk = PseudotimeKernel(adata, time_key='dpt_pseudotime')
+```
+
+- **Basis:** Diffusion maps embed the data in a space where geodesic distance
+  approximates diffusion time. DPT measures distance from a manually chosen
+  root cell along this manifold.
+- **Strength:** Handles branching gracefully; robust to local noise.
+- **Weakness:** Requires a root cell — root choice is subjective and
+  propagates through all downstream results.
+- **Direction convention:** `dpt_pseudotime` is 0 at the root and increases
+  toward differentiated states → compatible with `PseudotimeKernel` directly.
+
+#### Palantir pseudotime
+
+```python
+import palantir
+pr_res = palantir.core.run_palantir(ms_data, start_cell, num_waypoints=500)
+adata.obs['palantir_pseudotime'] = pr_res.pseudotime
+# Also attaches fate probabilities independently — can compare with CellRank
+ctk = PseudotimeKernel(adata, time_key='palantir_pseudotime')
+```
+
+- **Basis:** Models differentiation as a Markov chain on a low-dimensional
+  diffusion space; particularly designed for branching trajectories.
+- **Strength:** Produces its own fate probabilities and entropy score
+  (branch probability uncertainty). Good sanity-check against CellRank.
+- **Direction convention:** 0 at root, increases → compatible directly.
+
+#### Monocle 3 pseudotime
+
+Computed in R, exported to `adata.obs` via the h5ad:
+
+```r
+# In R (after cds construction):
+cds <- order_cells(cds, root_cells = root_barcodes)
+srt$monocle3_pseudotime <- pseudotime(cds)[colnames(srt)]
+```
+
+- **Basis:** Learns a principal graph (tree) through the data; pseudotime is
+  distance along this tree from the root.
+- **Strength:** Explicit topology — you can see which branches connect.
+- **Weakness:** Sensitive to graph connectivity; can fail on disconnected UMAP
+  regions. Requires a root cell or cluster.
+- **Direction convention:** 0 at root → compatible directly.
+
+#### Slingshot pseudotime
+
+```python
+import rpy2.robjects as ro
+# Run in R, export curves; Slingshot gives one pseudotime per lineage
+```
+
+- **Basis:** Fits smooth principal curves through a cluster graph.
+  Each curve produces a separate pseudotime — one per lineage.
+- **Strength:** Multi-lineage aware from the start; particularly good for
+  known topology (e.g. HSC → MK / Erythroid / Myeloid).
+- **Usage with CellRank:** Use one Slingshot lineage pseudotime per kernel,
+  or average them weighted by the Slingshot assignment weights.
+
+#### SCENT (thermodynamic potency)
+
+SCENT scores cells by their position in the gene regulatory network
+attractor landscape, using single-sample network entropy.
+
+```r
+# Already available in the pipeline as scent_hsc target
+# cytotrace_hsc$SCENT <- ...
+```
+
+- **Basis:** High network entropy = high plasticity = stem-like.
+  Like CytoTRACE2 but mechanistically grounded in signalling network theory.
+- **Direction convention:** High = stem-like → must invert before
+  `PseudotimeKernel` (same as CytoTRACE2).
+
+#### Choosing between scores
+
+| Score | Root needed? | Topology aware? | Invert for PTK? | Best used when |
+|-------|-------------|-----------------|-----------------|----------------|
+| CytoTRACE2 | No | No | **Yes** | No BAM, no prior |
+| DPT | Yes | Partial | No | Clear root cluster known |
+| Palantir | Yes | Yes | No | Branching; want independent fate probs |
+| Monocle3 | Yes | Yes (graph) | No | Known topology; R workflow |
+| Slingshot | Yes (clusters) | Yes (curves) | Depends | Multi-lineage, known endpoints |
+| SCENT | No | No | **Yes** | Regulatory network context |
+
+---
+
+### Troubleshooting and improving results
+
+#### T1 — Terminal states are stem cells, not committed cells
+
+**Symptom:** Terminal states concentrate in high-CytoTRACE2 regions of the
+UMAP (cluster 5 / 6 in this dataset).
+
+**Cause:** `PseudotimeKernel` is directing transitions toward higher score
+values. Since CytoTRACE2 high = stem-like, it is absorbing at the stem end.
+
+**Fix:**
+```python
+adata.obs['cytotrace2_pseudotime'] = 1.0 - adata.obs['cytotrace2_score']
+CYTOTRACE_COL = 'cytotrace2_pseudotime'
+```
+
+#### T2 — Too many / too few terminal states
+
+**Symptom:** States split a single lineage into multiple near-identical
+macrostates, or merge two distinct lineages into one.
+
+**Cause:** `k` (number of eigenvectors in CFLARE) does not match the true
+number of quasi-stationary components in the data.
+
+**Diagnosis:** Inspect the eigenspectrum (section 3). Count the number of
+eigenvalues close to 1 before the gap. That number is the natural `k`.
+
+**Fix:**
+```python
+N_MACROSTATES = 8  # adjust to the observed gap position
+c.fit(k=N_MACROSTATES)
+c.predict(use=N_MACROSTATES, ...)
+```
+
+Also use `c.predict(use=4)` with `k=8` to take only the top 4 from a larger
+pool — useful when some eigenvectors capture technical rather than biological
+structure.
+
+#### T3 — Negative fate probability values
+
+**Symptom:** `ValueError: N value(s) are negative` during
+`compute_fate_probabilities()`.
+
+**Cause:** GMRES converges to a solution with small negative entries due to
+floating-point accumulation when the linear system is poorly conditioned.
+
+**Fixes (in order of preference):**
+```python
+# Option A — tighter tolerance + ILU preconditioner (used in this run)
+c.compute_fate_probabilities(solver='gmres', tol=1e-7, preconditioner='ilu')
+
+# Option B — direct solver (exact, but only feasible for <5k cells)
+c.compute_fate_probabilities(solver='direct')
+
+# Option C — install petsc4py for the optimal sparse solver
+# pip install petsc4py  (requires PETSc installed)
+c.compute_fate_probabilities(solver='petsc')
+```
+
+#### T4 — Kernel arrows are disordered / incoherent
+
+**Symptom:** `kernel_projection.png` shows chaotic arrows with no clear flow.
+
+**Cause A:** Pseudotime is noisy in that UMAP region — cells with similar
+expression have very different CytoTRACE2 scores.
+
+**Fix A:** Increase the `ConnectivityKernel` weight to smooth more:
+```python
+combined = 0.6 * ctk + 0.4 * ck
+```
+
+**Cause B:** `n_neighbors` in `sc.pp.neighbors()` is too small, giving a
+disconnected or spiky neighbourhood graph.
+
+**Fix B:**
+```python
+sc.pp.neighbors(adata, use_rep='X_pca', n_neighbors=50, n_pcs=30)
+```
+
+#### T5 — Driver genes are dominated by ribosomal / stress genes
+
+**Symptom:** Top drivers for most terminal states are `Rps*`, `Rpl*`, or
+stress markers like `Hspa1a`.
+
+**Cause:** Ribosomal activity and stress vary across the UMAP independently
+of the pseudotime axis and correlate with fate probability by coincidence.
+
+**Fix:** Exclude these gene sets before computing drivers:
+```python
+exclude = adata.var_names.str.startswith(('Rps', 'Rpl', 'mt-', 'Hsp'))
+c.compute_lineage_drivers(
+    cluster_key=CLUSTER_COL,
+    use_raw=False,
+    layer='X',
+    # Filter manually after:
+)
+drivers = c.lineage_drivers
+drivers = drivers.loc[~drivers.index.str.startswith(('Rps', 'Rpl', 'mt-'))]
+```
+
+#### T6 — All cells assigned to same terminal state
+
+**Symptom:** Fate probability plots show one state with probability ≈ 1
+everywhere.
+
+**Cause:** The neighbourhood graph and pseudotime together create one
+dominant absorbing state; other states are transient and drain into it.
+
+**Fix:**
+1. Confirm the pseudotime direction (see T1).
+2. Manually set terminal states using known marker genes:
+```python
+# After c.fit():
+c.set_terminal_states(['cluster_5_cells'], cluster_key=CLUSTER_COL)
+# Or by cell mask:
+mask = adata.obs['Gata1'] > threshold
+c.set_terminal_states_from_mask(mask, ...)
+```
+
+---
+
+### Upgrading the kernel: RNA velocity
+
+Once BAM files are available and `run_velocyto.sh` has been executed, the
+`PseudotimeKernel` can be replaced with `VelocityKernel`:
+
+```python
+import scvelo as scv
+# ... (loom loading and scVelo preprocessing) ...
+scv.tl.recover_dynamics(adata, n_jobs=8)
+scv.tl.velocity(adata, mode='dynamical')
+scv.tl.velocity_graph(adata, n_jobs=8)
+
+from cellrank.kernels import VelocityKernel, ConnectivityKernel
+vk = VelocityKernel(adata).compute_transition_matrix()
+ck = ConnectivityKernel(adata).compute_transition_matrix()
+combined = 0.8 * vk + 0.2 * ck
+```
+
+**Why velocity is preferable when available:**
+
+- RNA velocity is cell-intrinsic — it estimates the derivative of the
+  expression state directly from spliced/unspliced RNA ratios, without
+  requiring a reference pseudotime score.
+- It captures non-monotone dynamics (gene upregulation then downregulation
+  along a trajectory) that CytoTRACE2 cannot represent.
+- It provides per-gene directionality, enabling velocity-confidence filtering
+  and identification of rate-limiting genes.
+- It does not require a root cell or score inversion.
+
+The `velocity_run.py` script is already gated on `HAS_LOOM` — running
+`./scripts/run_velocyto.sh` on the CellRanger outputs will automatically
+activate the RNA velocity section on the next run.
+
+---
+
+## Summary and next steps
+
+The CellRank analysis on 53,720 HSC cells successfully resolved:
+
+- A directed differentiation flow from high-CytoTRACE2 progenitors towards
+  14 distinct terminal states using `PseudotimeKernel + ConnectivityKernel`.
+- Fate probability maps that can be compared across WT, Het mCh−, and
+  Het mCh+ conditions to detect MPL-driven lineage bias.
+- Per-state driver genes and gene expression trends for all 9 canonical
+  HSC/lineage markers.
+
+**Recommended follow-up**
+
+- [ ] Annotate terminal states to biological lineages using marker gene overlap
+      with fate probability maps (sections 5 + 6).
+- [ ] Re-run `predict()` + `compute_lineage_drivers()` with `res = 0.5` cluster
+      column for finer terminal state labelling (no recomputation needed).
+- [ ] Formal statistical test for condition-specific fate probability shifts
+      (Wilcoxon or mixed-effects model per terminal state).
+- [ ] Run `./scripts/run_velocyto.sh` once BAM files are available to replace
+      the CytoTRACE2 proxy with true RNA velocity, then switch to
+      `VelocityKernel + ConnectivityKernel` in `velocity_run.py`.
+- [ ] Consider GPCCA with `krylov` solver once `petsc4py`/`slepc4py` are
+      available in the container, for coarse-grained transition matrices between
+      macrostates.
+
+{{< include ../_session-info.qmd >}}

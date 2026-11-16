@@ -1,0 +1,616 @@
+---
+title: "Geneset Exploration — HSC"
+format:
+  html:
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(plotly)
+library(DT)
+library(htmltools)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+
+
+theme_set(theme_cowplot())
+
+# Helper: reshape a named gene list into a DT-ready data.frame
+geneset_dt <- function(lst, group_col = "group") {
+  df <- stack(lst)
+  names(df) <- c("gene", group_col)
+  DT::datatable(df[, c(group_col, "gene")],
+                rownames = FALSE, filter = "top",
+                options = list(pageLength = 20, scrollY = "400px",
+                               scrollCollapse = TRUE))
+}
+
+# Helper: plotly UMAP scatter coloured by a UCell score column.
+# scores_df is the output of extract_ucell_scores() — already contains
+# UMAP1, UMAP2, and sample.name, so no Seurat object is needed.
+score_scatter <- function(scores_df, col) {
+  p <- ggplot(scores_df,
+              aes(UMAP1, UMAP2,
+                  color = .data[[col]],
+                  text  = paste0("sample: ", sample.name))) +
+    geom_point(size = 0.3, alpha = 0.7) +
+    scale_color_viridis_c(name = "UCell score") +
+    ggtitle(col) +
+    theme(legend.position = "right",
+          plot.title      = element_text(size = 11))
+  ggplotly(p, tooltip = "text")
+}
+```
+
+## Resource index
+
+```{r resource-table}
+targets::tar_read(geneset_study_table) |>
+  DT::datatable(rownames = FALSE,
+                options  = list(pageLength = 10, dom = "t"))
+```
+
+---
+
+## Summary heatmap — all genesets × cluster × sample
+
+Average UCell score per cluster × sample for every scored geneset, row- and
+column-clustered. Columns are grouped by cluster (column split); a top annotation
+bar shows `sample.name`. Values are z-scored per row.
+
+```{r summary-heatmap-data}
+META_COLS <- c("cell_id", "UMAP1", "UMAP2", "sample.name")
+
+cond_pal   <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+label_condition <- function(x) dplyr::case_when(
+  grepl("WT",      x) ~ "WT",
+  grepl("mCh-",   x) ~ "mCh-",
+  grepl("mCh\\+", x) ~ "mCh+",
+  TRUE                ~ x
+)
+
+# Load all UCell score targets
+scores_list <- list(
+  Nestorowa       = targets::tar_read(ucell_scores_nestorowa_hsc),
+  Isobe           = targets::tar_read(ucell_scores_isobe_hsc),
+  Psaila          = targets::tar_read(ucell_scores_psaila_hsc),
+  Pan             = targets::tar_read(ucell_scores_pan_hsc),
+  `Gavish meta`   = targets::tar_read(ucell_scores_gavish_meta_hsc),
+  `Gavish cancer` = targets::tar_read(ucell_scores_gavish_cancer_hsc)
+)
+
+# Cluster column from annotation_recluster_hsc
+clust_df <- targets::tar_read(annotation_recluster_hsc)
+clus_col <- grep("res_5|res\\.5$", colnames(clust_df), value = TRUE)[1]
+clust_df <- clust_df[, c("cell_id", clus_col)]
+colnames(clust_df)[2] <- "cluster"
+
+# Average UCell score per cluster × sample.name per geneset
+avg_rows <- lapply(names(scores_list), function(study) {
+  df         <- scores_list[[study]]
+  score_cols <- setdiff(names(df), META_COLS)
+  df |>
+    dplyr::select(cell_id, sample.name, dplyr::all_of(score_cols)) |>
+    dplyr::left_join(clust_df, by = "cell_id") |>
+    tidyr::pivot_longer(dplyr::all_of(score_cols),
+                        names_to = "geneset", values_to = "score") |>
+    dplyr::group_by(cluster, sample.name, geneset) |>
+    dplyr::summarise(mean_score = mean(score, na.rm = TRUE), .groups = "drop") |>
+    dplyr::mutate(study = study)
+})
+
+all_avg <- dplyr::bind_rows(avg_rows)
+
+# Column key: cluster__sample  (double underscore as separator)
+all_avg <- all_avg |>
+  dplyr::mutate(col_key = paste0(cluster, "__", sample.name))
+
+# genesets × (cluster__sample) matrix
+mat <- all_avg |>
+  dplyr::select(geneset, col_key, mean_score) |>
+  tidyr::pivot_wider(names_from = col_key, values_from = mean_score,
+                     values_fill = 0) |>
+  tibble::column_to_rownames("geneset") |>
+  as.matrix()
+
+# Sort columns: cluster numerically, then sample.name within cluster
+col_meta <- tibble::tibble(col_key = colnames(mat)) |>
+  tidyr::separate(col_key, into = c("cluster", "sample.name"),
+                  sep = "__", remove = FALSE) |>
+  dplyr::mutate(
+    cluster_num = suppressWarnings(as.integer(cluster)),
+    condition   = label_condition(sample.name)
+  ) |>
+  dplyr::arrange(cluster_num, sample.name)
+
+mat <- mat[, col_meta$col_key]
+
+# Row-wise z-score
+mat_z <- t(scale(t(mat)))
+mat_z[is.nan(mat_z)] <- 0
+
+# ── Row annotation: study ─────────────────────────────────────────────────────
+study_map <- all_avg |>
+  dplyr::distinct(geneset, study) |>
+  dplyr::filter(geneset %in% rownames(mat_z))
+study_vec <- study_map$study[match(rownames(mat_z), study_map$geneset)]
+
+n_studies  <- length(unique(study_vec))
+study_pal  <- setNames(
+  RColorBrewer::brewer.pal(max(n_studies, 3), "Set2")[seq_len(n_studies)],
+  unique(study_vec)
+)
+
+# ── Column annotation: sample.name coloured by condition ─────────────────────
+sample_vec    <- col_meta$sample.name
+condition_vec <- col_meta$condition
+# Per-sample colour: pick from condition palette
+sample_pal <- setNames(
+  cond_pal[condition_vec],
+  sample_vec
+)
+
+# Column split: cluster label for each column
+col_split <- factor(col_meta$cluster,
+                    levels = unique(col_meta$cluster[order(col_meta$cluster_num)]))
+
+cat("Matrix:", nrow(mat_z), "genesets ×", ncol(mat_z),
+    "columns (cluster × sample)\n")
+```
+
+```{r summary-heatmap-plot, fig.height=20, fig.width=14}
+col_anno <- ComplexHeatmap::HeatmapAnnotation(
+  Condition = condition_vec,
+  col       = list(Condition = cond_pal[names(cond_pal) %in% condition_vec]),
+  annotation_name_gp = grid::gpar(fontsize = 9),
+  annotation_height  = unit(4, "mm")
+)
+
+row_anno <- ComplexHeatmap::rowAnnotation(
+  Study = study_vec,
+  col   = list(Study = study_pal),
+  annotation_name_gp = grid::gpar(fontsize = 9)
+)
+
+col_fun <- circlize::colorRamp2(
+  c(-2, 0, 2), c("#2166ac", "white", "#d73027")
+)
+
+ComplexHeatmap::Heatmap(
+  mat_z,
+  name                      = "z-score",
+  col                       = col_fun,
+  cluster_rows              = TRUE,
+  cluster_columns           = TRUE,
+  clustering_method_rows    = "ward.D2",
+  clustering_method_columns = "ward.D2",
+  top_annotation            = col_anno,
+  right_annotation          = row_anno,
+  show_row_names            = TRUE,
+  show_column_names         = TRUE,
+  row_names_gp              = grid::gpar(fontsize = 7),
+  column_names_gp           = grid::gpar(fontsize = 8),
+  column_names_rot          = 90,
+  heatmap_legend_param      = list(
+    title         = "z-score",
+    title_gp      = grid::gpar(fontsize = 9),
+    labels_gp     = grid::gpar(fontsize = 8),
+    legend_height = unit(3, "cm")
+  )
+)
+```
+
+---
+
+## Nestorowa 2017 Blood
+
+Lineage gene sets from scRNA-seq of HSC/progenitor populations. Displayed as
+UMAP module scores — each score summarises mean scaled expression of the
+corresponding lineage programme per cell.
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r nestorowa-table}
+geneset_dt(targets::tar_read(nestorowa_17_bl_mm_genesets), "lineage")
+```
+
+### Module scores
+
+```{r nestorowa-scores}
+#| results: asis
+scores     <- targets::tar_read(ucell_scores_nestorowa_hsc)
+score_cols <- setdiff(names(scores), c("cell_id", "UMAP1", "UMAP2", "sample.name"))
+plots      <- lapply(score_cols, function(col) score_scatter(scores, col))
+tagList(plots)
+```
+
+:::
+
+---
+
+## Kucinski 2024 Cell Stem Cell
+
+HSPC marker genes by cell identity. T cells are excluded (absent from the
+sorted HSC compartment). Each panel shows individual marker genes split by
+`sample.name`.
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r kucinski-table}
+geneset_dt(targets::tar_read(kucinski_24_csc_mm_genesets), "cell_identity")
+```
+
+### Feature plots
+
+```{r kucinski-plots}
+#| fig-height: 12
+#| fig-width: 14
+srt         <- targets::tar_read(mpn_processed_hsc)
+lst         <- targets::tar_read(kucinski_24_csc_mm_genesets)
+plot_subset <- stringr::str_subset(names(lst), "T cell", negate = TRUE)
+n_avail     <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(lst[plot_subset][n_avail[plot_subset] > 0], function(markers) {
+  FeaturePlot(srt, markers, split.by = "sample.name") &
+    scale_color_viridis_c() & Seurat::RestoreLegend()
+})
+```
+
+:::
+
+---
+
+## Isobe 2023 Cell Genomics
+
+Trajectory lineage markers from a Jak2 V617F MPN mouse model. Module scores
+summarise expression per trajectory programme.
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r isobe-table}
+geneset_dt(targets::tar_read(isobe_23_cg_mm_genesets), "trajectory")
+```
+
+### Module scores
+
+```{r isobe-scores}
+#| results: asis
+scores     <- targets::tar_read(ucell_scores_isobe_hsc)
+score_cols <- setdiff(names(scores), c("cell_id", "UMAP1", "UMAP2", "sample.name"))
+plots      <- lapply(score_cols, function(col) score_scatter(scores, col))
+tagList(plots)
+```
+
+:::
+
+---
+
+## HemAtlas — HSPC Subclusters
+
+HSPC subcluster marker genes from the HemAtlas atlas. Each panel shows
+individual marker genes split by `sample.name`.
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r hematlas-hspc-table}
+geneset_dt(targets::tar_read(hematlas_hspc_mm_genesets), "subcluster")
+```
+
+### Feature plots
+
+```{r hematlas-hspc-plots}
+#| fig-height: 12
+#| fig-width: 14
+lst     <- targets::tar_read(hematlas_hspc_mm_genesets)
+n_avail <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(lst[n_avail > 0], function(markers) {
+  FeaturePlot(srt, markers, split.by = "sample.name") &
+    scale_color_viridis_c() & Seurat::RestoreLegend()
+})
+```
+
+:::
+
+---
+
+## HemAtlas — Mouse Lineage Reference
+
+Cross-stage mouse hematopoietic lineage markers. Adipogenic, Schwann cell, and
+hepatic programmes are excluded (not relevant to BM HSC compartment).
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r hematlas-lineage-table}
+geneset_dt(targets::tar_read(hematlas_lineage_mm_genesets), "cell_type")
+```
+
+### Feature plots
+
+```{r hematlas-lineage-plots}
+#| fig-height: 12
+#| fig-width: 14
+lst         <- targets::tar_read(hematlas_lineage_mm_genesets)
+plot_subset <- stringr::str_subset(names(lst), "adipo|schwann|hepat", negate = TRUE)
+n_avail     <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(lst[plot_subset][n_avail[plot_subset] > 0], function(markers) {
+  FeaturePlot(srt, markers, split.by = "sample.name") &
+    scale_color_viridis_c() & Seurat::RestoreLegend()
+})
+```
+
+:::
+
+---
+
+## Ferchen 2026 — Marker Genes
+
+Cell-type marker genes at `level_4` resolution from the Ferchen 2026 Nat
+Immunol bone marrow atlas. Only cell types with ≥ 1 gene present in the query
+are shown.
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r ferchen-marker-table}
+geneset_dt(targets::tar_read(ferchen_26_mm_marker_genesets), "cell_type")
+```
+
+### Feature plots
+
+```{r ferchen-marker-plots}
+#| fig-height: 12
+#| fig-width: 14
+lst     <- targets::tar_read(ferchen_26_mm_marker_genesets)
+n_avail <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(lst[n_avail > 0], function(markers) {
+  FeaturePlot(srt, markers, split.by = "sample.name") &
+    scale_color_viridis_c() & Seurat::RestoreLegend()
+})
+```
+
+:::
+
+---
+
+## Ferchen 2026 — TF Activities
+
+Transcription factor activity markers at `level_4` resolution. Limited to the
+first 20 cell types with available TFs to keep render time manageable.
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r ferchen-tf-table}
+geneset_dt(targets::tar_read(ferchen_26_mm_tf_genesets), "cell_type")
+```
+
+### Feature plots
+
+```{r ferchen-tf-plots}
+#| fig-height: 12
+#| fig-width: 14
+lst     <- targets::tar_read(ferchen_26_mm_tf_genesets)
+n_avail <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(names(lst)[n_avail > 0] %>% head(20), function(name) {
+  FeaturePlot(srt, lst[[name]], split.by = "sample.name") &
+    scale_color_viridis_c() & Seurat::RestoreLegend() &
+    patchwork::plot_annotation(title = name)
+})
+```
+
+:::
+
+---
+
+## Gavish 2023 Nature
+
+Cell-type marker genes and TF activities at `level_4` resolution.
+
+::: {.panel-tabset}
+
+### Marker gene sets
+
+```{r gavish-marker-table}
+geneset_dt(targets::tar_read(gavish_23_mm_marker_genesets), "cell_type")
+```
+
+### Marker feature plots
+
+```{r gavish-marker-plots}
+#| fig-height: 12
+#| fig-width: 14
+lst       <- targets::tar_read(gavish_23_mm_marker_genesets)
+lst_avail <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(names(lst)[lst_avail > 0], function(name) {
+  FeaturePlot(srt, lst[[name]]) &
+    scale_color_viridis_c() & Seurat::RestoreLegend() &
+    patchwork::plot_annotation(title = name)
+})
+```
+
+### TF gene sets
+
+```{r gavish-tf-table}
+geneset_dt(targets::tar_read(gavish_23_mm_tf_genesets), "cell_type")
+```
+
+### TF feature plots
+
+```{r gavish-tf-plots}
+#| fig-height: 12
+#| fig-width: 14
+lst       <- targets::tar_read(gavish_23_mm_tf_genesets)
+lst_avail <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(names(lst)[lst_avail > 0], function(name) {
+  FeaturePlot(srt, lst[[name]]) &
+    scale_color_viridis_c() & Seurat::RestoreLegend() &
+    patchwork::plot_annotation(title = name)
+})
+```
+
+:::
+
+---
+
+## Gavish 2023 — SCENIC Regulators (Human → Mouse)
+
+TF regulon targets from SCENIC, mapped to mouse orthologs. Filter: ≥ 2 orthologs
+present in the query.
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r gavish-hs-scenic-table}
+geneset_dt(targets::tar_read(gavish_23_hs_scenic_genesets), "program")
+```
+
+### Feature plots
+
+```{r gavish-hs-scenic-plots}
+#| fig-height: 12
+#| fig-width: 14
+lst       <- targets::tar_read(gavish_23_hs_scenic_genesets)
+lst_avail <- lapply(lst, function(x) sum(x %in% rownames(srt)))
+
+lapply(names(lst)[lst_avail > 1], function(name) {
+  FeaturePlot(srt, lst[[name]], split.by = "sample.name") &
+    scale_color_viridis_c() & Seurat::RestoreLegend() &
+    patchwork::plot_annotation(title = name)
+})
+
+rm(srt); gc()
+```
+
+:::
+
+---
+
+## Psaila & Wang 2020 Molecular Cell (Human → Mouse)
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r psaila-table}
+geneset_dt(targets::tar_read(psaila_20_hs_genesets), "signature")
+```
+
+### Module scores
+
+```{r psaila-scores}
+#| results: asis
+scores     <- targets::tar_read(ucell_scores_psaila_hsc)
+score_cols <- setdiff(names(scores), c("cell_id", "UMAP1", "UMAP2", "sample.name"))
+plots      <- lapply(score_cols, function(col) score_scatter(scores, col))
+tagList(plots)
+```
+
+:::
+
+---
+
+## Pan 2025 Cell Reports (Human → Mouse)
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r pan-table}
+geneset_dt(targets::tar_read(pan_25_hs_genesets), "pattern")
+```
+
+### Module scores
+
+```{r pan-scores}
+#| results: asis
+scores     <- targets::tar_read(ucell_scores_pan_hsc)
+score_cols <- setdiff(names(scores), c("cell_id", "UMAP1", "UMAP2", "sample.name"))
+plots      <- lapply(score_cols, function(col) score_scatter(scores, col))
+tagList(plots)
+```
+
+:::
+
+---
+
+## Gavish 2023 — Meta Programs (Human → Mouse)
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r gavish-hs-mp-table}
+geneset_dt(targets::tar_read(gavish_23_hs_meta_program_genesets), "meta_program")
+```
+
+### Module scores
+
+```{r gavish-hs-mp-scores}
+#| results: asis
+scores     <- targets::tar_read(ucell_scores_gavish_meta_hsc)
+score_cols <- setdiff(names(scores), c("cell_id", "UMAP1", "UMAP2", "sample.name"))
+plots      <- lapply(score_cols, function(col) score_scatter(scores, col))
+tagList(plots)
+```
+
+:::
+
+---
+
+## Gavish 2023 — Cancer MP & NMF (Human → Mouse)
+
+::: {.panel-tabset}
+
+### Gene sets
+
+```{r gavish-hs-cancer-mp-table}
+geneset_dt(targets::tar_read(gavish_23_hs_cancer_mp_genesets), "program")
+```
+
+### Module scores
+
+```{r gavish-hs-cancer-mp-scores}
+#| results: asis
+scores     <- targets::tar_read(ucell_scores_gavish_cancer_hsc)
+score_cols <- setdiff(names(scores), c("cell_id", "UMAP1", "UMAP2", "sample.name"))
+plots      <- lapply(score_cols, function(col) score_scatter(scores, col))
+tagList(plots)
+```
+
+:::
+
+{{< include ../_session-info.qmd >}}

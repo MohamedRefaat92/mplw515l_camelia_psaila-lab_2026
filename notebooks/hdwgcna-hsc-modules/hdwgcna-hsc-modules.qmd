@@ -1,0 +1,683 @@
+---
+title: "hdWGCNA — HSC Gene Modules"
+format:
+  html:
+    theme: cosmo
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(igraph)
+library(ComplexHeatmap)
+library(circlize)
+library(hdWGCNA)
+library(WGCNA)
+
+
+theme_set(theme_cowplot())
+
+cond_pal <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+
+label_condition <- function(x) dplyr::case_when(
+  grepl("WT",      x) ~ "WT",
+  grepl("mCh-",   x) ~ "mCh-",
+  grepl("mCh\\+", x) ~ "mCh+",
+  TRUE                ~ x
+)
+
+CLUST_COL <- "sNN_pca.SCT_30_res.0.9"
+```
+
+## Overview
+
+hdWGCNA constructs gene co-expression modules from scRNA-seq data by first
+aggregating cells into metacells (k-nearest-neighbour pseudobulk), then running
+WGCNA soft-thresholding on the metacell expression matrix. This circumvents the
+sparsity and technical noise inherent to single-cell count matrices.
+
+**Object:** `mpn_processed_hsc_fullcc` — cell-cycle-regressed HSC Seurat object.
+**Cluster column:** `sNN_pca.SCT_30_res.0.9` (Leiden, res = 0.9).
+**Metacell grouping:** per `sample.name` (preserves biological replication).
+
+---
+
+## 1 — Load data
+
+```{r load}
+targets::tar_load(hdwgcna_hsc_modules)
+targets::tar_load(hdwgcna_hsc_hvg)
+targets::tar_load(hdwgcna_hsc_soft_power)
+
+srt      <- hdwgcna_hsc_modules
+hvg      <- hdwgcna_hsc_hvg
+soft_pow <- hdwgcna_hsc_soft_power
+tom_dir  <- file.path("output", "objects", "hdwgcna")
+rm(hdwgcna_hsc_modules, hdwgcna_hsc_hvg, hdwgcna_hsc_soft_power); gc()
+
+DefaultAssay(srt) <- "SCT"
+srt$condition <- label_condition(srt$sample.name) %>% setNames(., names(srt$sample.name))
+
+umap_df <- as.data.frame(Embeddings(srt, "umap.nn")) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::rename(UMAP1 = 2, UMAP2 = 3) |>
+  dplyr::mutate(
+    cluster   = srt@meta.data[[CLUST_COL]],
+    condition = srt$condition,
+    sample    = srt$sample.name
+  )
+
+cat("Cells:", ncol(srt), "\n")
+cat("Clusters:", nlevels(factor(umap_df$cluster)), "\n")
+```
+
+---
+
+## 2 — Setup hdWGCNA
+
+Select highly variable genes (excluding reporter genes) and register the
+object for hdWGCNA.
+
+```{r setup-hdwgcna}
+# Loaded from hdwgcna_hsc_hvg target (cached)
+cat("HVGs after exclusion:", length(hvg), "\n")
+```
+
+---
+
+## 3 — Metacell aggregation
+
+Metacells aggregate k nearest cells per `sample.name` group to obtain
+pseudobulk-like profiles with reduced sparsity.
+
+```{r metacells}
+#| fig-width: 12
+#| fig-height: 5
+
+# Metacells loaded from hdwgcna_hsc_modules (cached via hdwgcna_hsc_metacells)
+mc_obj <- GetMetacellObject(srt, wgcna_name = "hsc_modules")
+
+# cells_in_metacell is a comma-separated barcode string; count elements
+mc_sizes   <- stringr::str_count(mc_obj$cells_merged, ",") + 1L
+mc_size_df <- data.frame(n_cells = mc_sizes)
+mc_size_df$n_cells <- as.integer(as.character(mc_size_df$n_cells))
+
+ggplot(mc_size_df, aes(n_cells)) +
+  geom_histogram() +
+  labs(title = "Metacell size distribution",
+       x = "Cells per metacell", y = "Number of metacells") +
+  theme_cowplot()
+```
+
+### 3.1 — Metacell UMAP placement
+
+Metacells are placed at the **median UMAP coordinates** of their constituent
+cells, then coloured by cluster majority vote and sized by cell count.
+
+```{r metacell-umap}
+#| fig-width: 14
+#| fig-height: 6
+#|
+# Map each metacell → its constituent cell_ids
+mc_cells <- mc_obj$cells_merged%>%
+  str_split(",")
+mc_cells_vec <- mc_obj$cells_merged%>%
+  str_split(",") %>%
+  stack %>%
+  with(setNames(.$ind %>% as.character(),
+                .$value %>% as.character())
+       )
+
+# Median dimensionality reductions and add it to the metacell Seurat object
+umap_cell_df <- Embeddings(srt,"umap.nn") %>% as.data.frame()
+umap_metacell_df <- aggregate(umap_cell_df,
+                     list(metacell_id = mc_cells_vec[rownames(umap_cell_df)]),
+                     median)
+mc_obj[["umap_median"]] <- umap_metacell_df %>%
+  column_to_rownames("metacell_id") %>%
+  as.matrix() %>%
+  Seurat::CreateDimReducObject(key = "UMAPmed_")
+
+pca_cell_df <- Embeddings(srt,"pca.SCT") %>% as.data.frame()
+pca_metacell_df <- aggregate(pca_cell_df,
+                     list(metacell_id = mc_cells_vec[rownames(pca_cell_df)]),
+                     median)
+mc_obj[["pca_median"]] <- pca_metacell_df %>%
+  column_to_rownames("metacell_id") %>%
+  as.matrix() %>%
+  Seurat::CreateDimReducObject(key = "PCmed_")
+
+# Median UMAP + majority cluster per metacell
+
+mc_umap_coords <- purrr::map_dfr(names(mc_cells), function(mc_id) {
+  cells <- mc_cells[[mc_id]]
+  cells <- intersect(cells, umap_df$cell_id)
+  sub <- umap_df[umap_df$cell_id %in% cells, ]
+  tibble::tibble(
+    metacell_id     = mc_id,
+    UMAP1           = median(sub$UMAP1),
+    UMAP2           = median(sub$UMAP2)
+  )
+})
+
+mc_obj[["umap_meta"]] <- mc_umap_coords %>%
+  column_to_rownames("metacell_id") %>%
+  as.matrix() %>%
+  Seurat::CreateDimReducObject(key = "UMAP")
+
+mc_meta <- purrr::map_dfr(names(mc_cells), function(mc_id) {
+  cells <- mc_cells[[mc_id]]
+  cells <- intersect(cells, umap_df$cell_id)
+  if (length(cells) == 0) return(NULL)
+  sub <- umap_df[umap_df$cell_id %in% cells, ]
+  tibble::tibble(
+    metacell_id     = mc_id,
+    UMAP1           = median(sub$UMAP1),
+    UMAP2           = median(sub$UMAP2),
+    majority_cluster = names(sort(table(sub$cluster), decreasing = TRUE))[1],
+    majority_cond    = names(sort(table(sub$condition), decreasing = TRUE))[1],
+    n_cells          = nrow(sub)
+  )
+})
+
+
+clust_levels <- sort(unique(umap_df$cluster))
+clust_pal    <- setNames(
+  scales::hue_pal()(length(clust_levels)),
+  clust_levels
+)
+
+p_cells <- ggplot(umap_df, aes(UMAP1, UMAP2, colour = cluster)) +
+  geom_point(size = 0.3, alpha = 0.4) +
+  scale_colour_manual(values = clust_pal) +
+  labs(title = "Cells — coloured by cluster") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+p_mc <- ggplot(mc_meta, aes(UMAP1, UMAP2,
+                               colour = majority_cluster)) +
+  geom_point(alpha = 0.7) +
+  scale_colour_manual(values = clust_pal) +
+  scale_size_continuous(range = c(1, 5), name = "cells") +
+  labs(title = "Metacells — median UMAP, majority cluster") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+p_mc_cond <- ggplot(mc_meta, aes(UMAP1, UMAP2,
+                                    colour = majority_cond)) +
+  geom_point(alpha = 0.7) +
+  scale_colour_manual(values = cond_pal,
+                      breaks = names(cond_pal)) +
+  scale_size_continuous(range = c(1, 5), name = "cells") +
+  labs(title = "Metacells — majority condition") +
+  theme_void() +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+p_cells | p_mc | p_mc_cond
+```
+
+### 3.2 — Metacells per cluster × sample
+
+```{r metacell-counts}
+#| fig-width: 10
+#| fig-height: 4
+
+mc_meta |>
+  dplyr::count(majority_cluster, majority_cond) |>
+  ggplot(aes(majority_cluster, n, fill = majority_cond)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = cond_pal, name = "condition") +
+  labs(x = "Cluster", y = "Metacells", title = "Metacells per cluster × condition") +
+  theme_cowplot()
+```
+
+---
+
+## 4 — Soft power selection
+
+```{r soft-power}
+#| fig-width: 10
+#| fig-height: 4
+
+# TestSoftPowers result cached in hdwgcna_hsc_network
+PlotSoftPowers(srt, wgcna_name = "hsc_modules")
+```
+
+```{r pick-power}
+# Loaded from hdwgcna_hsc_soft_power target
+cat("Selected soft power:", soft_pow, "\n")
+```
+
+---
+
+## 5 — Network construction & module detection
+
+```{r build-network}
+# ConstructNetwork cached in hdwgcna_hsc_network; TOM on disk at output/objects/hdwgcna/
+cat("TOM dir:", tom_dir, "\n")
+cat("TOM files:", paste(list.files(tom_dir), collapse = ", "), "\n")
+```
+
+```{r plot-dendrogram}
+#| fig-width: 12
+#| fig-height: 5
+
+PlotDendrogram(srt, wgcna_name = "hsc_modules",
+               main = "HSC gene modules — hdWGCNA dendrogram")
+```
+
+---
+
+## 6 — Module eigengenes & connectivity
+
+```{r eigengenes}
+# ScaleData + ModuleEigengenes + ModuleConnectivity cached in hdwgcna_hsc_modules
+```
+
+```{r module-summary}
+modules <- GetModules(srt, wgcna_name = "hsc_modules")
+
+module_summary <- modules |>
+  dplyr::filter(module != "grey") |>
+  tidyr::pivot_longer(
+    cols      = dplyr::starts_with("kME_"),
+    names_to  = "kME_module",
+    values_to = "kME"
+  ) |>
+  dplyr::filter(kME_module == paste0("kME_", module)) |>
+  dplyr::group_by(module) |>
+  dplyr::summarise(
+    n_genes   = dplyr::n(),
+    top_genes = paste(gene_name[order(-kME)][1:5], collapse = ", "),
+    .groups   = "drop"
+  ) |>
+  dplyr::arrange(module)
+
+DT::datatable(module_summary,
+              rownames = FALSE,
+              caption  = "Module summary — top 5 hub genes by kME",
+              options  = list(pageLength = 20, scrollY = "400px"))
+```
+
+```{r}
+#optional: automatically reassign grey module interesting genes to other modules
+hdWGCNA::ReassignModules(seurat_obj = srt,features = "Egr2",auto_reassign = TRUE,wgcna_name = "hsc_modules")
+
+```
+```{r}
+#optional: merge modules
+```
+
+
+---
+
+## 7 — Module eigengene UMAP
+
+```{r me-umap}
+#| fig-width: 14
+#| fig-height: 10
+
+me_df <- GetMEs(srt, wgcna_name = "hsc_modules") |>
+  tibble::rownames_to_column("cell_id")
+
+me_df <- dplyr::left_join(
+  umap_df[, c("cell_id", "UMAP1", "UMAP2")],
+  me_df, by = "cell_id"
+)
+
+mod_cols <- setdiff(colnames(me_df), c("cell_id", "UMAP1", "UMAP2"))
+mod_cols <- mod_cols[mod_cols != "grey"]
+
+plots <- lapply(mod_cols, function(m) {
+  ggplot(me_df, aes(UMAP1, UMAP2, colour = .data[[m]])) +
+    geom_point(size = 0.3, alpha = 0.7) +
+    scale_colour_gradientn(
+      colours  = rev(RColorBrewer::brewer.pal(11, "RdBu")),
+      name     = "ME",
+      limits   = c(-1, 1),
+      oob      = scales::squish
+    ) +
+    ggtitle(m) +
+    theme_void() +
+    theme(plot.title = element_text(size = 10, hjust = 0.5))
+})
+
+patchwork::wrap_plots(plots, ncol = 6) +
+  patchwork::plot_annotation(title = "Module eigengene UMAPs")
+```
+
+---
+
+## 8 — Module eigengene × condition
+
+```{r me-condition}
+#| fig-width: 12
+#| fig-height: 5
+
+me_cond <- me_df |>
+  dplyr::left_join(
+    umap_df[, c("cell_id", "condition", "cluster")],
+    by = "cell_id"
+  ) |>
+  tidyr::pivot_longer(
+    cols      = dplyr::all_of(mod_cols),
+    names_to  = "module",
+    values_to = "ME"
+  ) |>
+  dplyr::filter(!is.na(condition))
+
+ggplot(me_cond, aes(condition, ME, fill = condition)) +
+  geom_violin(scale = "width", alpha = 0.7) +
+  geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+  facet_wrap(~ module, scales = "free_y") +
+  scale_fill_manual(values = cond_pal) +
+  labs(x = NULL, y = "Module eigengene") +
+  theme_cowplot(font_size = 10) +
+  theme(legend.position = "none",
+        axis.text.x     = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+## 9 — Hub gene heatmap
+
+ComplexHeatmap of the top hub genes per module (by kME), cells ordered by
+Leiden cluster (pre-computed by Seurat), genes grouped by module.
+
+```{r hub-heatmap-cell}
+#| fig-width: 14
+#| fig-height: 10
+
+N_HUB <- 25  # top hub genes per module
+
+# hub_genes <- modules |>
+#   dplyr::filter(module != "grey") |>
+#   dplyr::rowwise() |>
+#   dplyr::mutate(kME = .data[[paste0("kME_", module)]]) |>
+#   dplyr::ungroup() |>
+#   dplyr::group_by(module) |>
+#   dplyr::slice_max(order_by = kME, n = N_HUB) |>
+#   dplyr::ungroup()
+hub_genes <- modules %>%
+  pivot_longer(cols = kME_green:kME_blue) %>%
+  group_by(module) %>%
+  slice_max(order_by = value, n = N_HUB)%>%
+  ungroup() %>%
+  distinct(gene_name, color, module)
+
+genes_use  <- hub_genes$gene_name
+cells_use  <- colnames(srt)
+
+mat_hub <- GetAssayData(srt, assay = "SCT", layer = "data")[genes_use, cells_use]
+mat_hub <- as.matrix(mat_hub)
+
+# Z-score per gene
+mat_hub <- t(scale(t(mat_hub)))
+mat_hub[mat_hub >  2] <-  2
+mat_hub[mat_hub < -2] <- -2
+
+# optimal ordering of the matrix
+ser_method <- "PCA" #PCA, PCA_angel, Heatmap(slow and memory intensive)
+
+# Seriate columns globally
+o_cols  <- seriation::seriate(mat_hub, method = ser_method) %>% seriation::get_order(2) %>% rev() %>% sample()
+o_cells <- colnames(mat_hub)[o_cols]
+
+# Seriate genes within each module independently
+o_genes <- hub_genes %>%
+  dplyr::select(gene_name, module) %>%
+  dplyr::group_by(module) %>%
+  dplyr::group_map(function(mod_df, key) {
+    genes_mod <- intersect(mod_df$gene_name, rownames(mat_hub))
+    if (length(genes_mod) <= 2L) return(genes_mod)
+    sub_mat <- mat_hub[genes_mod, , drop = FALSE]
+    tryCatch({
+      o <- seriation::seriate(sub_mat, method = ser_method) %>%
+           seriation::get_order(1L) %>% rev()
+      genes_mod[o]
+    }, error = function(e) genes_mod)
+  }) %>%
+  unlist(use.names = FALSE)
+
+# ── Column ordering: cluster → condition → seriation rank ────────────────────
+cell_meta  <- srt@meta.data[cells_use, ]
+ser_rank   <- setNames(seq_along(o_cells), o_cells)
+
+col_df <- tibble::tibble(
+  cell_id   = colnames(mat_hub),
+  cluster   = factor(cell_meta[[CLUST_COL]], levels = sort(unique(cell_meta[[CLUST_COL]]))),
+  condition = factor(cell_meta$condition,    levels = c("WT", "mCh-", "mCh+")),
+  ser_rank  = ser_rank[colnames(mat_hub)]
+) |>
+  dplyr::arrange(cluster, condition, ser_rank)
+
+final_cells <- col_df$cell_id
+clust_split <- col_df$cluster   # factor preserves cluster order for anno_block
+clust_labs  <- levels(clust_split)
+
+# ── Column annotation ─────────────────────────────────────────────────────────
+col_anno <- HeatmapAnnotation(
+  cluster = anno_block(
+    gp        = gpar(fill = clust_pal[clust_labs]),
+    labels    = clust_labs,
+    labels_gp = gpar(fontsize = 7, col = "white", fontface = "bold")
+  ),
+  condition = col_df$condition,
+  col  = list(condition = cond_pal),
+  annotation_name_side = "left"
+)
+
+# ── Row annotation — module colour bar ────────────────────────────────────────
+row_anno <- rowAnnotation(
+  module = setNames(hub_genes$module, hub_genes$gene_name)[o_genes],
+  col    = list(module = setNames(
+    unique(hub_genes$color),
+    unique(hub_genes$module)
+  )),
+  show_annotation_name = FALSE
+)
+
+Heatmap(
+  mat_hub[o_genes, final_cells],
+  name                    = "z-score",
+  col                     = colorRamp2(c(-2, 0, 2),
+                                       c("#2166ac", "white", "#b2182b")),
+  top_annotation          = col_anno,
+  left_annotation         = row_anno,
+  column_split            = clust_split,
+  column_title            = NULL,
+  row_split               = setNames(hub_genes$module, hub_genes$gene_name)[o_genes],
+  cluster_rows            = FALSE,
+  cluster_columns         = FALSE,
+  show_column_names       = FALSE,
+  show_row_names          = TRUE,
+  row_names_gp            = gpar(fontsize = 8),
+  row_title_rot           = 0,
+  use_raster              = TRUE,
+  raster_quality          = 3
+)
+```
+
+```{r hub-heatmap-metacell}
+#| fig-width: 14
+#| fig-height: 10
+
+N_HUB <- Inf  # top hub genes per module
+
+# hub_genes <- modules |>
+#   dplyr::filter(module != "grey") |>
+#   dplyr::rowwise() |>
+#   dplyr::mutate(kME = .data[[paste0("kME_", module)]]) |>
+#   dplyr::ungroup() |>
+#   dplyr::group_by(module) |>
+#   dplyr::slice_max(order_by = kME, n = N_HUB) |>
+#   dplyr::ungroup()
+hub_genes <- modules %>%
+  pivot_longer(cols = kME_green:kME_blue) %>%
+  group_by(module) %>%
+  slice_max(order_by = value, n = N_HUB)%>%
+  ungroup() %>%
+  distinct(gene_name, color, module)
+
+genes_use  <- hub_genes$gene_name
+cells_use  <- colnames(mc_obj)
+
+mat_hub <- GetAssayData(mc_obj, assay = "SCT", layer = "data")[genes_use, cells_use]
+mat_hub <- as.matrix(mat_hub)
+
+# Z-score per gene
+mat_hub <- t(scale(t(mat_hub)))
+mat_hub[mat_hub >  2] <-  2
+mat_hub[mat_hub < -2] <- -2
+
+# optimal ordering of the matrix
+ser_method <- "PCA" #PCA, PCA_angel, Heatmap(slow and memory intensive)
+
+# Seriate columns globally
+o_cols  <- seriation::seriate(mat_hub, method = ser_method) %>% seriation::get_order(2) %>% rev() %>% sample()
+o_cells <- colnames(mat_hub)[o_cols]
+
+# Seriate genes within each module independently
+o_genes <- hub_genes %>%
+  dplyr::select(gene_name, module) %>%
+  dplyr::group_by(module) %>%
+  dplyr::group_map(function(mod_df, key) {
+    genes_mod <- intersect(mod_df$gene_name, rownames(mat_hub))
+    if (length(genes_mod) <= 2L) return(genes_mod)
+    sub_mat <- mat_hub[genes_mod, , drop = FALSE]
+    tryCatch({
+      o <- seriation::seriate(sub_mat, method = ser_method) %>%
+           seriation::get_order(1L) %>% rev()
+      genes_mod[o]
+    }, error = function(e) genes_mod)
+  }) %>%
+  unlist(use.names = FALSE)
+
+# ── Column ordering: cluster → condition → seriation rank ────────────────────
+cell_meta  <- mc_meta %>% column_to_rownames("metacell_id")
+cell_meta  <- cell_meta[cells_use, ]
+ser_rank   <- setNames(seq_along(o_cells), o_cells)
+
+col_df <- tibble::tibble(
+  cell_id   = colnames(mat_hub),
+  cluster   = factor(cell_meta$majority_cluster, levels = str_sort(unique(cell_meta$majority_cluster), numeric = TRUE)),
+  condition = factor(cell_meta$majority_cond,    levels = c("WT", "mCh-", "mCh+")),
+  ser_rank  = ser_rank[colnames(mat_hub)]
+) |>
+  dplyr::arrange(cluster, condition, ser_rank)
+
+final_cells <- col_df$cell_id
+clust_split <- col_df$cluster   # factor preserves cluster order for anno_block
+clust_labs  <- levels(clust_split)
+
+# ── Column annotation ─────────────────────────────────────────────────────────
+col_anno <- HeatmapAnnotation(
+  cluster = anno_block(
+    gp        = gpar(fill = clust_pal[clust_labs]),
+    labels    = clust_labs,
+    labels_gp = gpar(fontsize = 7, col = "white", fontface = "bold")
+  ),
+  condition = col_df$condition,
+  col  = list(condition = cond_pal),
+  annotation_name_side = "left"
+)
+
+# ── Row annotation — module colour bar ────────────────────────────────────────
+row_anno <- rowAnnotation(
+  module = setNames(hub_genes$module, hub_genes$gene_name)[o_genes],
+  col    = list(module = setNames(
+    unique(hub_genes$color),
+    unique(hub_genes$module)
+  )),
+  show_annotation_name = FALSE
+)
+
+Heatmap(
+  mat_hub[o_genes, final_cells],
+  name                    = "z-score",
+  col                     = colorRamp2(c(-2, 0, 2),
+                                       c("#2166ac", "white", "#b2182b")),
+  top_annotation          = col_anno,
+  left_annotation         = row_anno,
+  column_split            = clust_split,
+  column_title            = NULL,
+  row_split               = setNames(hub_genes$module, hub_genes$gene_name)[o_genes],
+  cluster_rows            = FALSE,
+  cluster_columns         = FALSE,
+  show_column_names       = FALSE,
+  show_row_names          = TRUE,
+  row_names_gp            = gpar(fontsize = 8),
+  row_title_rot           = 0,
+  use_raster              = TRUE,
+  raster_quality          = 3
+)
+```
+
+---
+
+## 10 — Module–trait correlation
+
+Pearson correlation between module eigengenes and condition (one-hot encoded),
+coloured by significance.
+
+```{r trait-correlation}
+#| fig-width: 8
+#| fig-height: 6
+
+me_mat <- GetMEs(srt, wgcna_name = "hsc_modules")
+me_mat <- me_mat[, mod_cols, drop = FALSE]
+
+# One-hot encode conditions
+cond_vec <- label_condition(srt$sample.name)
+trait_mat <- model.matrix(~ 0 + factor(cond_vec))
+colnames(trait_mat) <- levels(factor(cond_vec))
+
+# Pearson r + BH-adjusted p
+cor_res  <- WGCNA::corAndPvalue(me_mat, trait_mat)
+r_mat    <- cor_res$cor
+p_mat    <- cor_res$p
+q_mat    <- matrix(p.adjust(p_mat, "BH"), nrow = nrow(p_mat),
+                   dimnames = dimnames(p_mat))
+
+sig_mat <- ifelse(q_mat < 0.05, "*", "")
+
+Heatmap(
+  r_mat,
+  name     = "Pearson r",
+  col      = colorRamp2(c(-1, 0, 1), c("#2166ac", "white", "#b2182b")),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (sig_mat[i, j] != "")
+      grid::grid.text(sig_mat[i, j], x, y, gp = grid::gpar(fontsize = 14, fontface = "bold"))
+  },
+  cluster_rows    = TRUE,
+  cluster_columns = TRUE,
+  row_names_gp    = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 9),
+  column_title    = "Condition",
+  row_title       = "Module"
+)
+```
+
+---
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
+
+{{< include ../_session-info.qmd >}}

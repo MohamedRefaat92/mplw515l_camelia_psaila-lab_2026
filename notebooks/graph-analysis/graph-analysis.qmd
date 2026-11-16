@@ -1,0 +1,512 @@
+---
+title: "HSC Cluster Graph Analysis — PAGA-style connectivity"
+format:
+  html:
+    embed-resources: false
+    toc: true
+    toc-depth: 3
+    code-fold: true
+theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: console
+---
+
+{{< include ../_provenance.qmd >}}
+
+```{r setup}
+#| include: false
+library(Seurat)
+library(igraph)
+library(graphlayouts)
+library(tidyverse)
+library(patchwork)
+library(cowplot)
+library(ggrepel)
+library(DT)
+
+
+theme_set(theme_cowplot(font_size = 11))
+
+cond_pal   <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+cond_order <- c("WT", "mCh-", "mCh+")
+
+label_condition <- function(x) {
+  dplyr::case_when(
+    grepl("WT",      x) ~ "WT",
+    grepl("mCh-",   x) ~ "mCh-",
+    grepl("mCh\\+", x) ~ "mCh+",
+    TRUE                ~ x
+  )
+}
+```
+
+# Overview
+
+PAGA-style cluster connectivity graph from the HSC SNN graph, with:
+
+1. **Graph construction** — inter-cluster connectivity normalised by expected random connectivity
+2. **ggplot visualisation** — UMAP background + edges + nodes sized by centrality
+3. **Node statistics** — betweenness, degree, eigenvector centrality, strength
+4. **Genotype connectivity** — per-node affinity toward Het (mCh+/mCh−) vs WT clusters
+
+---
+
+# 1  Load data
+
+```{r load}
+mpn_processed_hsc_fullcc      <- targets::tar_read(mpn_processed_hsc_fullcc)
+
+# Cluster column at res 5 (from recluster)
+clus_col <- "sNN_pca.SCT_30_res.0.9"
+clus     <- as.factor(mpn_processed_hsc_fullcc@meta.data[[clus_col]])
+
+# SNN graph
+snn_name <- grep("sNN", names(mpn_processed_hsc_fullcc@graphs), value = TRUE)[1]
+snn      <- mpn_processed_hsc_fullcc@graphs[[snn_name]]
+
+# UMAP embedding
+umap_emb  <- as.data.frame(mpn_processed_hsc_fullcc@reductions$umap@cell.embeddings)
+umap_cols <- colnames(umap_emb)   # e.g. umapnn_1, umapnn_2
+
+umap_df <- umap_emb |>
+  dplyr::rename(umap1 = 1, umap2 = 2) |>
+  tibble::rownames_to_column("cell_id") |>
+  dplyr::mutate(
+    cluster   = as.character(clus),
+    condition = label_condition(mpn_processed_hsc_fullcc$sample.name)
+  )
+
+cat("Clusters:", nlevels(clus), "\n")
+cat("Cells:", ncol(mpn_processed_hsc_fullcc), "\n")
+cat("SNN graph:", snn_name, "\n")
+```
+
+---
+
+# 2  PAGA-style connectivity matrix
+
+Inter-cluster edge weight = observed SNN connectivity / expected under random mixing.
+
+```{r paga}
+clusters  <- levels(clus)
+n_cl      <- length(clusters)
+n_cells   <- ncol(mpn_processed_hsc_fullcc)
+
+paga_mat <- matrix(0, n_cl, n_cl, dimnames = list(clusters, clusters))
+
+for (i in clusters) {
+  for (j in clusters) {
+    ci <- which(clus == i)
+    cj <- which(clus == j)
+    observed        <- sum(snn[ci, cj])
+    expected        <- (length(ci) * length(cj)) / n_cells
+    paga_mat[i, j]  <- observed / (expected + 1e-6)
+  }
+}
+
+# Build igraph (undirected, no self-loops)
+g <- igraph::graph_from_adjacency_matrix(
+  paga_mat, weighted = TRUE, mode = "undirected", diag = FALSE)
+
+cat("Nodes:", igraph::vcount(g), "\n")
+cat("Edges:", igraph::ecount(g), "\n")
+cat("Weight range: [", round(min(E(g)$weight), 2), ",",
+    round(max(E(g)$weight), 2), "]\n")
+```
+
+---
+
+# 3  Node statistics
+
+```{r node-stats}
+# Centroids for graph layout
+centroids <- umap_df |>
+  dplyr::group_by(cluster) |>
+  dplyr::summarise(x = median(umap1), y = median(umap2), .groups = "drop")
+
+# Per-cluster condition composition
+composition <- umap_df |>
+  dplyr::count(cluster, condition) |>
+  tidyr::pivot_wider(names_from = condition, values_from = n, values_fill = 0) |>
+  dplyr::mutate(
+    total      = rowSums(dplyr::across(dplyr::any_of(cond_order))),
+    frac_wt    = WT    / total,
+    frac_mchn  = `mCh-` / total,
+    frac_mchp  = `mCh+` / total,
+    frac_het   = (`mCh-` + `mCh+`) / total,
+    majority   = dplyr::case_when(
+      frac_wt  > 0.5 ~ "WT",
+      frac_mchp > frac_mchn ~ "mCh+",
+      TRUE           ~ "mCh-"
+    )
+  )
+
+node_stats <- tibble::tibble(
+  cluster     = V(g)$name,
+  betweenness = igraph::betweenness(g, normalized = TRUE),
+  degree      = igraph::degree(g),
+  strength    = igraph::strength(g),          # weighted degree
+  eigenvector = igraph::eigen_centrality(g)$vector,
+  transitivity = igraph::transitivity(g, type = "local", isolates = "zero")
+) |>
+  dplyr::left_join(centroids,    by = "cluster") |>
+  dplyr::left_join(composition,  by = "cluster")
+
+# Per-node Het/WT affinity: weighted average frac_het of neighbours
+adj_df <- igraph::as_data_frame(g, what = "edges")
+het_affinity <- purrr::map_dbl(V(g)$name, function(v) {
+  nb  <- adj_df |> dplyr::filter(from == v | to == v) |>
+    dplyr::mutate(neighbour = dplyr::if_else(from == v, to, from))
+  if (nrow(nb) == 0) return(NA_real_)
+  nb  <- dplyr::left_join(nb, composition |> dplyr::select(cluster, frac_het),
+                           by = c("neighbour" = "cluster"))
+  sum(nb$weight * nb$frac_het, na.rm = TRUE) / sum(nb$weight, na.rm = TRUE)
+})
+node_stats$het_neighbour_affinity <- het_affinity
+
+DT::datatable(
+  node_stats |>
+    dplyr::select(cluster, degree, strength, betweenness, eigenvector,
+                  transitivity, frac_het, frac_wt, het_neighbour_affinity, majority) |>
+    dplyr::arrange(dplyr::desc(betweenness)) |>
+    dplyr::mutate(dplyr::across(where(is.double), ~ round(.x, 3))),
+  rownames = FALSE, filter = "top",
+  caption  = "Node statistics — sorted by betweenness centrality",
+  options  = list(pageLength = 15, scrollX = TRUE)
+)
+```
+
+---
+
+# 4  Graph visualisation
+
+```{r graph-plot-fn}
+#' ggplot PAGA graph overlaid on UMAP background.
+#' @param weight_thr  Minimum edge weight to draw (filters visual clutter).
+#' @param size_by     Node size aesthetic: "betweenness" | "strength" | "eigenvector"
+#' @param color_by    Node fill: "majority" | "frac_het" | "het_neighbour_affinity"
+plot_paga_gg <- function(weight_thr = 1,
+                         size_by    = "betweenness",
+                         color_by   = "majority") {
+
+  edge_df <- igraph::as_data_frame(g, what = "edges") |>
+    dplyr::filter(weight >= weight_thr) |>
+    dplyr::left_join(centroids |> dplyr::rename(from = cluster, x_from = x, y_from = y),
+                     by = "from") |>
+    dplyr::left_join(centroids |> dplyr::rename(to = cluster, x_to = x, y_to = y),
+                     by = "to")
+
+  p <- ggplot() +
+    # Grey UMAP background
+    geom_point(data = umap_df, aes(umap1, umap2),
+               colour = "grey88", size = 0.15, alpha = 0.4) +
+    # Edges
+    geom_segment(data = edge_df,
+                 aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
+                     linewidth = weight, alpha = weight),
+                 colour = "steelblue4", show.legend = FALSE) +
+    scale_linewidth_continuous(range = c(0.2, 3)) +
+    scale_alpha_continuous(range = c(0.2, 0.8))
+
+  if (color_by == "majority") {
+    maj_pal <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+    p <- p +
+      geom_point(data = node_stats,
+                 aes(x, y, size = .data[[size_by]], fill = majority),
+                 shape = 21, colour = "white", stroke = 0.6) +
+      scale_fill_manual(values = maj_pal, name = "Majority\ncondition")
+  } else {
+    p <- p +
+      geom_point(data = node_stats,
+                 aes(x, y, size = .data[[size_by]], fill = .data[[color_by]]),
+                 shape = 21, colour = "white", stroke = 0.6) +
+      scale_fill_gradientn(
+        colours  = c("#2166ac", "white", "#d73027"),
+        name     = color_by,
+        limits   = c(0, 1))
+  }
+
+  p +
+    ggrepel::geom_label_repel(
+      data = node_stats, aes(x, y, label = cluster),
+      size = 2.5, label.size = 0.2, label.padding = 0.15,
+      fill = alpha("white", 0.7), max.overlaps = 30) +
+    scale_size_continuous(range = c(2, 10), name = size_by) +
+    labs(x = umap_cols[1], y = umap_cols[2]) +
+    theme_void() +
+    theme(legend.position = "right")
+}
+```
+
+## Betweenness centrality + majority condition
+
+```{r plot-betweenness, fig.width=10, fig.height=8}
+plot_paga_gg(weight_thr = 1, size_by = "betweenness", color_by = "majority")
+```
+
+## Strength (weighted degree) + Het neighbour affinity
+
+```{r plot-strength, fig.width=10, fig.height=8}
+plot_paga_gg(weight_thr = 1, size_by = "strength", color_by = "het_neighbour_affinity")
+```
+
+## Fraction Het cells per node
+
+```{r plot-frac-het, fig.width=10, fig.height=8}
+plot_paga_gg(weight_thr = 1, size_by = "strength", color_by = "frac_het")
+```
+
+## Minimum spanning tree
+
+The maximum spanning tree of the PAGA graph — the minimal set of edges that
+connects all clusters through the strongest SNN connections.
+Laid out with the Reingold-Tilford tree algorithm, rooted at the highest-betweenness
+node, so branch depth reflects topological distance from the hub.
+
+```{r mst-compute}
+# Maximum spanning tree: negate weights so mst() selects strongest edges
+g_mst <- igraph::mst(g, weights = -E(g)$weight)
+
+# Recover original weights for line thickness
+E(g_mst)$weight <- E(g)$weight[
+  igraph::get.edge.ids(g, as.vector(t(igraph::ends(g_mst, igraph::E(g_mst)))))
+]
+
+# Edge coordinates from UMAP centroids
+mst_edge_df <- igraph::as_data_frame(g_mst, what = "edges") |>
+  dplyr::left_join(
+    node_stats |> dplyr::select(cluster, x, y) |>
+      dplyr::rename(from = cluster, x_from = x, y_from = y),
+    by = "from") |>
+  dplyr::left_join(
+    node_stats |> dplyr::select(cluster, x, y) |>
+      dplyr::rename(to = cluster, x_to = x, y_to = y),
+    by = "to")
+
+cat("MST edges:", igraph::ecount(g_mst),
+    "| weight range: [", round(min(mst_edge_df$weight), 2),
+    ",", round(max(mst_edge_df$weight), 2), "]\n")
+```
+
+```{r mst-plot-fn}
+plot_paga_mst <- function(size_by  = "betweenness",
+                          color_by = "majority") {
+  p <- ggplot() +
+    # Grey UMAP background
+    geom_point(data = umap_df, aes(umap1, umap2),
+               colour = "grey88", size = 0.15, alpha = 0.4) +
+    # MST edges
+    geom_segment(
+      data = mst_edge_df,
+      aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
+          linewidth = weight),
+      colour = "steelblue4", alpha = 0.85, show.legend = FALSE) +
+    scale_linewidth_continuous(range = c(0.5, 3))
+
+  if (color_by == "majority") {
+    maj_pal <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+    p <- p +
+      geom_point(data = node_stats,
+                 aes(x, y, size = .data[[size_by]], fill = majority),
+                 shape = 21, colour = "white", stroke = 0.6) +
+      scale_fill_manual(values = maj_pal, name = "Majority\ncondition")
+  } else {
+    p <- p +
+      geom_point(data = node_stats,
+                 aes(x, y, size = .data[[size_by]],
+                     fill = .data[[color_by]]),
+                 shape = 21, colour = "white", stroke = 0.6) +
+      scale_fill_gradientn(
+        colours = c("#2166ac", "white", "#d73027"),
+        name    = color_by, limits = c(0, 1))
+  }
+
+  p +
+    ggrepel::geom_label_repel(
+      data = node_stats, aes(x, y, label = cluster),
+      size = 2.5, label.size = 0.2, label.padding = 0.15,
+      fill = alpha("white", 0.7), max.overlaps = 30) +
+    scale_size_continuous(range = c(2, 10), name = size_by) +
+    labs(x = umap_cols[1], y = umap_cols[2]) +
+    theme_void() +
+    theme(legend.position = "right")
+}
+```
+
+### MST — betweenness centrality + majority condition
+
+```{r mst-betweenness, fig.width=10, fig.height=8}
+plot_paga_mst(size_by = "betweenness", color_by = "majority")
+```
+
+### MST — Het neighbour affinity
+
+```{r mst-het-affinity, fig.width=10, fig.height=8}
+plot_paga_mst(size_by = "strength", color_by = "het_neighbour_affinity")
+```
+
+## Force-directed layout (stress)
+
+Stress-majorization layout (`graphlayouts::layout_with_stress`) —
+minimises the difference between graph-theoretic and Euclidean distances,
+placing well-connected clusters close and distant clusters far apart.
+No UMAP constraint; positions reflect pure graph topology.
+
+```{r fa2-layout}
+# Filter to edges above expected connectivity (same threshold as UMAP plots)
+g_fa2 <- igraph::delete_edges(g, which(E(g)$weight < 1))
+
+set.seed(42)
+layout_coords           <- graphlayouts::layout_with_stress(g_fa2)
+rownames(layout_coords) <- V(g_fa2)$name
+colnames(layout_coords) <- c("fa2_x", "fa2_y")
+
+nodes_fa2 <- node_stats |>
+  dplyr::left_join(
+    as.data.frame(layout_coords) |> tibble::rownames_to_column("cluster"),
+    by = "cluster")
+
+edges_fa2 <- igraph::as_data_frame(g_fa2, what = "edges") |>
+  dplyr::left_join(
+    nodes_fa2 |> dplyr::select(cluster, fa2_x, fa2_y) |>
+      dplyr::rename(from = cluster, x_from = fa2_x, y_from = fa2_y),
+    by = "from") |>
+  dplyr::left_join(
+    nodes_fa2 |> dplyr::select(cluster, fa2_x, fa2_y) |>
+      dplyr::rename(to = cluster, x_to = fa2_x, y_to = fa2_y),
+    by = "to")
+
+cat("FA2 graph: nodes =", igraph::vcount(g_fa2),
+    "| edges =", igraph::ecount(g_fa2), "\n")
+```
+
+```{r fa2-plot-fn}
+plot_paga_fa2 <- function(size_by  = "betweenness",
+                          color_by = "majority") {
+  p <- ggplot() +
+    geom_segment(
+      data = edges_fa2,
+      aes(x = x_from, y = y_from, xend = x_to, yend = y_to,
+          linewidth = weight, alpha = weight),
+      colour = "steelblue4", show.legend = FALSE) +
+    scale_linewidth_continuous(range = c(0.3, 3)) +
+    scale_alpha_continuous(range = c(0.2, 0.8))
+
+  if (color_by == "majority") {
+    maj_pal <- c(WT = "#888888", `mCh-` = "#2a9d8f", `mCh+` = "#e76f51")
+    p <- p +
+      geom_point(data = nodes_fa2,
+                 aes(fa2_x, fa2_y, size = .data[[size_by]], fill = majority),
+                 shape = 21, colour = "white", stroke = 0.8) +
+      scale_fill_manual(values = maj_pal, name = "Majority\ncondition")
+  } else {
+    p <- p +
+      geom_point(data = nodes_fa2,
+                 aes(fa2_x, fa2_y, size = .data[[size_by]],
+                     fill = .data[[color_by]]),
+                 shape = 21, colour = "white", stroke = 0.8) +
+      scale_fill_gradientn(
+        colours = c("#2166ac", "white", "#d73027"),
+        name    = color_by, limits = c(0, 1))
+  }
+
+  p +
+    ggrepel::geom_label_repel(
+      data = nodes_fa2, aes(fa2_x, fa2_y, label = cluster),
+      size = 2.5, label.size = 0.2, label.padding = 0.15,
+      fill = alpha("white", 0.7), max.overlaps = 30) +
+    scale_size_continuous(range = c(2, 10), name = size_by) +
+    labs(x = NULL, y = NULL) +
+    theme_void() +
+    theme(legend.position = "right")
+}
+```
+
+### Betweenness centrality + majority condition
+
+```{r fa2-betweenness, fig.width=9, fig.height=8}
+plot_paga_fa2(size_by = "betweenness", color_by = "majority")
+```
+
+### Het neighbour affinity
+
+```{r fa2-het-affinity, fig.width=9, fig.height=8}
+plot_paga_fa2(size_by = "strength", color_by = "het_neighbour_affinity")
+```
+
+### Fraction Het cells
+
+```{r fa2-frac-het, fig.width=9, fig.height=8}
+plot_paga_fa2(size_by = "strength", color_by = "frac_het")
+```
+
+---
+
+# 5  Genotype connectivity analysis
+
+For each node: weighted-average connectivity to WT neighbours vs Het neighbours.
+
+```{r geno-conn}
+wt_affinity <- purrr::map_dbl(V(g)$name, function(v) {
+  nb <- adj_df |> dplyr::filter(from == v | to == v) |>
+    dplyr::mutate(neighbour = dplyr::if_else(from == v, to, from)) |>
+    dplyr::left_join(composition |> dplyr::select(cluster, frac_wt),
+                     by = c("neighbour" = "cluster"))
+  sum(nb$weight * nb$frac_wt, na.rm = TRUE) / sum(nb$weight, na.rm = TRUE)
+})
+node_stats$wt_neighbour_affinity <- wt_affinity
+node_stats$het_vs_wt_affinity    <- node_stats$het_neighbour_affinity -
+                                    node_stats$wt_neighbour_affinity
+
+# Ranked bar: net Het affinity (positive = more connected to Het clusters)
+node_stats |>
+  dplyr::arrange(het_vs_wt_affinity) |>
+  dplyr::mutate(cluster = factor(cluster, levels = cluster)) |>
+  ggplot(aes(cluster, het_vs_wt_affinity, fill = het_vs_wt_affinity > 0)) +
+    geom_col() +
+    scale_fill_manual(values = c(`FALSE` = "#888888", `TRUE` = "#e76f51"),
+                      guide = "none") +
+    geom_hline(yintercept = 0, linewidth = 0.4) +
+    labs(x = "Cluster", y = "Het − WT neighbour affinity",
+         title = "Net connectivity bias toward Het vs WT clusters") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8))
+```
+
+```{r geno-conn-table}
+node_stats |>
+  dplyr::select(cluster, majority, frac_het, frac_wt,
+                het_neighbour_affinity, wt_neighbour_affinity,
+                het_vs_wt_affinity, betweenness, strength) |>
+  dplyr::arrange(dplyr::desc(het_vs_wt_affinity)) |>
+  dplyr::mutate(dplyr::across(where(is.double), ~ round(.x, 3))) |>
+  DT::datatable(rownames = FALSE, filter = "top",
+                caption  = "Genotype connectivity — sorted by Het − WT affinity",
+                options  = list(pageLength = 20, scrollX = TRUE))
+```
+
+---
+
+# 6  Central node summary
+
+Top nodes by betweenness (hubs) and by Het affinity (most Het-connected).
+
+```{r central-nodes}
+top_between <- node_stats |>
+  dplyr::slice_max(betweenness, n = 5) |>
+  dplyr::select(cluster, betweenness, strength, majority, frac_het)
+
+top_het <- node_stats |>
+  dplyr::slice_max(het_vs_wt_affinity, n = 5) |>
+  dplyr::select(cluster, het_vs_wt_affinity, frac_het, majority, betweenness)
+
+cat("=== Top hubs (betweenness) ===\n")
+print(top_between)
+cat("\n=== Most Het-connected nodes ===\n")
+print(top_het)
+```
+
+{{< include ../_session-info.qmd >}}
