@@ -444,15 +444,25 @@ read_mini_hits <- function(sam, opt = IS_DEFAULTS) {
   good <- at_junction & soft <= opt$max_softclip & nm <= pmax(1L, clip_len %/% 10L)
   if (!any(good)) return(empty_hit_table())
 
+  # Captured before the tibble() call: inside it, `pos` would resolve to the column being defined on
+  # the line below rather than to this local vector, silently producing NAs.
+  flank_pos_v <- pos[good]
+  span_v      <- as.integer(span[good])
+
   dplyr::tibble(
-    chrom    = ref[good, 1],          # the site_id; the genomic coordinate comes from the site table
-    pos      = junc[good],
-    strand   = ref[good, 2],
-    mapq     = as.integer(field(5))[good],
-    tube     = prov[good, 1],
-    barcode  = prov[good, 2],
-    umi      = prov[good, 3],
-    clip_len = clip_len[good]
+    chrom     = ref[good, 1],         # the site_id; the genomic coordinate comes from the site table
+    pos       = junc[good],
+    strand    = ref[good, 2],
+    mapq      = as.integer(field(5))[good],
+    tube      = prov[good, 1],
+    barcode   = prov[good, 2],
+    umi       = prov[good, 3],
+    clip_len  = clip_len[good],
+    # where the clip actually sits inside the flank, so junction_coverage() can draw the pile-up
+    # from exactly the alignments that passed the positional test and no others
+    flank_pos = flank_pos_v,
+    span      = span_v,
+    junction  = junc[good]
   ) |>
     dplyr::rename(site_id = chrom)
 }
@@ -577,6 +587,74 @@ update_site_counts <- function(site_table, mini, tubes) {
     dplyr::mutate(dplyr::across(c(reads, cells, umis, dplyr::starts_with("cells_")),
                                 ~ tidyr::replace_na(.x, 0L))) |>
     dplyr::arrange(dplyr::desc(cells), chrom, pos)
+}
+
+#' Per-base coverage of the host flanks either side of each junction, by channel.
+#'
+#' The two channels approach a provirus from opposite ends: 3' clips are the host sequence that
+#' FOLLOWS it and 5' clips the host that PRECEDES it. Plotted on a common axis anchored at the 3'
+#' junction, they should therefore pile up on opposite sides of it and meet - overlapping by the
+#' 5 bp target-site duplication. The TSD stops being a number in a table and becomes visible.
+#'
+#' Offsets are signed distances from the 3' junction in genomic coordinates, so 0 is the junction
+#' base itself. Mini-reference hits are converted out of flank coordinates using the junction offset
+#' carried in the reference name; 5' hits are already genomic.
+junction_coverage <- function(mini_sam, five_sam, sites, opt = IS_DEFAULTS, window = 120L) {
+  span_of <- function(cigar) ref_span(cigar)
+
+  read_sam <- function(path) {
+    if (!file.exists(path) || file.size(path) == 0L) return(NULL)
+    lines <- readLines(path, warn = FALSE)
+    lines <- lines[!startsWith(lines, "@")]
+    if (!length(lines)) return(NULL)
+    f <- strsplit(lines, "\t", fixed = TRUE)
+    fl <- as.integer(vapply(f, `[`, "", 2L))
+    keep <- bitwAnd(fl, 0x100) == 0L & bitwAnd(fl, 0x800) == 0L &
+      vapply(f, `[`, "", 3L) != "*"
+    if (!any(keep)) return(NULL)
+    f <- f[keep]
+    dplyr::tibble(rname = vapply(f, `[`, "", 3L),
+                  pos   = as.integer(vapply(f, `[`, "", 4L)),
+                  mapq  = as.integer(vapply(f, `[`, "", 5L)),
+                  cigar = vapply(f, `[`, "", 6L))
+  }
+
+  expand <- function(site_id, start, len) {
+    n <- rep(site_id, len)
+    dplyr::tibble(site_id = n, offset = unlist(Map(function(a, l) a:(a + l - 1L), start, len)))
+  }
+
+  out <- list()
+
+  # Take the 3' pile-up from read_mini_hits(), not from the raw SAM: only alignments that landed on
+  # the junction base count, and plotting the unfiltered set spreads coverage far beyond any clip's
+  # length (IS01 ran -49 to +119, wider than a 125 bp read can reach).
+  m <- read_mini_hits(mini_sam, opt)
+  if (nrow(m)) {
+    out$three <- expand(m$site_id, m$flank_pos - m$junction, m$span) |>
+      dplyr::mutate(channel = "3' junction (host after the provirus)")
+  }
+
+  f5 <- read_sam(five_sam)
+  if (!is.null(f5)) {
+    f5 <- dplyr::filter(f5, mapq >= opt$min_mapq)
+    hit <- lapply(seq_len(nrow(f5)), function(i) {
+      k <- which(sites$chrom == f5$rname[i] & abs(sites$pos - f5$pos[i]) <= 2000L)
+      if (!length(k)) return(NULL)
+      k <- k[which.min(abs(sites$pos[k] - f5$pos[i]))]
+      len <- as.integer(span_of(f5$cigar[i]))
+      if (len <= 0L) return(NULL)
+      dplyr::tibble(site_id = sites$site_id[k],
+                    offset  = (f5$pos[i] - sites$pos[k]):(f5$pos[i] - sites$pos[k] + len - 1L))
+    })
+    hit <- dplyr::bind_rows(hit)
+    if (nrow(hit)) out$five <- dplyr::mutate(hit, channel = "5' junction (host before the provirus)")
+  }
+
+  if (!length(out)) return(dplyr::tibble())
+  dplyr::bind_rows(out) |>
+    dplyr::filter(abs(offset) <= window) |>
+    dplyr::count(site_id, channel, offset, name = "depth")
 }
 
 #' Match 5' junctions to called sites and test the target-site duplication.

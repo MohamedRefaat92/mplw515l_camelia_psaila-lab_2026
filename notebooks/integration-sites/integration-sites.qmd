@@ -158,6 +158,7 @@ sites       <- readr::read_csv(file.path(sites_dir, "integration_sites.csv"), sh
 assign      <- readr::read_csv(file.path(sites_dir, "cell_site_assignments.csv"), show_col_types = FALSE)
 summary_tbl <- readr::read_csv(file.path(sites_dir, "site_calling_summary.csv"), show_col_types = FALSE)
 tsd         <- readr::read_csv(file.path(sites_dir, "tsd_check.csv"), show_col_types = FALSE)
+coverage    <- readr::read_csv(file.path(sites_dir, "junction_coverage.csv"), show_col_types = FALSE)
 
 # One factor with every site as a level, so a clone keeps the same colour in every panel even where
 # it has no cells. As a bare character it would be re-levelled per panel and the colours would shift.
@@ -511,6 +512,61 @@ as the passes:
   that happens to lie nearby, *not* a failed duplication for that site. chr19:38,932,385 carries more
   reads than IS03's own 5′ junction while sitting 1.4 kb away, and remains unexplained; it is kept
   out of the arithmetic deliberately.
+
+### Seeing it
+
+The duplication is easier to believe as geometry than as a number. Each panel is a window around one
+site with both channels on a common axis anchored at the 3′ junction: 3′ clips above the line,
+5′ clips below, each scaled within its own channel because the 3′ channel is up to a hundred times
+deeper.
+
+```{r junction-pileup, fig.height=8.5, fig.width=10}
+tsd_band <- coverage |>
+  dplyr::group_by(site_id) |>
+  dplyr::filter(any(grepl("^5", channel))) |>
+  dplyr::summarise(
+    lo = max(min(offset[grepl("^3", channel)]), min(offset[grepl("^5", channel)])),
+    hi = min(max(offset[grepl("^3", channel)]), max(offset[grepl("^5", channel)])),
+    .groups = "drop") |>
+  dplyr::mutate(bp = hi - lo + 1L, lab = paste0("TSD ", bp, " bp"))
+
+coverage |>
+  dplyr::group_by(site_id, channel) |>
+  dplyr::mutate(rel = depth / max(depth)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(rel = ifelse(grepl("^5", channel), -rel, rel)) |>
+  ggplot() +
+  geom_rect(data = tsd_band, aes(xmin = lo - 0.5, xmax = hi + 0.5, ymin = -Inf, ymax = Inf),
+            fill = "#f0c200", alpha = 0.85, inherit.aes = FALSE) +
+  geom_col(aes(offset, rel, fill = channel), width = 1) +
+  geom_hline(yintercept = 0, colour = "grey20", linewidth = 0.3) +
+  geom_text(data = tsd_band, aes(x = lo + bp / 2, y = 1.22, label = lab),
+            size = 2.9, colour = "grey20", inherit.aes = FALSE) +
+  facet_wrap(~ site_id, ncol = 2) +
+  scale_fill_manual(values = c("#D55E00", "#0072B2")) +
+  scale_y_continuous(labels = abs, limits = c(-1.1, 1.4)) +
+  coord_cartesian(xlim = c(-55, 55)) +
+  labs(x = "offset from the 3′ junction (bp)", y = "coverage, scaled within channel", fill = NULL,
+       title = "Chimeric read pile-up either side of each integration junction") +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+Three things are worth reading off it.
+
+**Each channel stops where the provirus starts.** Neither spills across the junction, because a clip
+is by construction the host half of a read whose other half aligned to the vector. The hard edge at
+offset 0 is the provirus boundary, not a plotting limit.
+
+**The orientation flips between sites.** Where the 3′ pile-up lies left of the junction the provirus
+is on the minus strand, and right of it on the plus strand. The 5′ channel always takes the opposite
+side, which is what two ends of one insert requires.
+
+**They overlap by exactly 5 bases, every time.** That is the shaded band: the target-site duplication
+drawn rather than asserted, the stagger integrase leaves, measured independently at four sites.
+Sites with no 5′ reads show one channel and no band — missing evidence, not contrary evidence.
+
+### What it has already caught
 
 The check has already earned its place. It caught a coordinate bug in the 3′ channel — minus-strand
 junctions were being reported about 48 bp from their true position, and worse, clips from one

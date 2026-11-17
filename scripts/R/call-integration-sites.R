@@ -97,6 +97,11 @@ if (stage == "extract") {
   tsd  <- tsd_check(site_table, five)
   readr::write_csv(tsd, file.path(out, "tsd_check.csv"))
 
+  # Per-base pile-up either side of each junction, for the report's browser-style figure.
+  readr::write_csv(
+    junction_coverage(file.path(work, "assign.sam"), file.path(work, "five_prime.sam"), site_table),
+    file.path(out, "junction_coverage.csv"))
+
   readr::write_csv(
     dplyr::tibble(
       stage = c("discovery clips placed uniquely",
