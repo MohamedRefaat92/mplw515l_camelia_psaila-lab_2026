@@ -92,6 +92,10 @@ dt   <- readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_ty
 vec  <- comp[comp$denominator == "cells carrying vector transcript", ]
 fcur <- readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = FALSE)
 big  <- dt[!is.na(dt$clone_size), ][order(-dt$cells[!is.na(dt$clone_size)]), ][1:2, ]
+# The sites the evidence table does not support, subset ONCE. Taking the subset inside ifelse() and
+# again from its result indexes three values with fifteen logicals, and every reason renders as NA.
+weak <- ev[!ev$defensible, ]
+stopifnot(nrow(weak) > 0, !anyNA(weak$pooled_only))
 
 dplyr::tibble(
   what = c("Integration sites called",
@@ -100,8 +104,13 @@ dplyr::tibble(
            "Share of the transduced population these clones account for",
            "Assignment error, measured against the decoy flanks"),
   value = c(
-    sprintf("**%d**, of which **%d** are defensible (%s clear the cell floor only on pooled reads)",
-            nrow(ev), sum(ev$defensible), paste(ev$site_id[!ev$defensible], collapse = ", ")),
+    # The reason is derived per site rather than asserted: an earlier version said all three
+    # "clear the cell floor only on pooled reads", which is true of IS14 and IS15 and not of IS07.
+    sprintf("**%d**, of which **%d** are defensible (%s)", nrow(ev), sum(ev$defensible),
+            paste(sprintf("%s: %s", weak$site_id,
+                          ifelse(weak$pooled_only, "pooled reads only",
+                                 "flank cannot support quantification")),
+                  collapse = "; ")),
     sprintf("**%s** across %d sites", scales::comma(sum(ev$cells)), nrow(ev)),
     sprintf("**%s** and **%s** cells, against %d and %d detected",
             scales::comma(big$clone_size[1]), scales::comma(big$clone_size[2]),
@@ -117,7 +126,7 @@ dplyr::tibble(
 
 **The judgement that is not a number.** Two of the fifteen sites, IS14 and IS15, reach the cell floor
 only when both channels' reads are pooled and have no 5′ junction to vouch for them; a third, IS07,
-has a flank that cannot support quantification. **Quote 13, not 15**, for anything that counts sites.
+has a flank that cannot support quantification. **Quote 12, not 15**, for anything that counts sites.
 `site_evidence.csv` carries a `defensible` column so this does not have to be remembered.
 
 **The one open question.** Roughly 88% of vector-expressing mCherry⁺ cells belong to no called site.
@@ -594,7 +603,7 @@ disagreement and nothing finer, because sub-floor molecules come one to a cell �
 151 different cells. **No cell in this data carries two sub-floor molecules**, which also retires the
 idea of aggregating several short clips within a cell into one confident call: it has no instances
 here. At λ ≈ 0.3–0.7 you do not get two attempts at the same cell. The exception is instructive:
-IS05, at 2.63 molecules a cell, is the one site where within-cell replication exists at all.
+IS05, at 2.75 molecules a cell, is the one site where within-cell replication exists at all.
 
 ```{r clip-length}
 junction_clips <- anchor_ends %>%
@@ -621,9 +630,10 @@ Those are not the same question, and treating them as one is what the old single
 Discovery must survive 2.7 Gb of alternatives, so it needs a clip long enough to be unique there.
 Assignment only has to choose among a handful of known flanks — **and the clip must land on the
 junction base exactly**, not merely somewhere in the flank. That positional constraint is the real
-discriminator, and it is strong enough that a 10 bp clip is decisive: it has 400 places to land in
-each flank and one is accepted. The floor is 10 rather than 8 because that is where the decoy flanks
-stop returning hits — 8 and 9 bp return two between them, 10 bp and above return none.
+discriminator, and it is strong enough that a 6 bp clip is decisive: it has 400 places to land in
+each flank and one is accepted. The floor is 6, set from the per-base decoy curve below, and only in
+company with exact matching beneath 15 bases — under the mismatch budget a 6 bp clip matches most of
+a decoy set.
 
 The evidence that this is safe rather than merely generous is the control: 28,010 cells across the
 wild-type tubes that never saw the vector. Dropping the threshold from 25 to 10 raises labelled
@@ -722,7 +732,8 @@ evidence in the set, so they are flagged `pooled_only` in the site table. They a
 sites the mini-reference gate holds out for lacking 5′ confirmation, which is not a coincidence:
 nothing independent vouches for either. **Exclude them from any repertoire count, diversity
 statistic or denominator** until a second line of evidence arrives. Saying "15 sites" without that
-caveat overstates what was found; the defensible count is **13**.
+caveat overstates what was found. Counting the flank-gated IS07 as well, the defensible count is
+**12**, and `site_evidence.csv` carries a `defensible` column so it need not be re-derived.
 
 The largest addition is not marginal. **IS10, `chr13:5,676,485`, is the fifth largest clone in the
 experiment at 99 cells, and the 3′ channel cannot see it at all.** Not for want of reads: three
@@ -1163,10 +1174,49 @@ embedding <- dplyr::bind_rows(hsc, mnc) %>%
       grepl("wildtype",   sample) ~ "wild-type (no vector)"),
     levels = c("FACS mCherry+", "FACS mCherry−", "wild-type (no vector)")))
 
-# The file against the object. If these ever disagree, one is stale - most likely the file, after an
-# upstream target was rebuilt - and the report should stop rather than report whichever it picked.
-stopifnot(identical(as.character(embedding$replicate), as.character(embedding$replicate_srt)))
-embedding$replicate_srt <- NULL
+# The file against the object, checked in two parts rather than with one identical(). A first
+# version demanded identical() and halted the render: of 50,088 HSC cells present in both, ZERO
+# disagree, and a single cell is absent from the file - so the test was failing on coverage while
+# the content was perfect. The two failures mean different things and deserve different treatment.
+#
+#  - a DISAGREEMENT means one source is stale, most likely the file after an upstream target was
+#    rebuilt, and nothing downstream can be trusted: halt.
+#  - a GAP means the demultiplexer's output does not cover a cell the processed object kept. One
+#    such cell exists (its call is "negative"). Fill it from the object and say how many, but halt
+#    if it is more than a handful, because that would mean the file is from a different run.
+#' Attach `replicate` from the calls file, checking it against the object's own column.
+#'
+#' One helper for every embedding, because `cell_embedding()` has two callers and an earlier version
+#' of this fixed up only the post-QC one - leaving the pre-QC embedding with no `replicate` column at
+#' all, which the facets below then failed on.
+#'
+#' `strict` is TRUE for the called-cell embedding, where the demultiplexer saw essentially every cell
+#' and a gap means the file is from another run. It is FALSE for the pre-QC embedding, which contains
+#' barcodes that were never called cells and which the demultiplexer therefore never saw: a large gap
+#' there is expected, not a fault.
+attach_replicate <- function(emb, label, strict = TRUE) {
+  both <- !is.na(emb$replicate) & !is.na(emb$replicate_srt)
+  bad  <- sum(as.character(emb$replicate[both]) != as.character(emb$replicate_srt[both]))
+  if (bad > 0L) {
+    stop("hashtag calls disagree with the Seurat objects for ", bad, " of ", sum(both),
+         " cells in ", label, ". One is stale; re-run scripts/R/export-hashtag-calls.R.",
+         call. = FALSE)
+  }
+  gap <- sum(is.na(emb$replicate) & !is.na(emb$replicate_srt))
+  if (strict && gap > 10L) {
+    stop("hashtag_calls.csv.gz is missing ", gap, " of ", label, "'s cells, too many to be a ",
+         "demultiplexer edge case; the file is probably from another run.", call. = FALSE)
+  }
+  if (gap > 0L) {
+    message("note: ", gap, " cell(s) of ", label,
+            " absent from hashtag_calls.csv.gz, filled from the processed object")
+  }
+  emb |>
+    dplyr::mutate(replicate = dplyr::coalesce(replicate, replicate_srt)) |>
+    dplyr::select(-replicate_srt)
+}
+
+embedding <- attach_replicate(embedding, "the called-cell embedding", strict = TRUE)
 rm(hsc, mnc); gc(verbose = FALSE)
 
 # tube + barcode is the Seurat cell name, e.g. Rx_4 + AAACCAAAGAATCATC-1 -> Rx_4_AAACCAAAGAATCATC-1
@@ -1251,7 +1301,11 @@ has to be checked rather than assumed.
 # smoke test caught the orphan.
 raw_hsc <- cell_embedding(tar_read(mpn_raw_processed_hsc), "HSC"); gc(verbose = FALSE)
 raw_mnc <- cell_embedding(tar_read(mpn_raw_processed_mnc), "MNC"); gc(verbose = FALSE)
-embedding_raw <- dplyr::bind_rows(raw_hsc, raw_mnc)
+embedding_raw <- dplyr::bind_rows(raw_hsc, raw_mnc) |>
+  dplyr::left_join(dplyr::transmute(hashtag_calls, cell, replicate = factor(
+    call, levels = c("TotalSeq-B0301", "TotalSeq-B0302", "TotalSeq-B0303",
+                     "TotalSeq-B0304", "negative", "multiplet"))), by = "cell") |>
+  attach_replicate("the pre-QC embedding", strict = FALSE)
 rm(raw_hsc, raw_mnc); gc(verbose = FALSE)
 
 labelled_raw <- assign |>
@@ -1759,7 +1813,7 @@ ggplot(dose, aes(k, observed, colour = pair)) +
 **There is a dose–response, and the matched control is flat at zero.** Sharing rises with detection
 depth for the same-mouse pair — 0, then 10.5%, then 31.8% — and stays at exactly zero for the
 cross-mouse pair at every depth including the eight deepest cells. At matched depth `k = 2` the
-contrast is 12 of 114 against 0 of 91, Fisher exact *p* = 0.0014. Doublets and correlated detection
+contrast is 12 of 101 against 0 of 84, Fisher exact *p* = 0.00056. Doublets and correlated detection
 do not produce a depth gradient in one pair and a flat zero in another; partial detection of a
 shared founder does.
 
@@ -2048,8 +2102,8 @@ readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FA
   DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 15, scrollX = TRUE))
 ```
 
-**Read the top row and the bottom row together.** IS05 averages 2.63 molecules a cell and the
-estimator returns 63 against 57 detected — 91% detection, tightly bounded, and the one case where
+**Read the top row and the bottom row together.** IS05 averages 2.75 molecules a cell and the
+estimator returns 58 against 53 detected — 92% detection, tightly bounded, and the one case where
 the method can see what it is doing.
 
 **But be precise about what IS05 validates.** It is the only site with within-cell replication, the
@@ -2162,8 +2216,8 @@ are a repertoire far larger than fifteen clones, or residual gate impurity beyon
 test. The FACS mCherry⁺ fraction per animal is the measurement that separates them, which returns it
 to load-bearing rather than a cross-check.
 
-**One estimator, not three in agreement.** The zero-truncated Poisson gives **660 and 1,154** for
-IS02 and IS01, with bootstrap intervals of 593–753 and 942–1,480. It is the one to quote: it has a
+**One estimator, not three in agreement.** The zero-truncated Poisson gives **660 and 1,167** for
+IS02 and IS01, with bootstrap intervals of 591–757 and 952–1,530. It is the one to quote: it has a
 referent, an interval, and a fit check that passes.
 
 The other two should not be lined up beside it as corroboration. Chapman's 648 and 948 come from a
@@ -2172,7 +2226,7 @@ their closeness to the right answer is a coincidence, not agreement. And the co-
 2,312 assumes IS01 and IS02 are **fully** shared, which the depth analysis above has just argued
 against: under partial sharing the inversion is not a clone-size estimate of anything. Quoting three
 numbers that "agree on order 10³" dressed one estimate up as a consensus. **It is one estimate, and
-order 10³ against 318 and 342 detected is what it says.**
+order 10³ against 342 and 320 detected is what it says.**
 
 # Limitations
 

@@ -1754,7 +1754,12 @@ ambient_rate <- function(clip_tbl, called, raw_counts) {
     dplyr::left_join(raw_counts, by = "tube") |>
     dplyr::mutate(rate_per_cell = in_called_cells / cells,
                   rate_per_empty = not_cells / pmax(raw_barcodes - cells, 1L),
-                  ratio = rate_per_cell / pmax(rate_per_empty, 1e-12)) |>
+                  # NA, not a guard constant. Dividing by pmax(rate, 1e-12) turned Rx_7's zero
+                  # non-cell barcodes into a printed ratio of 816,888,086, which is not a large
+                  # number - it is the absence of a denominator. A tube with no ambient barcodes has
+                  # no ratio to report, and the same goes for one with no labelled cells.
+                  ratio = ifelse(rate_per_empty > 0 & rate_per_cell > 0,
+                                 rate_per_cell / rate_per_empty, NA_real_)) |>
     dplyr::arrange(dplyr::desc(junction_barcodes))
 }
 

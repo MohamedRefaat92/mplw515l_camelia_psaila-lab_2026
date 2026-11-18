@@ -163,8 +163,8 @@ site only if its junction-adjacent base lands on that site's junction base, at t
 the sequence name. One accepted landing site out of ~400 per flank is what makes a 10 bp clip
 decisive. (bwa used to do this placement, via a `read_mini_hits()` that no longer exists: its `-T 12`
 silently enforced a 12 bp floor while `min_assign` advertised 8, so 169 reads were written and
-dropped with no error. The floor is now whatever `min_assign` says, and `min_assign` is 10 because
-that is where the decoy flanks stop returning hits.)
+dropped with no error. The floor is now whatever `assign_floor` says, and it is 6 with exact
+matching required beneath 15 bases - one policy, not two constants.)
 
 Result: cells labelled rise from 339 to **552** on the 3′ channel alone, and to **1,186** once the
 genome-mapped channel's cells are folded in as well. The wild-type tubes stayed at zero through all
@@ -261,7 +261,7 @@ it was a question about what the library contains, now answered.
 
 ## 7. Results, and the validations
 
-15 sites called — **13 defensibly**, see `pooled_only` below — 12 in the mini-reference, **1,186 distinct cells labelled**. `mouse` is the
+15 sites called — **12 defensibly** (`site_evidence.csv` has a `defensible` column; IS14/IS15 are pooled-only, IS07's flank cannot support quantification) — **1,195 distinct cells labelled**. `mouse` is the
 dominant hashtag class, which is 96–100% of each site's cells.
 
 | id | locus | gene | cells | mouse | note |
@@ -355,11 +355,14 @@ detection-corrected clone size with a bootstrap interval, and an observed-agains
 
 | site | detected | molecules/cell | detection | clone size (95% CI) |
 |---|---|---|---|---|
-| IS05 | 57 | 2.63 | **91%** | 63 (60–67) |
-| IS02 | 342 | 1.41 | 52% | 660 (593–753) |
-| IS01 | 318 | 1.17 | 28% | 1,154 (942–1,480) |
-| IS11 / IS06 / IS08 | 25 / 10 / 10 | 1.16 / 1.80 / 1.40 | 26 / 73 / 51% | 95 / 14 / 20 |
-| nine others | 451 | ≤ 1.09 | — | — |
+| IS05 | 53 | 2.75 | **92%** | 58 (56–61) |
+| IS02 | 342 | 1.41 | 52% | 660 (591–757) |
+| IS01 | 320 | 1.17 | 27% | 1,167 (952–1,530) |
+| IS11 / IS06 / IS08 | 25 / 11 / 10 | 1.16 / 1.73 / 1.40 | 26 / 70 / 51% | 95 / 16 / 20 |
+| nine others | 461 | ≤ 1.09 | — | — |
+
+(Regenerate from `detection_model.csv` rather than editing: these moved once already when the floor
+changed to 6 and the called-cell filter landed, and the prose quoting them had to be chased.)
 
 Three things not to get wrong with it. **The molecule count must come from the clip table**, not from
 summing `umis_three + umis_genomic` over the cell table — that double-counts the 83 molecules in both
