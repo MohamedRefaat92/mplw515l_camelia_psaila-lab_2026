@@ -309,8 +309,19 @@ The thresholds used for the tables in this report are listed below; the setup th
 
 
 ```{r is-defaults}
+# Not vapply(..., character(1)): assign_floor is a two-element policy rather than a scalar, and
+# flattening the defaults assumed every entry was length one. A nested entry is printed as its
+# named parts, so the floor shows as "min_len = 6, exact_below = 15" and stays one row.
+fmt_default <- function(x) {
+  if (is.list(x) && !is.null(names(x))) {
+    paste(sprintf("%s = %s", names(x), vapply(x, as.character, character(1))), collapse = ", ")
+  } else {
+    paste(as.character(x), collapse = ", ")
+  }
+}
+
 dplyr::tibble(parameter = names(IS_DEFAULTS),
-              value     = vapply(IS_DEFAULTS, as.character, character(1))) |>
+              value     = vapply(IS_DEFAULTS, fmt_default, character(1))) |>
   DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12))
 ```
 
@@ -1228,6 +1239,25 @@ false-negative discussion in the transgene-detection report.
 
 ## Where the clones sit on the UMAP
 
+The question these tables answer is whether clone labels survive QC, and whether they are
+concentrated in the part of the manifold QC removes — debris, dying cells, ambient-heavy droplets.
+A clone label is attached to a *barcode*, and the extraction never consulted the QC flags, so this
+has to be checked rather than assumed.
+
+```{r raw-embedding}
+# The pre-QC embedding. The pre-QC UMAP figure that used to sit here was dropped as a near-duplicate
+# of the post-QC one, but these two objects are not duplicates - three tables below count labelled
+# barcodes against `pass_cell`, and removing the figure took the data with it until a chunk-level
+# smoke test caught the orphan.
+raw_hsc <- cell_embedding(tar_read(mpn_raw_processed_hsc), "HSC"); gc(verbose = FALSE)
+raw_mnc <- cell_embedding(tar_read(mpn_raw_processed_mnc), "MNC"); gc(verbose = FALSE)
+embedding_raw <- dplyr::bind_rows(raw_hsc, raw_mnc)
+rm(raw_hsc, raw_mnc); gc(verbose = FALSE)
+
+labelled_raw <- assign |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::inner_join(dplyr::select(embedding_raw, -tube), by = "cell")
+```
 
 ```{r raw-vs-clean}
 labelled_raw |>
