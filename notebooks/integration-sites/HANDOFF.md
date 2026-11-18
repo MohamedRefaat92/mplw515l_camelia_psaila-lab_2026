@@ -294,7 +294,7 @@ registry.
 bound the *assignment* tier. The genome-mapped channel has its own decoy now — `genomic_decoy_rate()`,
 run as the `genomic-decoy` stage — which repeats the scan with the terminus permuted to the same base
 composition. Genome-wide across all eight tubes (job 35768797, 2 h): **15 decoy reads against 1,422
-real, 1.1%**, scattered over 9 positions where the real reads concentrate at 47. No decoy position is
+real, 1.1%**, scattered over 7 positions where the real reads concentrate at 47. No decoy position is
 dense enough to be called a site, so the rate is **1.1% at the read level and zero at the site
 level**. Rx_8 makes the point best: a wild-type tube with zero real reads and 5 decoy reads, so in
 material with no provirus the real 13-mer finds nothing and a random one finds five.

@@ -478,19 +478,23 @@ The evidence that this is safe rather than merely generous is the control: 28,01
 wild-type tubes that never saw the vector. Dropping the threshold from 25 to 10 raises labelled
 cells by about two thirds and leaves them at zero.
 
-They are no longer at exactly zero overall, and the two events are worth running down rather than
-rounding away, because the UMIs identify what each one is. With the genome-mapped channel folded in,
-**two** wild-type cells carry a junction, both at IS04 — two of 1,222 labelled assignments, 0.16%.
+They are no longer at exactly zero, and the events are worth running down rather than rounding away,
+because the UMIs identify what each one is. Four junction-bearing barcodes sit in wild-type tubes —
+two in Rx_1 and two in Rx_5 — and the called-cell filter is what separates them:
 
-- **Rx_5 is index hopping, demonstrated rather than inferred.** The read carries 121 bases of host at
-  MAPQ 255, and its UMI `AGGCGGTTGTGT` appears at the same junction base in **Rx_6** as well — as
-  does its cell barcode. One molecule from one cell, read out under two sample indices. That is the
-  signature, and it is the only one of its kind in the data.
-- **Rx_1 has no such partner.** Its 32-base clip carries UMI `AGGGGTTACCAG`, which appears in no
-  other tube, and neither does its barcode. A single read with no second-index twin is either
-  genuine carry-over of a cell or a chance match; one read cannot distinguish them.
+- **The Rx_5 pair are not cells**, and one of them is **index hopping, demonstrated rather than
+  inferred**: the read carries 121 bases of host at MAPQ 255, and its UMI `AGGCGGTTGTGT` appears at
+  the same junction base in **Rx_6**, as does its barcode. One molecule from one cell, read out under
+  two sample indices. Both Rx_5 barcodes are absent from Cell Ranger's filtered list, so the
+  called-cell filter removes them — which is the right outcome and also a check on it: the one
+  provable hopping event in the data landed in an empty droplet, not in a cell.
+- **One Rx_1 barcode is a called cell**, and it survives. Its 32-base clip carries UMI
+  `AGGGGTTACCAG`, which appears in no other tube, and neither does its barcode. A single read with no
+  second-index twin is either genuine carry-over of a cell or a chance match; one read cannot
+  distinguish them.
 
-So the demonstrable cross-tube rate is **1 in 1,222**, and the residual is a single unexplained read.
+So among called cells the cross-tube rate is **1 in 1,222**, and that one event is unexplained rather
+than demonstrated. The demonstrable hopping is in the ambient fraction, where it does no harm.
 That is what the wild-type tubes were included to supply, and it is a tighter answer than a
 percentage.
 
@@ -513,23 +517,19 @@ sites %>%
 Fifteen sites, and the two channels do not contribute equally to that list. Run each one's reads
 through the same site caller on its own:
 
-| called from | sites |
-|---|---|
-| the 3′ channel alone | 9 |
-| the genome-mapped channel alone | 13 |
-| both together | 15 |
+Running each channel's reads through the same site caller alone gives 9 sites from the 3′ channel
+and 13 from the genome-mapped one — which recovers **every** site the 3′ channel finds, the 3′-only
+column being empty, and adds four of its own. That leaves 9 + 4 = 13 against a pooled call of 15, so
+the arithmetic needs a third category rather than a sentence. `site_provenance()` records it per site:
 
-The genome-mapped channel recovers **every** site the 3′ channel finds — the 3′-only column is
-empty — and adds four of its own.
-
-That leaves 9 + 4 = 13, and the pooled call gives 15, so the arithmetic needs the third row of this
-breakdown rather than a sentence. `integration_sites.csv` now carries it per site as `called_by`:
-
-| `called_by` | sites | |
-|---|---|---|
-| both channels | 9 | IS01, IS02, IS03, IS04, IS05, IS06, IS07, IS08, IS09 |
-| genomic channel only | 4 | IS10, IS11, IS12, IS13 |
-| **pooled only** | **2** | **IS14, IS15** |
+```{r called-by}
+sites |>
+  dplyr::group_by(`called by` = called_by) |>
+  dplyr::summarise(sites = dplyr::n(),
+                   which = paste(sort(site_id), collapse = ", "), .groups = "drop") |>
+  dplyr::arrange(dplyr::desc(sites)) |>
+  knitr::kable()
+```
 
 **IS14 and IS15 clear the cell floor only on the two channels' reads summed** — neither channel
 reaches `min_cells` at either locus alone. That is legitimate evidence and it is also the weakest
@@ -1297,21 +1297,32 @@ would put a number on the floor beneath every other panel. The mCherry⁻ column
 matter: those cells failed a gate on *protein*, which is not the same as lacking the provirus, so a
 label there is informative rather than wrong.
 
-```{r umap-facet, fig.height=7, fig.width=11}
-# One panel per clone, so sites with few cells are not hidden under the larger ones. The grey layer
-# carries `panel` but not `site_id`, so ggplot repeats it across every column of the grid while
-# keeping each compartment on its own row - no cross join needed.
-ggplot(dplyr::filter(labelled, pass_cell), aes(UMAP_1, UMAP_2)) +
-  geom_point(data = dplyr::select(dplyr::filter(embedding, pass_cell),
-                                  panel, UMAP_1, UMAP_2),
-             colour = "grey90", size = 0.15, stroke = 0) +
-  geom_point(colour = "firebrick", size = 1.1) +
-  facet_grid(panel ~ site_id, switch = "y") +
-  labs(title = "Each clone on its own panel",
-       x = NULL, y = NULL) +
-  theme(axis.text = element_blank(), panel.grid = element_blank(),
-        strip.text.y.left = element_text(angle = 0))
+::: {.panel-tabset}
+
+```{r umap-facet, fig.height=7.5, fig.width=12, results="asis"}
+# One panel per clone, so sites with few cells are not hidden under the larger ones; one tab per
+# compartment, the clones wrapped into rows of square panels so each UMAP keeps its shape (a single
+# row of 15 squashed every panel to a narrow strip). The grey layer has no `site_id`, so ggplot
+# repeats it in every panel.
+clone_cols <- 5
+for (cmp in levels(factor(embedding$panel))) {
+  cat("### ", cmp, "\n\n", sep = "")
+  print(
+    ggplot(dplyr::filter(labelled, pass_cell, panel == cmp), aes(UMAP_1, UMAP_2)) +
+      geom_point(data = dplyr::select(dplyr::filter(embedding, pass_cell, panel == cmp),
+                                      UMAP_1, UMAP_2),
+                 colour = "grey90", size = 0.15, stroke = 0) +
+      geom_point(colour = "firebrick", size = 1.1) +
+      facet_wrap(~ site_id, ncol = clone_cols, drop = FALSE) +
+      labs(title = paste0("Each clone on its own panel: ", cmp), x = NULL, y = NULL) +
+      theme(axis.text = element_blank(), axis.ticks = element_blank(),
+            panel.grid = element_blank(), aspect.ratio = 1)
+  )
+  cat("\n\n")
+}
 ```
+
+:::
 
 A clone confined to one region of the embedding would suggest its cells share a state; one scattered
 across the map suggests the opposite. With these numbers, treat any apparent clustering cautiously —
@@ -1724,16 +1735,6 @@ readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FA
   DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 15, scrollX = TRUE))
 ```
 
-| site | detected | molecules/cell | detection | clone size (95% CI) |
-|---|---|---|---|---|
-| IS05 | 57 | 2.63 | **91%** | **63** (60 – 67) |
-| IS02 | 342 | 1.41 | 52% | **660** (593 – 753) |
-| IS01 | 318 | 1.17 | 28% | **1,154** (942 – 1,480) |
-| IS11 | 25 | 1.16 | 26% | 95 (52 – 121) |
-| IS06 | 10 | 1.80 | 73% | 14 (11 – 32) |
-| IS08 | 10 | 1.40 | 51% | 20 (13 – 32) |
-| IS03, IS04, IS09, IS10, IS12–IS15 | 451 | ≤ 1.09 | — | — |
-
 **Read the top row and the bottom row together.** IS05 averages 2.63 molecules a cell and the
 estimator returns 63 against 57 detected — 91% detection, tightly bounded, and the one case where
 the method can see what it is doing. The nine sites at or below 1.09 molecules a cell get `NA`: at
@@ -1892,7 +1893,7 @@ not zero:
 | decoy reads | 0 | 2 | 3 | 1 | 0 | 4 | 0 | 5 | **15** |
 | decoy positions | 0 | 1 | 1 | 1 | 0 | 2 | 0 | 2 | 9 |
 
-**1.1% of reads, and no callable site.** The 15 decoy reads scatter over 9 positions across 8 tubes —
+**1.1% of reads, and no callable site.** The 15 decoy reads scatter over 7 positions across 8 tubes —
 at most a few reads at any one of them — while the 1,422 real reads concentrate at 47 positions, 800
 of them at 16 positions in Rx_4 alone. A site needs `min_cells` distinct cells and `min_umis`
 molecules at one base, and nothing in the decoy output approaches that. So the error rate to quote is
