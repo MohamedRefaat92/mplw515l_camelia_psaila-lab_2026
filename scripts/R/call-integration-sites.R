@@ -9,6 +9,7 @@
 #                                                five_prime.fa, and the tables the report plots
 #     bwa  -> discovery.sam, five_prime.sam      against the genome
 #   genomic <out> <bam_dir> <tube>...            the host-mapped channel, one streaming pass per BAM
+#   genomic-decoy <out> <bam_dir> [chrom] [fa]   its error bound: the same scan, terminus shuffled
 #   sites   <out> <genes.gtf.gz> <genome.fa>     call the sites, write the mini-reference
 #   assign  <out> <genome.fa>                    cell assignments, TSD check, summary
 #
@@ -21,7 +22,7 @@ source("src/R/integration-sites.R")   # functions only; attaches nothing
 args  <- commandArgs(trailingOnly = TRUE)
 stage <- args[1]
 out   <- args[2]
-stopifnot(stage %in% c("extract", "genomic", "sites", "assign"), !is.na(out))
+stopifnot(stage %in% c("extract", "genomic", "genomic-decoy", "sites", "assign"), !is.na(out))
 work <- file.path(out, "work")
 dir.create(work, recursive = TRUE, showWarnings = FALSE)
 
@@ -85,7 +86,8 @@ if (stage == "extract") {
     cache <- file.path(work, paste0("genomic_", tube, ".csv"))
     if (file.exists(cache)) {
       message("    ", tube, ": cached")
-      return(readr::read_csv(cache, show_col_types = FALSE, progress = FALSE))
+      # Fixed schema, not guessed: the wild-type tubes cache zero rows. See read_genomic_cache().
+      return(read_genomic_cache(cache))
     }
     bam <- file.path(bam_dir, paste0("cellranger_", tube), "sample_alignments.bam")
     g <- read_genomic_clips(bam, tube)
@@ -109,6 +111,46 @@ if (stage == "extract") {
     print(as.data.frame(utils::head(top, 25)), row.names = FALSE)
   }
 
+} else if (stage == "genomic-decoy") {
+  # Error bound for the genome-mapped channel: the same scan with the terminus shuffled to the same
+  # base composition. Run as its own stage because it costs what the genomic stage costs, and the
+  # pipeline must not wait on a control. An optional 4th argument restricts it to one chromosome,
+  # which is how it is run when a full pass is not worth the walltime.
+  bam_dir <- args[3]
+  region  <- if (length(args) >= 4L && nzchar(args[4])) args[4] else NULL
+  tubes   <- readLines(file.path(work, "tubes.txt"))
+  cores   <- max(1L, min(length(tubes),
+                         as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "1"))), na.rm = TRUE)
+  gr <- if (is.null(region)) NULL else {
+    fai <- utils::read.delim(paste0(args[5], ".fai"), header = FALSE)
+    GenomicRanges::GRanges(region, IRanges::IRanges(1, fai$V2[fai$V1 == region]))
+  }
+  message(">>> scrambled-terminus decoy over ", length(tubes), " tubes on ", cores, " cores",
+          if (is.null(region)) "" else paste0(", restricted to ", region))
+  res <- parallel::mclapply(tubes, function(tb) {
+    bam <- file.path(bam_dir, paste0("cellranger_", tb), "sample_alignments.bam")
+    # Real counts come from the genomic stage's cache where it exists. Rescanning for them doubles
+    # the job to recompute a number already on disk.
+    cache <- file.path(work, paste0("genomic_", tb, ".csv"))
+    tryCatch(genomic_decoy_rate(bam, tb, region = gr,
+                                real_cache = if (file.exists(cache)) cache else NULL),
+             error = function(e) conditionMessage(e))
+  }, mc.cores = cores, mc.preschedule = FALSE)
+  ok <- vapply(res, is.data.frame, logical(1))
+  if (any(!ok)) message("    FAILED for ", sum(!ok), " tube(s): ",
+                        paste(tubes[!ok], collapse = ", "))
+  d <- dplyr::bind_rows(res[ok])
+  # Region-tagged, so a one-chromosome probe cannot overwrite a whole-genome measurement with a
+  # smaller one. Two runs of this stage at different scopes wrote the same filename, which is the
+  # silent-wrong-number failure this analysis keeps meeting.
+  readr::write_csv(d, file.path(out, if (is.null(region)) "genomic_decoy_rate.csv"
+                                     else sprintf("genomic_decoy_rate_%s.csv", region)))
+  if (nrow(d)) {
+    print(as.data.frame(d[, c("tube", "real_reads", "decoy_reads", "decoy_pos")]), row.names = FALSE)
+    message("=== real ", sum(d$real_reads), " reads vs decoy ", sum(d$decoy_reads),
+            if (sum(d$decoy_reads) == 0L) "  (as required)" else "  <-- RAISE min_genomic")
+  }
+
 } else if (stage == "sites") {
   gtf       <- args[3]
   genome_fa <- args[4]
@@ -125,7 +167,7 @@ if (stage == "extract") {
   # with the 3' clips, they can call a site on their own.
   gen_csv <- file.path(work, "genomic_junction_reads.csv")
   if (file.exists(gen_csv)) {
-    gen <- readr::read_csv(gen_csv, show_col_types = FALSE)
+    gen <- read_genomic_cache(gen_csv)
     if (nrow(gen)) {
       gen <- dplyr::mutate(gen, mapq = as.integer(mapq), seq = NA_character_)
       discovery <- dplyr::bind_rows(
@@ -141,6 +183,18 @@ if (stage == "extract") {
   sites      <- label_sites(dplyr::mutate(call_sites(discovery), tier = "discovery"),
                             registry = "metadata/integration_site_registry.csv")
   site_table <- summarise_sites(sites, gtf, tubes)
+
+  # Which channel called each site on its own. Carried in the table because "15 sites" is not one
+  # kind of claim: two of them clear the floor only on the two channels' reads summed.
+  prov <- site_provenance(discovery, site_table)
+  site_table <- dplyr::left_join(site_table, prov, by = "site_id")
+  message(">>> called by: ",
+          paste(sprintf("%s = %d", names(table(prov$called_by)), table(prov$called_by)),
+                collapse = ", "))
+  if (any(prov$pooled_only)) {
+    message("    POOLED ONLY (weakest evidence, exclude from repertoire counts): ",
+            paste(prov$site_id[prov$pooled_only], collapse = ", "))
+  }
 
   # TSD BEFORE the flanks are cut, so it can vouch for a site sitting at the cell floor. The flank
   # gate in write_site_flanks() needs this column; without it the gate is skipped entirely.
@@ -196,7 +250,7 @@ if (stage == "extract") {
   evidence <- mini
   gen_csv  <- file.path(work, "genomic_junction_reads.csv")
   if (file.exists(gen_csv)) {
-    gen   <- readr::read_csv(gen_csv, show_col_types = FALSE, progress = FALSE)
+    gen   <- read_genomic_cache(gen_csv)
     gmini <- genomic_site_hits(gen, site_table)
     message("=== genomic channel folded in: ", nrow(gmini), " reads, ",
             dplyr::n_distinct(paste(gmini$tube, gmini$barcode)), " cells, ",

@@ -1008,6 +1008,124 @@ update_site_counts <- function(site_table, mini, tubes) {
     dplyr::arrange(dplyr::desc(cells), chrom, pos)
 }
 
+#' Scrambled-terminus decoy for the GENOME-MAPPED channel.
+#'
+#' The 100 decoy flanks bound the assignment tier. Nothing bounded this one, and it needed bounding
+#' more than the other, because four of the fifteen sites rest on this channel alone and IS10 - 99
+#' cells, the fifth largest clone - is invisible without it. The channel's claim is that a read the
+#' aligner placed at MAPQ 255 whose soft-clipped end matches the last `min_genomic` bases of the
+#' provirus terminus, within the absorption window, is a junction read. This measures how often that
+#' is true of a terminus that cannot be there.
+#'
+#' The decoy is a PERMUTATION OF THE TESTED K-MER, not of the whole terminus. Those differ and the
+#' difference flatters the channel: the real 13-mer AAAATCTCTAGCA is A-rich (6 A), a permutation of
+#' the full 18-mer leaves the tested 13 with 3, and A-rich k-mers are commoner in a mammalian genome,
+#' so a composition-mismatched decoy understates the false-positive rate. Composition is matched
+#' here and the shuffle is reseeded until it is neither the real k-mer nor a substring of the real
+#' terminus.
+#'
+#' `region` exists because a whole-genome pass is ~105 minutes a tube. One chromosome is a real
+#' measurement on a real slice; the argument is there so the bound can be tightened without
+#' rewriting anything.
+#'
+#' Returns one row a tube: decoy hits, and the real hits on the same slice for the contrast. A
+#' non-zero decoy count is not a rate to report but a threshold to raise.
+#' `real_cache` skips the real pass and takes its counts from the genomic stage's cache instead.
+#' Rescanning for them doubles the cost of the most expensive thing the pipeline does, to recompute
+#' a number already on disk. Supply it for a whole-genome run; leave it NULL only when the cache does
+#' not cover the slice being tested.
+genomic_decoy_rate <- function(bam, tube, region = NULL, opt = IS_DEFAULTS,
+                               seed = 20261118L, real_cache = NULL) {
+  k      <- opt$min_genomic
+  real_k <- substr(opt$terminus, nchar(opt$terminus) - k + 1L, nchar(opt$terminus))
+  set.seed(seed)
+  repeat {
+    dec_k <- paste(sample(strsplit(real_k, "")[[1]]), collapse = "")
+    if (dec_k != real_k && !grepl(dec_k, opt$terminus, fixed = TRUE)) break
+  }
+  opt_d <- opt
+  # Only the last k bases are ever tested, so the prefix is padding and is deliberately not DNA.
+  opt_d$terminus <- paste0(strrep("X", max(0L, nchar(opt$terminus) - k)), dec_k)
+
+  real <- if (is.null(real_cache)) {
+    read_genomic_clips(bam, tube, region = region, opt = opt)
+  } else {
+    r <- read_genomic_cache(real_cache)
+    if (!is.null(region)) r <- r[r$chrom %in% as.character(GenomeInfoDb::seqnames(region)), ]
+    r
+  }
+  decoy <- read_genomic_clips(bam, tube, region = region, opt = opt_d)
+  dplyr::tibble(
+    tube = tube, region = if (is.null(region)) "whole genome" else as.character(region),
+    real_kmer = real_k, decoy_kmer = dec_k,
+    real_reads = nrow(real), real_pos = dplyr::n_distinct(real$pos),
+    decoy_reads = nrow(decoy), decoy_pos = dplyr::n_distinct(decoy$pos))
+}
+
+#' Read a cached genomic-channel table with its schema fixed, never guessed.
+#'
+#' The genomic stage caches one CSV a tube so the expensive scan can be restarted without redoing
+#' what is already done. Read back with guessed column types that cache is a trap: the two wild-type
+#' tubes legitimately return ZERO rows, readr types every column in a header-only file as character,
+#' and binding those to a tube with real rows fails with "Can't combine `pos` <character> and `pos`
+#' <double>". The failure lands at the START of the rerun, after the first run has already been paid
+#' for, and it is caused by the two tubes that are working correctly.
+#'
+#' So the schema is declared. It matches empty_genomic_table(), and a cache that does not fit it is
+#' an error worth seeing rather than something to coerce around.
+read_genomic_cache <- function(path) {
+  readr::read_csv(
+    path, progress = FALSE, show_col_types = FALSE,
+    col_types = readr::cols(
+      chrom = readr::col_character(), pos = readr::col_integer(),
+      strand = readr::col_character(), mapq = readr::col_integer(),
+      tube = readr::col_character(), barcode = readr::col_character(),
+      umi = readr::col_character(), clip_len = readr::col_integer(),
+      host_len = readr::col_integer(), absorbed = readr::col_integer()))
+}
+
+#' Which channel calls each site on its own, and which sites need both.
+#'
+#' The headline counts - 9 sites from the 3' channel, 13 from the genome-mapped one, 15 pooled - look
+#' like they do not add up, and the reason they do is worth carrying in the table rather than in a
+#' sentence. The 3' channel's sites are a subset of the genomic channel's, so pooling should give 13.
+#' It gives 15 because two sites clear the cell floor only when the two channels' reads are SUMMED:
+#' neither channel reaches `min_cells` there alone.
+#'
+#' That is legitimate evidence and it is also the weakest evidence in the set, so those two sites are
+#' flagged `pooled_only`. They should be excluded from any repertoire count, diversity statistic or
+#' denominator until a second line of evidence arrives - a TSD, a 5' read, or the spliced channel.
+#' Reporting "15 sites" without that distinction overstates what was found.
+#'
+#' Computed by rerunning the same caller on each channel's reads alone, so it cannot drift from the
+#' pooled call: same function, same thresholds, one subset at a time.
+site_provenance <- function(discovery_hits, sites, opt = IS_DEFAULTS) {
+  if (nrow(sites) == 0L) return(dplyr::tibble())
+  loci <- function(h) {
+    if (!nrow(h)) return(dplyr::tibble(chrom = character(), pos = integer()))
+    call_sites(h, opt) |>
+      dplyr::group_by(site_id) |>
+      dplyr::summarise(chrom = dplyr::first(chrom), pos = min(pos), .groups = "drop") |>
+      dplyr::select(chrom, pos)
+  }
+  near <- function(tbl, chrom, pos) {
+    if (!nrow(tbl)) return(FALSE)
+    any(tbl$chrom == chrom & abs(tbl$pos - pos) <= opt$cluster_window)
+  }
+  ch <- if ("channel" %in% names(discovery_hits)) discovery_hits$channel else "three_prime"
+  three <- loci(discovery_hits[ch == "three_prime", , drop = FALSE])
+  gen   <- loci(discovery_hits[ch == "genomic", , drop = FALSE])
+
+  out <- vapply(seq_len(nrow(sites)), function(i) {
+    a <- near(three, sites$chrom[i], sites$pos[i])
+    b <- near(gen,   sites$chrom[i], sites$pos[i])
+    if (a && b) "both channels" else if (a) "3' channel only" else if (b) "genomic channel only"
+    else "pooled only"
+  }, character(1))
+  dplyr::tibble(site_id = sites$site_id, called_by = out,
+                pooled_only = out == "pooled only")
+}
+
 #' Attach the genome-mapped channel's reads to the called sites, as cell evidence.
 #'
 #' The genomic channel already earned its place in DISCOVERY - it calls sites on its own. Until this
@@ -1053,7 +1171,7 @@ genomic_site_hits <- function(gen, site_table, opt = IS_DEFAULTS) {
     dplyr::filter(!is.na(site_id), !is.na(barcode), !is.na(umi))
 }
 
-#' Per-site capture-recapture between the two channels - and the test that invalidates it.
+#' Per-site channel overlap: the detection rate it does support, and the clone size it does not.
 #'
 #' The tempting argument: the two channels read the same junctions through different reads, so a cell
 #' carrying a clone can be captured by either, the overlap between them estimates the capture
@@ -1084,10 +1202,17 @@ genomic_site_hits <- function(gen, site_table, opt = IS_DEFAULTS) {
 #' N_hat down, while the one-molecule mechanism biases it up. Two demonstrable biases in opposite
 #' directions, neither pinned down well enough to net out.
 #'
-#' Hence: chapman is written to the table because the argument for it should be inspectable, not
-#' because it is a clone size. Report detected, as a lower bound. The co-occurrence analysis in the
-#' report reaches the same place by a different route and lands within a factor of three or four of
-#' these numbers, which is worth knowing and is not the same thing as either being right.
+#' The underlying objection is a partition, not a bias: Lincoln-Petersen needs two SAMPLES of one
+#' population, and these two channels are a partition of one sample. Every junction molecule is in
+#' exactly one of them, assigned by where its fragment fell. There is no second draw to recapture
+#' anything, so n1*n2/m is not a mis-estimate of the clone - it has no referent in this design at
+#' all, and no amount of bias correction gives it one. The molecule model above is what that
+#' partition predicts quantitatively; the partition is why the quantity is meaningless.
+#'
+#' Hence: chapman is written to the table as an audit trail, because an argument this tempting should
+#' be inspectable rather than deleted, and `lambda`/`detection`/`n_ztp` are what the section should
+#' quote instead. Report detected as the floor and n_ztp where the fit is conditioned well enough to
+#' mean anything.
 #'
 #' n1, n2 and m are counted in MOLECULES for the reason above. 73 of 1434 molecules do appear in both
 #' channels, so a molecule's channel is not strictly fixed - fragmentation happens after
@@ -1104,8 +1229,26 @@ channel_capture_recapture <- function(cell_table) {
       n1 <- sum(d$umis_three > 0L)
       n2 <- sum(d$umis_genomic > 0L)
       m  <- sum(d$umis_three > 0L & d$umis_genomic > 0L)
+      # Zero-truncated Poisson on the per-cell molecule counts. This is the estimate the section
+      # actually needs, and it comes from a different place than the overlap: if a clone's cells each
+      # carry Poisson(lambda) DETECTED junction molecules, the cells with zero are exactly the ones
+      # missing from the table, and the truncated mean k/(1 - exp(-k)) identifies lambda without
+      # them. detection = 1 - exp(-lambda) is then a per-cell detection rate and detected/detection
+      # a clone size.
+      #
+      # It is sharp only where the mean is comfortably above 1. At a mean of 1.00 the fit is
+      # degenerate - lambda -> 0, detection -> 0, clone size -> infinity - so it returns NA there
+      # rather than a number, and at 1.04 (IS03) it is formally defined and still worthless. IS05 is
+      # the one well-conditioned case in this data at 2.65 molecules a cell, and it returns 63
+      # against 57 detected, which is the kind of answer the estimator gives when it can see.
+      lam <- if (length(k) >= 5L && mean(k) > 1.10) {
+        tryCatch(stats::uniroot(function(l) l / (1 - exp(-l)) - mean(k), c(1e-6, 50))$root,
+                 error = function(e) NA_real_)
+      } else NA_real_
       dplyr::tibble(
         detected = nrow(d), umis_per_cell = mean(k), frac_one_umi = mean(k == 1L),
+        lambda = lam, detection = 1 - exp(-lam),
+        n_ztp = round(nrow(d) / (1 - exp(-lam))),
         n_three = n1, n_genomic = n2, m_both = m,
         lincoln_petersen = if (m > 0L) n1 * n2 / m else NA_real_,
         chapman = (n1 + 1) * (n2 + 1) / (m + 1) - 1,

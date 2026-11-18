@@ -89,6 +89,16 @@ echo "=== 3/5 the genome-mapped channel ==="
 # shellcheck disable=SC2086  # tubes is a deliberate word-split list
 $rscript scripts/R/call-integration-sites.R genomic "$out" "$PROJ/data" $tubes
 
+# The genome-mapped channel's error bound. Commented out because it repeats the most expensive
+# stage in the pipeline -- the decoy pass costs what the real pass costs, so enabling it roughly
+# doubles the job -- and because a control must never be on the critical path of a run that someone
+# is waiting for. Uncomment, or run the stage on its own, when the bound needs tightening:
+#
+#   sbatch --time=12:00:00 --wrap "scripts/R/call-integration-sites.R genomic-decoy $out $PROJ/data"
+#
+# Measured so far: chr19 in Rx_4, 27.6M alignments containing a real 29-read site, zero decoy hits.
+# $rscript scripts/R/call-integration-sites.R genomic-decoy "$out" "$PROJ/data" chr19 "$CR_REF/fasta/genome.fa"
+
 echo "=== 4/5 call the sites, and build the flanks plus the decoys ==="
 $rscript scripts/R/call-integration-sites.R sites "$out" "$gtf" "$CR_REF/fasta/genome.fa"
 
