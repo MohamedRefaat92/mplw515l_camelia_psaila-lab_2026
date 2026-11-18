@@ -59,6 +59,13 @@ if (stage == "extract") {
                             file.path(work, "all_clips.fa"))
   message("=== all junction clips, no floor: ", n_all)
 
+  # Cell Ranger's called barcodes, captured with the run so every cell count downstream is
+  # reproducible from the outputs alone. See read_called_barcodes() for why this is needed.
+  called <- read_called_barcodes(bam_dir, tubes)
+  write_csv_checked(called, file.path(work, "called_barcodes.csv.gz"))
+  write_csv_checked(count_barcodes(bam_dir, tubes), file.path(work, "barcode_counts.csv"))
+  message("=== called barcodes: ", nrow(called), " over ", dplyr::n_distinct(called$tube), " tubes")
+
   # Second channel: the provirus's 5' junction, read off the same BAMs.
   five <- dplyr::bind_rows(lapply(tubes, function(tube) {
     bam <- file.path(bam_dir, paste0("cellranger_", tube), "sample_alignments.bam")
@@ -279,12 +286,33 @@ if (stage == "extract") {
     evidence <- dplyr::bind_rows(mini, gmini)
   }
 
+  # Restrict CELL evidence to Cell Ranger's called cells. The BAM carries corrected CB tags for
+  # barcodes that were never called, and they were arriving in the cell table as cells - the ambient
+  # droplets, 2.8% of it. The raw clip and genomic tables keep them, because the ambient measurement
+  # is computed from exactly those rows.
+  called_f <- file.path(work, "called_barcodes.csv.gz")
+  if (file.exists(called_f)) {
+    called <- readr::read_csv(called_f, show_col_types = FALSE, progress = FALSE)
+    before <- dplyr::n_distinct(paste(evidence$tube, evidence$barcode))
+    evidence <- dplyr::semi_join(evidence, called, by = c("tube", "barcode"))
+    after <- dplyr::n_distinct(paste(evidence$tube, evidence$barcode))
+    message("=== called-cell filter: ", before - after, " non-cell barcodes removed (",
+            after, " cells remain)")
+  } else {
+    warning("no called_barcodes.csv.gz; cell counts include non-cell barcodes", call. = FALSE)
+  }
+
   cell_table <- summarise_cells(evidence)
   write_csv_checked(cell_table, file.path(out, "cell_site_assignments.csv"))
 
   # ---- the clip table: one row per molecule, no floor, every site's mismatch count ----------
   # Built from the same matcher assign_clips_exact() filters, so the two cannot disagree. The gate
   # below is the whole point of writing it this way.
+  # Needed by unassigned_molecules() to separate "placed uniquely at a sub-threshold locus" from
+  # "could not be placed at all", which is the difference between a missed site and a blind spot.
+  discovery_for_unassigned <- read_bwa_hits(file.path(work, "discovery.sam"),
+                                            channel = "three_prime")
+
   all_fa <- file.path(work, "all_clips.fa")
   if (file.exists(all_fa) && file.size(all_fa) > 0L) {
     raw <- clip_site_matches(all_fa, file.path(work, "site_flanks.fa"), min_len = 1L)
@@ -305,7 +333,8 @@ if (stage == "extract") {
     # THE EQUALITY GATE. Filtered at the current floor and tolerance, the clip table must reproduce
     # the pipeline's own output exactly. If it does not, the table is wrong and nothing built on it
     # is interpretable - so this stops the run rather than warning.
-    gate <- clip_table_gate(raw, site_table, cell_table, gen_site_hits = gmini)
+    gate <- clip_table_gate(raw, site_table, cell_table, gen_site_hits = gmini,
+                            called = if (exists("called")) called else NULL)
     print(as.data.frame(gate), row.names = FALSE)
     if (!all(gate$agrees)) {
       stop("clip table does not reproduce the pipeline output; see the gate table above")
@@ -316,6 +345,22 @@ if (stage == "extract") {
     # which is the only place they are both de-duplicated across channels and free of the floor.
     det <- detection_model(cell_table, clip_tbl)
     write_csv_checked(det, file.path(out, "detection_model.csv"))
+
+    # Every number the report quotes about floors, ambient and completeness is computed here, not
+    # typed into the prose. A figure in a rendered report that cannot be regenerated from the code
+    # and the data is a figure nobody can check.
+    write_csv_checked(clip_floor_curve(clip_tbl), file.path(out, "clip_floor_curve.csv"))
+    write_csv_checked(unassigned_molecules(clip_tbl, discovery_for_unassigned, cell_table),
+                      file.path(out, "unassigned_molecules.csv"))
+    counts_f <- file.path(work, "barcode_counts.csv")
+    if (file.exists(called_f) && file.exists(counts_f)) {
+      write_csv_checked(
+        ambient_rate(clip_tbl, called, readr::read_csv(counts_f, show_col_types = FALSE)),
+        file.path(out, "ambient_rate.csv"))
+    }
+    mch <- if (file.exists(called_f)) sum(called$tube %in% c("Rx_4", "Rx_6")) else NA_integer_
+    write_csv_checked(repertoire_completeness(det, mch),
+                      file.path(out, "repertoire_completeness.csv"))
     if (nrow(det)) {
       message("=== detection model (NA where the truncated mean is too close to 1 to fit)")
       print(as.data.frame(det |> dplyr::transmute(

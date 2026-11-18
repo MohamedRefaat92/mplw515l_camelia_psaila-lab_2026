@@ -392,6 +392,32 @@ verbatim when you do (priors from clone sizes and clone sizes from posteriors is
 point pulls ambiguous mass onto the largest clone — the inflation already visible in all seven
 cross-mouse landings sitting on IS01 and IS02).
 
+**Three changes on 2026-11-18, in response to "every number in the report must be reproducible".**
+
+1. **The floor is 6, not 10, and it comes with `exact_below = 15`.** These are one decision, not two:
+   under the `L %/% 10` mismatch budget a 6-base clip is allowed one mismatch, and 21 of the 35
+   molecules at 6 bp then hit a decoy flank; under exact matching, none do. The per-base decoy curve
+   is clean from 6 bp up and dirty below (1 of 9 molecules at 5 bp, 10 of 17 at 4 bp). The change
+   gains 57 three-prime assignments at 6–9 bp and **loses 5** at 10–12 bp that had rested on a
+   mismatch — the losses are the point, not a regret. `assign_keep()` holds the rule in one place so
+   the equality gate cannot pass against a stale version of it.
+2. **Cell evidence is restricted to Cell Ranger's called barcodes.** 33 of what the cell table called
+   cells were not cells — the BAM carries corrected `CB` tags for droplets Cell Ranger did not call,
+   and this pipeline read them without checking. They are the ambient population. The filter is
+   applied where cells are counted and **deliberately not** to the clip and genomic tables, because
+   `ambient_rate()` is computed from exactly the rows it removes. 34 removed on the current run.
+3. **Five measurements that were prose are now outputs.** The floor curve, the completeness figures,
+   the unassigned-molecule decomposition and the ambient rate were computed in scratch scripts and
+   typed into the notebook; they would have gone stale silently the first time anything upstream
+   moved, while twelve other chunks recomputed around them. They are now
+   `clip_floor_curve.csv`, `repertoire_completeness.csv`, `unassigned_molecules.csv` and
+   `ambient_rate.csv`, read by render chunks. The mono-replicate control needs the hashtag calls, so
+   it is a notebook chunk rather than a pipeline output — and it had to be **moved** in the document,
+   because it was written into the floor section where `site_replicate` and `embedding` do not yet
+   exist and would have failed at render.
+
+Current counts: **15 sites, 1,222 assignments over 1,195 cells**, gate passing.
+
 Three checks the pipeline never used as input, so they are genuinely independent:
 
 1. **Integration-site preference — underpowered, do not cite as a validation.** 6 of 8 usable sites

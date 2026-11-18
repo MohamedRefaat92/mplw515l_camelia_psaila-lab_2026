@@ -52,13 +52,28 @@ IS_DEFAULTS <- list(
   # one exact offset in it, so a far shorter clip is decisive: 10 bp against the mini-reference is a
   # stricter test than 25 bp placed genome-wide, not a looser one.
   #
-  # Set to 10 by the decoy measurement, not by argument. Across 100 decoy flanks carried through the
-  # identical positional test, hits are zero in every clip-length band at 10 bp and above, and
-  # non-zero below it: the <=9 band returns 2 decoy hits, an epsilon of 0.004 and 0.16 expected
-  # spurious assignments. 8 was the number the earlier reasoning reached from the wild-type tubes
-  # being empty, which bound cross-tube hopping rather than within-tube chance matching - the wrong
-  # instrument for this question. Raise or lower this only against a fresh decoy run.
-  min_assign     = 10L,
+  # Set to 6 by the decoy measurement, one base at a time, and only in company with exact_below.
+  # The clip table carries every clip against every flank at every mismatch count with no floor, so
+  # the 100 decoy flanks answer this directly: a decoy has no junction, so a decoy match at a given
+  # length IS the chance rate. Under exact matching they are clean from 6 bp up - 28 molecules at
+  # 6 bp, all matching exactly one real site, none matching any of the 100 decoys - and dirty below:
+  # 1 of 11 molecules hits a decoy at 5 bp, 10 of 17 at 4 bp, and at 1-2 bp a clip matches most of
+  # the decoy set. Worth 73 assignments over 47 cells that had none, 4% on 1186, with no wild-type
+  # tube assignment added.
+  #
+  # The history, because this number has been wrong twice in opposite directions. 8 came from the
+  # wild-type tubes being empty, which bounds cross-tube hopping rather than within-tube chance
+  # matching - the wrong instrument. 10 came from decoy hits in coarse bands under the mismatch
+  # budget, which is the right instrument read at the wrong resolution: in bands, and with one
+  # mismatch allowed, 6-9 bp looks dirty. Raise or lower this only against a fresh per-base decoy
+  # curve, and never without deciding exact_below in the same breath.
+  min_assign     = 6L,
+  # Below this length a clip must match EXACTLY. The mismatch budget below is L %/% 10, which is one
+  # mismatch for anything under 20 bases - and one mismatch allowed on a 6-base clip lets it match
+  # almost every flank, which is why decoy hits persisted to 8 bp under the budget and vanish at 6 bp
+  # under exact matching. The floor and this constant are one decision, not two: min_assign = 6 is
+  # only defensible with exact matching beneath it.
+  exact_below    = 15L,
   flank          = 200L,    # bases either side of a called site in the mini-reference
   # A flank containing a long homopolymer attracts clips that belong nowhere. JH584304.1:35,417 has a
   # 23-base run against 5-6 for every genuine site, and the mini-reference inflated it 3 -> 14 cells,
@@ -791,6 +806,17 @@ empty_match_table <- function() {
                 junction = integer())
 }
 
+#' The rule that turns a match into an assignment. Defined once so nothing can test a different one.
+#'
+#' Two thresholds, and they are a single decision: a clip must reach `min_assign`, and beneath
+#' `exact_below` it must match exactly rather than within the L %/% 10 budget. Keeping them in one
+#' predicate is not tidiness - the equality gate exists to prove the clip table and the pipeline
+#' agree, and it can only do that if both ask the same question. When this was two copies of a
+#' filter, changing the floor in one place would have left the gate passing against the old rule.
+assign_keep <- function(clip_len, nm, budget, opt = IS_DEFAULTS) {
+  clip_len >= opt$min_assign & nm <= ifelse(clip_len < opt$exact_below, 0L, budget)
+}
+
 #' Assign clips to sites: the floor-and-tolerance VIEW over clip_site_matches().
 #'
 #' This used to be the matcher. It is now a filter over one, which is the point: the clip table and
@@ -802,7 +828,7 @@ assign_clips_exact <- function(clip_fa, flank_fa, opt = IS_DEFAULTS) {
   m <- clip_site_matches(clip_fa, flank_fa, opt, min_len = opt$min_assign)
   if (nrow(m) == 0L) return(empty_hit_table())
   m |>
-    dplyr::filter(nm <= budget) |>
+    dplyr::filter(assign_keep(clip_len, nm, budget, opt)) |>
     dplyr::select(site_id, pos, strand, mapq, tube, barcode, umi, clip_len, flank_pos, span,
                   junction)
 }
@@ -1289,6 +1315,10 @@ molecule_clip_table <- function(raw, gen_site_hits = NULL, sites = NULL, opt = I
         best_nm   = min(nm),
         n_match   = dplyr::n_distinct(site_id[nm <= budget & !is_decoy(site_id)]),
         n_decoy_match = dplyr::n_distinct(site_id[nm <= budget & is_decoy(site_id)]),
+        # Exact-match counts as well as budgeted ones. The floor curve is read off these, and
+        # recording both is what lets the curve be recomputed rather than quoted.
+        n_match_exact = dplyr::n_distinct(site_id[nm == 0L & !is_decoy(site_id)]),
+        n_decoy_exact = dplyr::n_distinct(site_id[nm == 0L & is_decoy(site_id)]),
         match_sites = paste(sort(unique(site_id[nm <= budget & !is_decoy(site_id)])),
                             collapse = ";"),
         .groups = "drop")
@@ -1332,13 +1362,19 @@ molecule_clip_table <- function(raw, gen_site_hits = NULL, sites = NULL, opt = I
 #' It is deliberately an equality and not a tolerance. A clip table that is 1% off is not 99% right,
 #' it is wrong in a way nobody will track down later.
 clip_table_gate <- function(matches, site_table, cell_table, gen_site_hits = NULL,
-                            opt = IS_DEFAULTS) {
+                            called = NULL, opt = IS_DEFAULTS) {
   view <- matches |>
-    dplyr::filter(clip_len >= opt$min_assign, nm <= budget) |>
+    dplyr::filter(assign_keep(clip_len, nm, budget, opt)) |>
     dplyr::semi_join(dplyr::select(site_table, site_id), by = "site_id") |>
     dplyr::select(site_id, tube, barcode)
   if (!is.null(gen_site_hits) && nrow(gen_site_hits)) {
     view <- dplyr::bind_rows(view, dplyr::select(gen_site_hits, site_id, tube, barcode))
+  }
+  # The cell table is restricted to called cells, so the view must be too, or the gate compares a
+  # filtered count against an unfiltered one and fails for a reason that has nothing to do with the
+  # matcher.
+  if (!is.null(called) && nrow(called)) {
+    view <- dplyr::semi_join(view, called, by = c("tube", "barcode"))
   }
 
   dplyr::tibble(
@@ -1350,6 +1386,176 @@ clip_table_gate <- function(matches, site_table, cell_table, gen_site_hits = NUL
                    dplyr::n_distinct(paste(view$tube, view$barcode)))
   ) |>
     dplyr::mutate(agrees = pipeline == clip_table)
+}
+
+#' Repertoire completeness: what share of the transduced population the called sites account for.
+#'
+#' The denominator this needed turned out to be in hand all along - the mCherry-positive cells
+#' SEQUENCED, not the FACS record. Two numbers come out, and they should always be reported together
+#' because they bracket the answer from opposite sides.
+#'
+#' `floor_share` is labelled cells over mCherry+ cells. It assumes nothing: even at perfect detection
+#' the called sites cannot account for less than this. `corrected_share` divides each site's detected
+#' count by its own per-cell detection rate first, and so inherits lambda's uncertainty - sites
+#' without an estimable lambda are corrected by the median of those that have one, which is the
+#' weakest step here and is why the floor is reported beside it.
+#'
+#' What it cannot see, stated so nobody has to rediscover it: a clone whose proviruses never yielded
+#' a captured junction molecule contributes nothing to the numerator and is still in the denominator.
+#' That is the point - it is the only measure here that counts those clones at all.
+repertoire_completeness <- function(detection_tbl, mcherry_cells) {
+  if (nrow(detection_tbl) == 0L) return(dplyr::tibble())
+  med <- stats::median(detection_tbl$detection, na.rm = TRUE)
+  d <- dplyr::mutate(detection_tbl,
+                     detection_used = ifelse(is.na(detection), med, detection),
+                     imputed = is.na(detection),
+                     size_used = cells / detection_used)
+  dplyr::tibble(
+    mcherry_cells_sequenced = mcherry_cells,
+    sites = nrow(d),
+    detected_cells = sum(d$cells),
+    floor_share = sum(d$cells) / mcherry_cells,
+    median_detection_used = med,
+    sites_with_imputed_detection = sum(d$imputed),
+    corrected_cells = round(sum(d$size_used)),
+    corrected_share = sum(d$size_used) / mcherry_cells,
+    unaccounted_share = 1 - sum(d$size_used) / mcherry_cells)
+}
+
+#' The floor curve: what a clip of each length matches, real sites and decoy flanks alike.
+#'
+#' The measurement that sets `min_assign`, computed rather than quoted. For every clip length it
+#' reports how many molecules matched exactly one called site, how many matched more than one, and
+#' how many matched any of the 100 decoy flanks - and a decoy has no junction, so a decoy match at a
+#' given length IS the chance rate at that length. Decoys can be cut at will, so this has a sample
+#' size the mono-replicate control cannot reach.
+#'
+#' Reported under both rules, because the floor and the mismatch tolerance are one decision: `_exact`
+#' columns require nm == 0, the others allow the L %/% 10 budget. Under the budget a 6-base clip is
+#' allowed a mismatch and decoy hits persist to 8 bp; under exact matching they stop at 6.
+clip_floor_curve <- function(clip_tbl, opt = IS_DEFAULTS) {
+  if (nrow(clip_tbl) == 0L) return(dplyr::tibble())
+  clip_tbl |>
+    dplyr::filter(channel == "three_prime") |>
+    dplyr::group_by(clip_len) |>
+    dplyr::summarise(
+      molecules       = dplyr::n(),
+      unique_budget   = sum(n_match == 1L),
+      ambiguous_budget = sum(n_match > 1L),
+      decoy_budget    = sum(n_decoy_match > 0L),
+      unique_exact    = sum(n_match_exact == 1L),
+      ambiguous_exact = sum(n_match_exact > 1L),
+      decoy_exact     = sum(n_decoy_exact > 0L),
+      decoy_flanks_exact = mean(n_decoy_exact),
+      .groups = "drop") |>
+    dplyr::mutate(
+      at_or_above_floor = clip_len >= opt$min_assign,
+      exact_required    = clip_len < opt$exact_below) |>
+    dplyr::arrange(clip_len)
+}
+
+#' Where the junction molecules that match no called site actually go.
+#'
+#' The honest answer to "if most of the transduced population belongs to no called site, why are
+#' there no junction reads from it". There are, and this says what becomes of them: too short to
+#' place, long enough but matching nothing, and of those, how many bwa could not place uniquely
+#' versus how many sit at a real position that failed the cell floor. The second group is the
+#' repertoire genuinely missed; the first is the repetitive-flank blind spot.
+#'
+#' `discovery` is read_bwa_hits() output, used to separate the two.
+unassigned_molecules <- function(clip_tbl, discovery, cell_table, opt = IS_DEFAULTS) {
+  if (nrow(clip_tbl) == 0L) return(dplyr::tibble())
+  assigned <- unique(paste(cell_table$tube, cell_table$barcode))
+  un <- clip_tbl |> dplyr::filter(n_match == 0L)
+  placed <- if (nrow(discovery)) {
+    dplyr::distinct(discovery, tube, barcode, umi) |> dplyr::mutate(placed_uniquely = TRUE)
+  } else {
+    dplyr::tibble(tube = character(), barcode = character(), umi = character(),
+                  placed_uniquely = logical())
+  }
+  un |>
+    dplyr::left_join(placed, by = c("tube", "barcode", "umi")) |>
+    dplyr::mutate(
+      placed_uniquely = tidyr::replace_na(placed_uniquely, FALSE),
+      class = dplyr::case_when(
+        channel == "genomic"            ~ "genome-mapped, no called site within the window",
+        clip_len < opt$min_assign       ~ "below the assignment floor",
+        clip_len < opt$min_discovery    ~ "above the floor, below the discovery length",
+        placed_uniquely                 ~ "long and placed uniquely: a locus below the cell floor",
+        TRUE                            ~ "long but unplaceable: MAPQ < 30 or unmapped")) |>
+    dplyr::group_by(class) |>
+    dplyr::summarise(molecules = dplyr::n(),
+                     cells = dplyr::n_distinct(paste(tube, barcode)),
+                     cells_with_no_assignment =
+                       dplyr::n_distinct(paste(tube, barcode)[!paste(tube, barcode) %in% assigned]),
+                     .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(molecules))
+}
+
+#' Ambient: junction-bearing barcodes that Cell Ranger did not call as cells.
+#'
+#' Per-cell against per-empty-droplet, which is the comparison that makes the number mean something.
+#' It needs the barcodes the called-cell filter removes, which is why that filter is applied to the
+#' cell table and not to the clip and genomic tables.
+ambient_rate <- function(clip_tbl, called, raw_counts) {
+  if (nrow(clip_tbl) == 0L) return(dplyr::tibble())
+  clip_tbl |>
+    dplyr::distinct(tube, barcode) |>
+    dplyr::left_join(dplyr::mutate(called, is_cell = TRUE), by = c("tube", "barcode")) |>
+    dplyr::mutate(is_cell = tidyr::replace_na(is_cell, FALSE)) |>
+    dplyr::group_by(tube) |>
+    dplyr::summarise(junction_barcodes = dplyr::n(),
+                     in_called_cells = sum(is_cell),
+                     not_cells = sum(!is_cell),
+                     ambient_share = sum(!is_cell) / dplyr::n(), .groups = "drop") |>
+    dplyr::left_join(raw_counts, by = "tube") |>
+    dplyr::mutate(rate_per_cell = in_called_cells / cells,
+                  rate_per_empty = not_cells / pmax(raw_barcodes - cells, 1L),
+                  ratio = rate_per_cell / pmax(rate_per_empty, 1e-12)) |>
+    dplyr::arrange(dplyr::desc(junction_barcodes))
+}
+
+#' Cell Ranger's called barcodes, per tube, read from the filtered matrix.
+#'
+#' The BAM carries reads from barcodes Cell Ranger error-corrected to a CB but did NOT call as cells,
+#' and this pipeline takes CB tags straight from the BAM. So 33 of what the cell table called cells
+#' were not cells: 18 in Rx_4, 12 in Rx_6, one each in Rx_2, Rx_3 and Rx_5, none of them in any
+#' filtered barcode list and therefore in none of the Seurat objects either. 2.8% of 1186.
+#'
+#' They are not noise to be discarded quietly - they are the ambient population, the same droplets
+#' that give the 2.6% ambient fraction in Rx_4. So the list is read here and the FILTER is applied
+#' where cells are counted, leaving the raw clip and genomic tables untouched: the ambient
+#' measurement needs the non-cells, and the clone sizes must not include them.
+#'
+#' Written to work/called_barcodes.csv.gz by the extract stage so every count downstream is
+#' reproducible from the run's own outputs, without reaching back into data/.
+read_called_barcodes <- function(bam_dir, tubes) {
+  dplyr::bind_rows(lapply(tubes, function(tube) {
+    f <- file.path(bam_dir, paste0("cellranger_", tube),
+                   "sample_filtered_feature_bc_matrix", "barcodes.tsv.gz")
+    if (!file.exists(f)) {
+      warning("no filtered barcode list for ", tube, "; its cells cannot be checked", call. = FALSE)
+      return(dplyr::tibble(tube = character(), barcode = character()))
+    }
+    dplyr::tibble(tube = tube, barcode = readLines(gzfile(f)))
+  }))
+}
+
+#' Called cells and total droplets per tube, for the ambient denominator.
+#'
+#' The ambient rate is only interpretable per droplet: a junction in one of 2.5 million empty
+#' droplets and a junction in one of 20,000 cells are different events. The raw barcode count is the
+#' denominator for the first, so it is captured with the run rather than recomputed from data/ later.
+count_barcodes <- function(bam_dir, tubes) {
+  dplyr::bind_rows(lapply(tubes, function(tube) {
+    base <- file.path(bam_dir, paste0("cellranger_", tube))
+    f_called <- file.path(base, "sample_filtered_feature_bc_matrix", "barcodes.tsv.gz")
+    f_raw    <- file.path(base, "sample_raw_feature_bc_matrix", "barcodes.tsv.gz")
+    dplyr::tibble(
+      tube = tube,
+      cells = if (file.exists(f_called)) length(readLines(gzfile(f_called))) else NA_integer_,
+      raw_barcodes = if (file.exists(f_raw)) length(readLines(gzfile(f_raw))) else NA_integer_)
+  }))
 }
 
 #' Junction molecules per cell, counted once each, with no floor.

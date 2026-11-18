@@ -161,6 +161,11 @@ OS release, so on a Rocky 9 node it finds no library and the first `library()` c
 | `orphan_rescue.csv` | 4 | orphan 5′ junction tested at the one position its partner must occupy, with the denominator |
 | `junction_coverage.csv` | — | site × channel × offset: the pile-up figure |
 | `genomic_decoy_rate.csv` | 8 | tube: real against decoy hits for the genome-mapped channel, from the scrambled-terminus run. Region-tagged when restricted to one chromosome, so a narrow probe cannot overwrite a genome-wide measurement |
+| `clip_floor_curve.csv` | ~50 | clip length: what a clip of that length matches, real sites and decoy flanks, under both the exact and budgeted rules. **The measurement that sets `min_assign` and `exact_below`** |
+| `repertoire_completeness.csv` | 1 | the assumption-free floor and the detection-corrected share of the mCherry⁺ population, with the number of sites whose detection had to be imputed |
+| `unassigned_molecules.csv` | 4 | what becomes of junction molecules matching no called site: below the floor, unplaceable, or at a locus that failed the cell floor |
+| `ambient_rate.csv` | 8 | tube: junction-bearing barcodes that are and are not called cells, per-cell against per-empty-droplet |
+| `work/called_barcodes.csv.gz` | ~161,000 | Cell Ranger's called barcodes, captured with the run so every cell count is reproducible from the outputs alone |
 | `detection_model.csv` | 15 | site: per-cell detection rate from a zero-truncated Poisson on molecule counts, the detection-corrected clone size with a bootstrap interval, and the observed-against-fitted check. `NA` where the truncated mean is too close to 1 to fit — that is the estimator declining, not a gap |
 | `clip_table.csv.gz` | ~1,800 | **molecule**: one row per tube + barcode + UMI with **no floor**, its longest clip, and how many called sites and decoy flanks that clip matches. The table every floor and detection question is answered from |
 | `clip_matches.csv.gz` | ~9,000 | clip × flank × orientation with the mismatch count, for anything the molecule view collapses away |
@@ -357,89 +362,66 @@ of magnitude.
 |---|---|---|---|
 | **25 bp** `min_discovery` | 3′ discovery | **2.7 Gb** of genome, no prior | long enough for bwa to place uniquely; 86 of 974 clips still land at MAPQ 0 |
 | **13 bp** `min_genomic` | genome-mapped channel | **one position** in a read already placed at MAPQ 255 | an exact match to the provirus terminus, as a confirmation on a read the aligner has already located — not a placement |
-| **10 bp** `min_assign` | assignment | **~3.6 kb** of called flanks, and one accepted offset in each | measured, not argued: 100 decoy flanks return zero hits at 10 bp and above, two below it |
-| ~~8 bp~~ | — | — | superseded. It came from the wild-type tubes being empty, which bounds cross-tube hopping and not within-tube chance matching — the wrong instrument |
+| **6 bp** `min_assign` | assignment | **~3.6 kb** of called flanks, and one accepted offset in each | measured per base: the 100 decoy flanks are clean from 6 bp up under exact matching, dirty below |
+| **15 bp** `exact_below` | assignment | — | not a length floor but its companion: beneath it a clip must match **exactly**, because the `L %/% 10` budget allows one mismatch and that is what the decoys catch |
+| ~~8 bp~~, ~~10 bp~~ | — | — | superseded, each for a different reason. 8 came from the wild-type tubes being empty, which bounds cross-tube hopping and not within-tube chance matching — the wrong instrument. 10 came from the right instrument read at the wrong resolution: decoy hits in coarse bands with a mismatch allowed |
 
-**Do not carry 10 bp into discovery.** A 10 bp query has ~95 expected matches in 2.7 Gb. It is safe
-for assignment only because assignment is not a search: the flank set is ~3.6 kb, the clip must land
-on one exact offset, and the decoys measure what that costs. 13 bp is not a discovery floor either —
-it is a confirmation on a read whose coordinate came from 120–140 bases of host.
+**Do not carry 6 bp into discovery.** A 6 bp query matches somewhere in 2.7 Gb roughly every 4 kb. It
+is safe for assignment only because assignment is not a search: the flank set is ~3.6 kb, the clip
+must land on one exact offset, and the decoys measure what that costs. 13 bp is not a discovery floor
+either — it is a confirmation on a read whose coordinate came from 120–140 bases of host.
 
-### How low the assignment floor could go, measured
+### Where the assignment floor is, and how it was measured
 
-`min_assign = 10` was set from decoy hits in coarse length bands. `clip_table.csv.gz` now carries
-every clip against every flank at every mismatch count with **no floor applied**, so the question can
-be asked one base at a time. The 100 decoy flanks are the instrument: a decoy has no junction, so a
-decoy match at a given length *is* the chance rate, and there is no sample-size limit because decoys
-can be cut at will.
+`min_assign` is **6**, with exact matching required beneath 15 bases. Both numbers come from one
+measurement, computed each run rather than quoted: `clip_table.csv.gz` carries every clip against
+every flank at every mismatch count with **no floor**, so the question can be asked one base at a
+time. The 100 decoy flanks are the instrument — a decoy has no junction, so a decoy match at a given
+length *is* the chance rate at that length — and decoys can be cut at will, so there is no
+sample-size limit.
 
-Requiring an **exact** match (`nm == 0`):
+```{r floor-curve}
+readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = FALSE) |>
+  dplyr::filter(clip_len <= 20) |>
+  dplyr::transmute(`clip length` = clip_len, molecules,
+                   `one site, exact` = unique_exact, `>1 site, exact` = ambiguous_exact,
+                   `hit a decoy, exact` = decoy_exact,
+                   `hit a decoy, with the budget` = decoy_budget,
+                   `floor` = ifelse(at_or_above_floor, "in", "out"),
+                   `exact required` = ifelse(exact_required, "yes", "no")) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 20, scrollX = TRUE)) |>
+  DT::formatStyle("hit a decoy, exact", target = "row",
+                  backgroundColor = DT::styleInterval(0, c("#e8f5e9", "#fde8e8")))
+```
 
-| clip length | molecules | matched exactly one real site | hit ≥1 decoy | decoy flanks hit, mean |
-|---|---|---|---|---|
-| 1 bp | 13 | 0 | **13 of 13** | 44.5 |
-| 2 bp | 14 | 2 | **14 of 14** | 11.1 |
-| 3 bp | 4 | 3 | 4 of 4 | 4.0 |
-| 4 bp | 17 | 13 | 10 of 17 | 0.82 |
-| 5 bp | 11 | 10 | 1 of 11 | 0.09 |
-| **6 bp** | **28** | **28 (100%)** | **0** | **0.00** |
-| 7–24 bp | 319 | 319 (100%) | 0 | 0.00 |
-| 25 bp + | 429 | 429 (100%) | 0 | 0.00 |
+**Clean from 6 bp up, dirty below.** At 6 bp, 27 molecules match exactly one real site and **none of
+the 100 decoys**; at 5 bp one molecule in nine hits a decoy, at 4 bp ten of seventeen do, and at 1–2
+bp a clip matches most of the decoy set — the prior-inflation hazard made visible rather than argued.
+Read it as a bound: zero hits in 35 × 100 comparisons at 6 bp, not a demonstrated zero.
 
-**The floor could go to 6 bp, and not below.** At 6 bp every molecule matches exactly one real site
-and none of the 100 decoys; at 5 bp one in eleven hits a decoy, at 4 bp more than half do, and at
-1–2 bp a clip matches most of the decoy set — which is the ambiguity the floor exists to prevent,
-visible at last rather than inferred. Read it as a bound: zero hits in 28 × 100 comparisons, not a
-demonstrated zero.
+**The 6 bp row also shows why the two thresholds are one decision.** Under the `L %/% 10` mismatch
+budget, **21 of those 35 molecules hit a decoy**. Under exact matching, zero do. A 6-base clip allowed
+one mismatch matches almost anything, so lowering the floor without `exact_below` would have been
+strictly worse than leaving it at 10.
 
-Two conditions. It requires exact matching — under the `L %/% 10` mismatch budget the assignment tier
-normally applies, a one-base clip is allowed one mismatch and therefore matches *everything*, and
-decoy hits persist to 8 bp. And the yield is small: **73 assignments over 47 previously unlabelled
-cells, 4.0% on 1,186**, spread across nine sites. The global check holds — **zero** wild-type-tube
-assignments are added, against the 2 of 1,213 already there.
+**What the change cost and bought.** Against the previous rule — floor 10, budget throughout — the
+new rule gains **57** three-prime assignments and loses **5**:
 
-**The floor is left at 10 here.** Changing it moves every downstream number, the gain is four per
-cent of cells, and it would have to arrive with the mismatch budget changed underneath it. The
-measurement is recorded so the decision is costed rather than argued.
+| | clip lengths | assignments |
+|---|---|---|
+| gained, newly above the floor | 6, 7, 8, 9 bp | 25, 20, 4, 8 |
+| **lost**, now rejected for carrying a mismatch | 10, 11, 12 bp | 1, 1, 3 |
 
-#### The other instrument, and why it does not decide this
+The five losses are the point rather than a regret: they are assignments that previously rested on a
+mismatch at a length where the decoys say a mismatch is unsafe. Net across both channels, with the
+called-cell filter applied at the same time, the table moves from 1,213 assignments over 1,186 cells
+to **1,222 over 1,195**.
 
-There is a second way to measure assignment error, and it is tempting because it runs on real reads
-rather than decoys: every site belongs to exactly one mouse and every cell's hashtag names its mouse,
-so **a clip assigned to a site in the wrong mouse is a detectable error**. Run over the current
-assignments:
-
-| clip length | molecules | cross-mouse | rate |
-|---|---|---|---|
-| 10–11 | 71 | 3 | 4.23% |
-| 12–14 | 104 | 0 | 0% |
-| 15–19 | 128 | 0 | 0% |
-| 20–29 | 290 | 3 | 1.03% |
-| 30+ | 538 | 1 | 0.19% |
-| **pooled** | **1,131** | **7** | **0.62%** (0.71% inflated per cell) |
-
-It passes at the current floor — under 1% — and it is reported for that. **It cannot set the floor**,
-for two reasons that are structural rather than fixable by more data.
-
-It measures chance matching *plus* hashtag misassignment *plus* doublets. Four of the seven
-cross-mouse landings sit at 23, 27 and 45 bases, where an exact positional match to the wrong flank
-is not a coincidence, so the confound floor is **0.48%** against a 1% tolerance. And the resulting
-power at the band that matters — 94 molecules at 6–9 bp — is not close to sufficient:
-
-| if the true clip error were | power to detect it |
-|---|---|
-| 1% | **8%** |
-| 2% | 20% |
-| 5% | 62% |
-| 10% | 93% |
-
-So it can exclude an error rate above ~5% and cannot certify one below 1%, which is the only decision
-a floor needs. The decoy flanks measure chance matching alone, and 100 of them can be cut against 94
-real molecules, so they have the sample size this lacks. **Set the floor from decoys; read this curve
-as a sanity check that happens to agree.** One detail worth recording either way: all seven
-cross-mouse landings are on IS01 or IS02, the two largest clones, which is the prior-inflation
-signature — ambiguous evidence drifting onto the biggest hypothesis — showing up even at the current
-floor.
+**A second instrument exists and does not decide this.** Because every site belongs to one mouse,
+a clip assigned to a site in the *wrong* mouse is a detectable error on real reads. It agrees with
+the decoys at the current floor, but it cannot set one — it measures chance matching plus hashtag
+error plus doublets, and it has 8% power against a 1% error rate at the band that matters. It needs
+the hashtag calls, so it is computed further down, under *Cells carrying more than one site*.
 
 #### How much ambiguity there is to resolve, which bounds everything above
 
@@ -498,7 +480,7 @@ cells by about two thirds and leaves them at zero.
 
 They are no longer at exactly zero overall, and the two events are worth running down rather than
 rounding away, because the UMIs identify what each one is. With the genome-mapped channel folded in,
-**two** wild-type cells carry a junction, both at IS04 — two of 1,213 labelled cells, 0.16%.
+**two** wild-type cells carry a junction, both at IS04 — two of 1,222 labelled assignments, 0.16%.
 
 - **Rx_5 is index hopping, demonstrated rather than inferred.** The read carries 121 bases of host at
   MAPQ 255, and its UMI `AGGCGGTTGTGT` appears at the same junction base in **Rx_6** as well — as
@@ -508,7 +490,7 @@ rounding away, because the UMIs identify what each one is. With the genome-mappe
   other tube, and neither does its barcode. A single read with no second-index twin is either
   genuine carry-over of a cell or a chance match; one read cannot distinguish them.
 
-So the demonstrable cross-tube rate is **1 in 1,213**, and the residual is a single unexplained read.
+So the demonstrable cross-tube rate is **1 in 1,222**, and the residual is a single unexplained read.
 That is what the wild-type tubes were included to supply, and it is a tighter answer than a
 percentage.
 
@@ -1001,25 +983,30 @@ dplyr::tibble(
 ```
 
 **Where the labelled cells go, since the pipeline's count and the figures' count differ and the
-difference should be named rather than noticed.** The pipeline writes **1,213 assignments over 1,186
+difference should be named rather than noticed.** The pipeline writes **1,222 assignments over 1,195
 distinct cells**. Counted outside the Seurat objects, they sit in the tubes like this:
 
 | tube | Rx_1 | Rx_2 | Rx_3 | Rx_4 | Rx_5 | Rx_6 | Rx_7 |
 |---|---|---|---|---|---|---|---|
 | labelled cells | 1 | 5 | 36 | 665 | 1 | 466 | 12 |
 
-and reach the joined table above by two subtractions:
+and reach the joined table above by one subtraction:
 
-- **−5** in the stroma tubes, Rx_1 and Rx_2. Those tubes are in neither embedded panel — the HSC
-  panel is Rx_3/4/5 and the MNC panel Rx_6/7/8 — so their cells cannot join and drop out of every
-  figure below. One of them is the Rx_1 wild-type cell discussed under Limitations.
-- **−33** present in the pipeline but in no demultiplexer output at all. These are barcodes Cell
-  Ranger called as cells, and whose reads carry a junction, that the demultiplexing step did not
-  receive. 2.8% of the labelled cells, and worth a look: they are not filtered, they are missing.
+- **−5 or so** in the stroma tubes, Rx_1 and Rx_2. Those tubes are in neither embedded panel — the
+  HSC panel is Rx_3/4/5 and the MNC panel Rx_6/7/8 — so their cells cannot join and drop out of
+  every figure below. One of them is the Rx_1 wild-type cell discussed under Limitations.
 
-That leaves **1,148** reaching the join before any QC, and the `pass_cell` row in the table above is
-the last step. Only the render can produce that number, because `pass_cell` lives in the Seurat
-objects; everything above it is reproducible from the CSVs alone.
+There used to be a second subtraction, and it was a defect rather than a filter. 33 barcodes in the
+cell table appeared in no demultiplexer output at all, and the reason turned out to be that **none of
+them was a called cell**: the BAM carries error-corrected `CB` tags for droplets Cell Ranger did not
+call, and this pipeline read those tags without checking. They were the ambient population arriving
+in the cell table as cells — 2.8% of it. `read_called_barcodes()` now restricts cell evidence to
+Cell Ranger's filtered barcode list, captured with the run in `work/called_barcodes.csv.gz`, and the
+filter removed **34** barcodes on the current run. The clip and genomic tables deliberately keep
+them, because the ambient rate above is computed from exactly those rows.
+
+The `pass_cell` row in the table above is the last step, and only the render can produce it, because
+`pass_cell` lives in the Seurat objects; everything above it is reproducible from the CSVs alone.
 
 Two separate drops are expected. Assignments in tubes these objects do not cover — the stroma tubes —
 fall out at the second row. The larger drop is at the third: the extraction uses every barcode Cell
@@ -1583,6 +1570,63 @@ Sites in different animals are necessarily distinct founders, whatever the withi
 proves to be. The change from the previous run is B0304: it had exactly one site, and now it has six,
 headed by IS10 at 99 cells. The seven B0303 sites remain unresolved against each other.
 
+#### The other instrument, and why it does not decide this
+
+There is a second way to measure assignment error, and it is tempting because it runs on real reads
+rather than decoys: every site belongs to exactly one mouse and every cell's hashtag names its mouse,
+so **a clip assigned to a site in the wrong mouse is a detectable error**. It needs the hashtag calls,
+which live in the targets store rather than the pipeline's outputs, so it is computed here:
+
+```{r mono-replicate}
+# Every assignment-tier match, with the mouse of its site and the mouse of its cell. A landing in
+# the wrong mouse is an error that real reads can show, at every clip length.
+mono <- clip_site_matches(file.path(sites_dir, "work", "all_clips.fa"),
+                          file.path(sites_dir, "work", "site_flanks.fa"), min_len = 1L) |>
+  dplyr::filter(assign_keep(clip_len, nm, budget)) |>
+  dplyr::semi_join(dplyr::select(sites, site_id), by = "site_id") |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::inner_join(dplyr::select(site_replicate, site_id, site_mouse = mouse), by = "site_id") |>
+  dplyr::inner_join(dplyr::transmute(embedding, cell,
+                                     cell_mouse = sub("^TotalSeq-", "", as.character(replicate))),
+                    by = "cell") |>
+  dplyr::filter(grepl("^B03", cell_mouse)) |>
+  dplyr::mutate(cross = cell_mouse != site_mouse,
+                band = cut(clip_len, c(0, 9, 14, 19, 29, Inf),
+                           labels = c("6–9", "10–14", "15–19", "20–29", "30+")))
+
+dplyr::bind_rows(
+  mono |> dplyr::group_by(band) |> dplyr::summarise(molecules = dplyr::n(),
+            `cross-mouse` = sum(cross), .groups = "drop") |>
+    dplyr::mutate(band = as.character(band)),
+  dplyr::tibble(band = "pooled", molecules = nrow(mono), `cross-mouse` = sum(mono$cross))) |>
+  dplyr::mutate(rate = sprintf("%.2f%%", 100 * `cross-mouse` / molecules)) |>
+  knitr::kable()
+```
+
+It passes at the current floor and it is reported for that. **It cannot set the floor**, for two
+reasons that are structural rather than fixable by more data.
+
+It measures chance matching *plus* hashtag misassignment *plus* doublets. Four of the seven
+cross-mouse landings sit at 23, 27 and 45 bases, where an exact positional match to the wrong flank
+is not a coincidence, so the confound floor is **0.48%** against a 1% tolerance. And the resulting
+power at the band that matters — 94 molecules at 6–9 bp — is not close to sufficient:
+
+| if the true clip error were | power to detect it |
+|---|---|
+| 1% | **8%** |
+| 2% | 20% |
+| 5% | 62% |
+| 10% | 93% |
+
+So it can exclude an error rate above ~5% and cannot certify one below 1%, which is the only decision
+a floor needs. The decoy flanks measure chance matching alone, and 100 of them can be cut against 94
+real molecules, so they have the sample size this lacks. **Set the floor from decoys; read this curve
+as a sanity check that happens to agree.** One detail worth recording either way: all seven
+cross-mouse landings are on IS01 or IS02, the two largest clones, which is the prior-inflation
+signature — ambiguous evidence drifting onto the biggest hypothesis — showing up even at the current
+floor.
+
+
 ### Clone size: a detection rate that works, and a capture–recapture that cannot
 
 The two channels read the same junctions through different reads, so the tempting argument writes
@@ -1707,44 +1751,58 @@ so comparing it to 1 suggests a problem that is not there.)
 
 ### Repertoire completeness: what fraction of the transduced population these sites account for
 
-Detection-corrected clone sizes make a question answerable that has sat open for several rounds, and
-the denominator needed for it is already in hand — the mCherry⁺ cells sequenced, not the FACS record.
+Detection-corrected clone sizes make a question answerable that sat open for several rounds, and the
+denominator it needs was in hand all along — the mCherry⁺ cells **sequenced**, not the FACS record.
 
-- mCherry⁺ cells sequenced (Rx_4 + Rx_6): **43,332**
-- labelled: **1,131**, which is **2.6%** — an assumption-free floor on completeness
-- detection-corrected cells across all fifteen sites: **≈ 2,900**, using the median detection of the
-  estimable sites for the nine without one
-- **so the fifteen sites account for roughly 7% of the sorted mCherry⁺ population**
+```{r completeness}
+readr::read_csv(file.path(sites_dir, "repertoire_completeness.csv"), show_col_types = FALSE) |>
+  dplyr::transmute(
+    `mCherry+ cells sequenced` = scales::comma(mcherry_cells_sequenced),
+    sites, `labelled cells` = scales::comma(detected_cells),
+    `floor (no model)` = sprintf("%.1f%%", 100 * floor_share),
+    `detection-corrected cells` = scales::comma(corrected_cells),
+    `corrected share` = sprintf("%.1f%%", 100 * corrected_share),
+    `unaccounted` = sprintf("%.1f%%", 100 * unaccounted_share),
+    `sites using imputed detection` = sites_with_imputed_detection) |>
+  t() |> as.data.frame() |> setNames("value") |>
+  knitr::kable()
+```
 
-The floor needs no model: even at perfect detection the sites would cover 2.6%. The ~7% leans on λ
-and on treating mCherry⁺ as implying a provirus, so it carries the same factor-two uncertainty as the
-clone sizes. The direction does not: **these fifteen sites are a small minority of the transduced
-population**, and any statement about the clonal repertoire should say so.
+Two numbers, reported together because they bracket the answer from opposite sides. **2.8% is a
+floor that assumes nothing**: even at perfect detection the fifteen sites cannot account for less of
+the mCherry⁺ population than the cells they already label. **6.7% is the detection-corrected
+estimate**, and it inherits λ's uncertainty — nine of the fifteen sites have no estimable λ and are
+corrected by the median of those that do, which is the weakest step in the calculation and is
+exactly why the floor is printed beside it.
+
+Either way the direction is not in doubt: **these fifteen sites are a small minority of the
+transduced population**, and any statement about the clonal repertoire should say so.
 
 #### Where the rest of the junctions are, since they are visible
 
-That conclusion invites the obvious objection — if ~93% of mCherry⁺ cells belong to no called site,
-why are there no junction reads from them? There are, and the clip table says what happens to them.
-Of 1,422 junction-bearing cells, **236 carry a molecule attributable to no called site**:
+That invites the obvious objection — if ~93% of mCherry⁺ cells belong to no called site, why are
+there no junction reads from them? There are, and the clip table says what becomes of them.
 
-| | molecules |
-|---|---|
-| below the assignment floor (< 10 bp) | 100 |
-| 10–24 bp | 64 |
-| **≥ 25 bp, long enough to place, matching nothing** | **76** |
+```{r unassigned}
+readr::read_csv(file.path(sites_dir, "unassigned_molecules.csv"), show_col_types = FALSE) |>
+  dplyr::transmute(`what the molecule is` = class, molecules, cells,
+                   `cells with no assignment at all` = cells_with_no_assignment) |>
+  knitr::kable()
+```
 
-Following that last group through `bwa`: **67 place at MAPQ < 30** — repetitive flank, the blind spot
-— 15 do not place at all, and 29 place cleanly at MAPQ ≥ 30. Those 29 sit at exactly **seven uncalled
-positions**, each with 1–2 cells and 1–3 molecules, every one below the `min_cells = 3` and
-`min_umis = 3` floor. One of them is `chrX:100,691,113`, the orphan the target-site-duplication
-rescue identified and that was never promoted to a site.
+The decisive split is between the last two rows. A molecule whose clip is long enough to place and
+which still matches no called site is either **at a real locus that failed the cell floor** — 20
+molecules at a handful of positions, each with one or two cells, every one below `min_cells = 3`,
+one of them `chrX:100,691,113` which the target-site-duplication rescue identified and which was
+never promoted to a site — or it is **unplaceable**, 59 molecules at MAPQ < 30 or unmapped, which is
+the repetitive-flank blind spot the genome-mapped channel partly repairs.
 
-So the repertoire missing *within this data* is seven micro-loci below the calling floor plus a
-repetitive-flank blind spot — **not** a large population of undetected clones leaving no trace. The
-two findings are consistent: the undetected 93% are cells of clones whose proviruses never yielded a
-captured junction molecule at all, which is what a per-cell detection rate of 26–52% implies, and
-they are invisible here by construction rather than by oversight. That is also why this estimate does
-not need step 4's posteriors to reach it.
+So the repertoire missing *within this data* is a few micro-loci below the calling floor plus that
+blind spot — **not** a large population of undetected clones leaving no trace. The two findings are
+consistent: the unaccounted 93% are cells of clones whose proviruses never yielded a captured
+junction molecule at all, which is what a per-cell detection rate of 26–52% implies, so they are
+invisible here by construction rather than by oversight. That is also why this estimate needs no
+posterior model to reach it.
 
 Three routes now bear on the size of the two large B0303 clones, and they differ in what they
 assume: the zero-truncated Poisson gives **660 and 1,154** from molecule counts alone, with bootstrap
@@ -1773,22 +1831,33 @@ assumes comparable depth.
 **Small sites sit near the background, and the wild-type tubes do not bound all of it.** A wild-type
 tube bounds *cross-tube* error — index hopping and carry-over — and nothing else. It cannot bound
 within-tube ambient, where every lysed mCherry⁺ cell sheds vector RNA into the shared soup. That is
-measured separately from sub-threshold droplets, and that measurement now covers both channels:
+measured separately from sub-threshold droplets, computed each run across both channels:
 
-| | Rx_4 | Rx_6 |
-|---|---|---|
-| junction-bearing barcodes | 422 | 247 |
-| of those, **not** a called cell | **11** | **4** |
-| ambient share | 2.6% | 1.6% |
-| rate per called cell | 2.00% | 1.06% |
-| rate per empty droplet | 4.3 × 10⁻⁶ | 1.8 × 10⁻⁶ |
-| ratio | **4,700×** | **6,100×** |
+```{r ambient}
+readr::read_csv(file.path(sites_dir, "ambient_rate.csv"), show_col_types = FALSE) |>
+  dplyr::filter(junction_barcodes >= 10) |>
+  dplyr::transmute(tube, `junction-bearing barcodes` = junction_barcodes,
+                   `of those, a called cell` = in_called_cells,
+                   `not a cell` = not_cells,
+                   `ambient share` = sprintf("%.1f%%", 100 * ambient_share),
+                   `rate per called cell` = sprintf("%.2f%%", 100 * rate_per_cell),
+                   `rate per empty droplet` = sprintf("%.1e", rate_per_empty),
+                   `ratio` = scales::comma(round(ratio))) |>
+  knitr::kable()
+```
 
-Folding in the genome-mapped channel is a check on this in its own right: it raised the
-junction-bearing barcode count from 568 to 669 and left the non-cell count at **15, unchanged**. The
-new channel added signal without adding ambient, which is what should happen if the extra reads are
-real junctions rather than background — a doubling of a background-driven signal would have doubled
-its background with it. Scaled by the depth difference between a cell and an empty droplet — the one
+The comparison that makes the number mean something is the last column: a junction in one of 2.5
+million empty droplets and a junction in one of 20,000 cells are different events, and per droplet
+the signal is three to four orders of magnitude stronger in cells. These are also exactly the
+barcodes the called-cell filter removes from the cell table — the filter is applied where cells are
+counted and **not** to the clip and genomic tables, because this measurement is computed from the
+rows it removes.
+
+Folding in the genome-mapped channel was a check on this in its own right: it raised the
+junction-bearing barcode count substantially and left the non-cell count unchanged. The new channel
+added signal without adding ambient, which is what should happen if the extra reads are real
+junctions rather than background — a doubling of a background-driven signal would have doubled its
+background with it. Scaled by the depth difference between a cell and an empty droplet — the one
 multiplier not measured here — this is of order 1–2% of labelled cells, consistent with the doublet
 rate. Scaled by the depth difference between a cell and an empty droplet — the one multiplier not
 measured here — that is of order 1–2% of labelled cells, consistent with the doublet rate.
@@ -1833,7 +1902,7 @@ Two details worth keeping. **Rx_8 is the sharpest result in the table**: a wild-
 reads, and 5 decoy reads — so in material with no provirus at all, the real 13-mer finds nothing and
 a composition-matched random one finds five. The real terminus is not merely better than chance here,
 it is cleanly separated from it. And at the cell level 1.1% of 1,396 folded-in reads is roughly 15
-reads, so of 1,186 labelled cells perhaps 15 could carry a spurious label — the same order as the
+reads, so of 1,195 labelled cells perhaps 15 could carry a spurious label — the same order as the
 ambient and doublet rates, and not concentrated anywhere.
 
 One limitation of this run, for whoever tightens it: `genomic_decoy_rate()` stores counts per tube,
