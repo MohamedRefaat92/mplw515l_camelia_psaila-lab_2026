@@ -14,6 +14,25 @@ from the 3′ channel alone. They now carry both channels. The site count went 9
 cell count 552 → 1,186. Site labels are now pinned to loci by `metadata/integration_site_registry.csv`
 rather than assigned by rank — see §7.
 
+**Three results changed direction on the same day, and the pattern is worth more than any of them.**
+Each came from using a denominator that already had the answer built into it:
+
+1. *Co-occurrence.* Comparing observed pairs against `|A|·|B| / labelled cells` assumes complete
+   detection, so "below chance" was guaranteed. The fix was a control, not a correction: sites in
+   different mice cannot share a cell, so cross-mouse pairs measure the doublet floor directly.
+2. *Leakage.* "B0304 leaks at 14% against B0303's 0.2%" divided labelled cells by labelled cells.
+   B0304 has 92% of its cells in the mCherry⁻ tubes. Per cell the animal effect is 2.4-fold, and the
+   ranking inverts.
+3. *The 100%-mCherry⁻ sites.* Called "selection" on the assumption that a site found in those tubes
+   must read 100%. It need not — discovery and assignment both pool every tube — so the asymmetry is
+   real, just thin at 2–6 cells.
+
+**Never divide labelled cells by labelled cells.** All three had the shape of a strong result.
+
+**13 sites, not 15, for any repertoire statement.** IS14 and IS15 clear the cell floor only on the
+two channels' reads summed, and have no 5′ junction either. `integration_sites.csv` carries
+`called_by` and `pooled_only` so this does not have to be remembered.
+
 ---
 
 ## 1. The question
@@ -152,6 +171,15 @@ genome-mapped channel's cells are folded in as well. The wild-type tubes stayed 
 of that except for two cells — one in Rx_1 and one in Rx_5, both at IS04 — which is the measured
 cross-tube rate, 0.16% of labelled cells.
 
+**A third trap, hit on 2026-11-18: the cache that only breaks on restart.** The genomic stage writes
+one CSV a tube so the expensive scan can be resumed. Read back with guessed column types, that cache
+is a landmine — the two wild-type tubes legitimately return **zero rows**, `readr` types every column
+in a header-only file as character, and binding them to a tube with real rows dies with *"Can't
+combine `pos` <character> and `pos` <double>"*. The failure lands at the start of the rerun, after
+the first run has already been paid for, and it is caused by the two tubes that are working
+correctly. `read_genomic_cache()` declares the schema instead. **Any cache whose contents can
+legitimately be empty needs its types declared, not inferred.**
+
 **Two traps, both hit:**
 
 - *Low-complexity flanks attract clips that belong nowhere.* JH584304.1:35,417 has a 23-base
@@ -233,7 +261,7 @@ it was a question about what the library contains, now answered.
 
 ## 7. Results, and the validations
 
-15 sites called, 12 in the mini-reference, **1,186 distinct cells labelled**. `mouse` is the
+15 sites called — **13 defensibly**, see `pooled_only` below — 12 in the mini-reference, **1,186 distinct cells labelled**. `mouse` is the
 dominant hashtag class, which is 96–100% of each site's cells.
 
 | id | locus | gene | cells | mouse | note |
@@ -251,14 +279,29 @@ dominant hashtag class, which is 96–100% of each site's cells.
 | IS08 | chr18:17,071,116 | intergenic | 10 | B0303 | |
 | IS13 | chr2:126,704,897 | *Trpm7* | 6 | B0303 | all six cells in mCherry⁻ tubes |
 | IS07 | JH584304.1:35,417 | intergenic | 3 | B0303 | **artefact.** Unplaced scaffold, 23-base homopolymer in its flank, no 5′ junction, and all three cells in mCherry⁻ tubes. Held out of the mini-reference by `max_homopolymer`; its cells come from the genomic channel, which does not consult the flank |
-| IS14 | chr10:19,804,209 | intergenic | 2 | B0304 | at the cell floor, no 5′ confirmation; held out of the mini-reference |
+| IS14 | chr10:19,804,209 | intergenic | 2 | B0304 | **`pooled_only`** — clears the cell floor only on both channels' reads summed, no 5′ junction, held out of the mini-reference. Exclude from repertoire counts |
 | IS15 | chr9:82,806,975 | *Phip* | 2 | B0304 | as IS14 |
+
+`called_by` in `integration_sites.csv` carries this per site: 9 sites called by both channels, 4 by the genome-mapped channel alone, 2 (IS14, IS15) only on the pooled reads. **The defensible repertoire count is 13.**
 
 **Site IDs are pinned to loci, not to ranks.** `metadata/integration_site_registry.csv` holds the
 mapping; a locus in it keeps its number for good and a new locus takes the lowest number never used.
 This replaced rank ordering after the genomic channel changed the ranking and silently repointed IS01
 through IS04 at different loci. Do not infer importance from the number, and do not renumber the
 registry.
+
+**What bounds the error in each tier.** The decoy flanks (100 of them, zero hits at 10 bp and above)
+bound the *assignment* tier. The genome-mapped channel has its own decoy now — `genomic_decoy_rate()`,
+run as the `genomic-decoy` stage — which repeats the scan with the terminus permuted to the same base
+composition. On chr19 in Rx_4, 27.6M alignments containing a real 29-read site, it returns **zero**.
+That is one chromosome of one tube: a real measurement on a real slice, not the channel's rate. The
+stage takes a chromosome argument so the bound can be tightened; a full pass costs what the genomic
+stage costs, which is why it is opt-in.
+
+Composition-match the decoy *k*-mer, not the whole terminus. The real 13-mer `AAAATCTCTAGCA` has six
+adenines; permuting all 18 bases leaves the tested 13 with three, and A-rich *k*-mers are commoner in
+the genome, so that version understates the rate in the direction that flatters the channel. The
+first attempt made exactly that mistake.
 
 Three checks the pipeline never used as input, so they are genuinely independent:
 

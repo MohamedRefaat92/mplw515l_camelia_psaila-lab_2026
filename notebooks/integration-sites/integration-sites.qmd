@@ -82,7 +82,15 @@ data/cellranger_<tube>/sample_alignments.bam        8 tubes, ~55 GB each
         │     MAPQ 255 behind 120-140 bases of host, so no alignment follows. A streaming pass
         │     over every alignment in each BAM, one core per tube, cached per tube.
         ▼
-   work/genomic_<tube>.csv
+   work/genomic_<tube>.csv                          cached per tube; schema declared on read back,
+        │                                            because the wild-type tubes cache zero rows
+        │
+        │  3b. GENOMIC DECOY (optional)   genomic_decoy_rate()
+        │     The same scan with the terminus permuted to the same base composition, which bounds
+        │     this channel's false-positive rate the way the decoy flanks bound assignment's. Costs
+        │     what stage 3 costs, so it is opt-in and takes a chromosome argument.
+        ▼
+   genomic_decoy_rate.csv
         │
         │  4. SITES     call_sites(), label_sites(), summarise_sites(), write_site_flanks()
         │     GenomicRanges clusters BOTH channels' placements into sites together -- the
@@ -110,6 +118,9 @@ bwa used to run a second time here, against the flanks. It was removed: MAPQ aga
 short sequences is near-meaningless and was already being ignored, `-a` had to be passed to stop its
 ranking discarding true hits, and `-T 12` silently enforced a 12 bp floor while `min_assign`
 advertised 8 — 169 reads written and dropped with no error, the same failure as `-T 30` one tier up.
+**That `-T 12` problem is resolved by removal, not by a fix:** there is no aligner in this tier any
+more, so the flag gates nothing and cannot be reintroduced by changing a threshold. It is recorded
+here so nobody reopens it looking for the setting that corrects it.
 What remained once those were stripped away was a positional test, which is exact, deterministic and
 runs in seconds.
 
@@ -120,6 +131,7 @@ runs in seconds.
 | [`src/R/integration-sites.R`](../../src/R/integration-sites.R) | all the logic, as functions. Attaches no packages, so it can be `source()`d and stepped through. Every threshold is in `IS_DEFAULTS` at the top. |
 | [`scripts/R/call-integration-sites.R`](../../scripts/R/call-integration-sites.R) | driver with four entry points — `extract`, `genomic`, `sites`, `assign` — split where bwa has to run between them, and where the genomic scan has to be restartable on its own |
 | [`scripts/slurm/analysis/integration-sites.sh`](../../scripts/slurm/analysis/integration-sites.sh) | the batch job, five stages. The genomic scan dominates: ~105 min for eight BAMs forked one core per tube, against ~14 h in series. Everything else is minutes. |
+| [`scripts/slurm/analysis/integration-sites-decoy.sh`](../../scripts/slurm/analysis/integration-sites-decoy.sh) | the genome-mapped channel's error bound: the same scan with the terminus permuted to the same base composition. Its own job, ~1 h 50 m, because a control must not sit on the critical path. Takes an optional chromosome |
 | [`scripts/slurm/setup/bwa-index.sh`](../../scripts/slurm/setup/bwa-index.sh) | builds the bwa index once, ~50 min |
 
 Both jobs run on the `short` partition and **not** the `_el9` ones: renv keys its library path on the
@@ -148,6 +160,7 @@ OS release, so on a Rocky 9 node it finds no library and the first `library()` c
 | `tsd_check.csv` | 8 | 5′ cluster: signed Δ, the duplicated span, whether reads contain it, strand agreement |
 | `orphan_rescue.csv` | 4 | orphan 5′ junction tested at the one position its partner must occupy, with the denominator |
 | `junction_coverage.csv` | — | site × channel × offset: the pile-up figure |
+| `genomic_decoy_rate.csv` | 8 | tube: real against decoy hits for the genome-mapped channel, from the scrambled-terminus run. Region-tagged when restricted to one chromosome, so a narrow probe cannot overwrite a genome-wide measurement |
 | `channel_capture_recapture.csv` | 15 | site: cells seen by each channel, their overlap, Chapman's estimator — **and the molecule-model expectation that stops it being read as a clone size** |
 
 ## Re-running it
@@ -329,6 +342,26 @@ The clip is host genome, so its length is exactly how much flanking sequence the
 short and it cannot be placed uniquely in a 2.7 Gb genome; the information-theoretic floor is about 16
 bases, and in practice mismatches and repeats push the usable threshold higher.
 
+### Four numbers, three tiers — which is which
+
+Three different length floors are live in this analysis and a fourth is historical. They are not
+alternatives and carrying one into another tier is the single most expensive mistake this pipeline
+has made, twice: `-T 30` voided a 25 bp floor and `-T 12` voided an 8 bp one, both silently. Each
+number belongs to a tier, and the tier is what sets it, because the prior odds differ by six orders
+of magnitude.
+
+| number | tier | what is being searched | why that number |
+|---|---|---|---|
+| **25 bp** `min_discovery` | 3′ discovery | **2.7 Gb** of genome, no prior | long enough for bwa to place uniquely; 86 of 974 clips still land at MAPQ 0 |
+| **13 bp** `min_genomic` | genome-mapped channel | **one position** in a read already placed at MAPQ 255 | an exact match to the provirus terminus, as a confirmation on a read the aligner has already located — not a placement |
+| **10 bp** `min_assign` | assignment | **~3.6 kb** of called flanks, and one accepted offset in each | measured, not argued: 100 decoy flanks return zero hits at 10 bp and above, two below it |
+| ~~8 bp~~ | — | — | superseded. It came from the wild-type tubes being empty, which bounds cross-tube hopping and not within-tube chance matching — the wrong instrument |
+
+**Do not carry 10 bp into discovery.** A 10 bp query has ~95 expected matches in 2.7 Gb. It is safe
+for assignment only because assignment is not a search: the flank set is ~3.6 kb, the clip must land
+on one exact offset, and the decoys measure what that costs. 13 bp is not a discovery floor either —
+it is a confirmation on a read whose coordinate came from 120–140 bases of host.
+
 ```{r clip-length}
 junction_clips <- anchor_ends %>%
   dplyr::filter(anchor_end == JUNCTION, !polya)
@@ -362,11 +395,21 @@ The evidence that this is safe rather than merely generous is the control: 28,01
 wild-type tubes that never saw the vector. Dropping the threshold from 25 to 10 raises labelled
 cells by about two thirds and leaves them at zero.
 
-They are no longer at exactly zero overall, and the one event is worth stating precisely rather than
-rounding away. With the genome-mapped channel folded in, **two** wild-type cells carry a junction:
-one in Rx_1 and one in Rx_5, both at IS04, the Rx_5 read carrying 121 bases of host at MAPQ 255. Two
-of 1,213 labelled cells, 0.16%. That is the cross-tube error rate — index hopping and carry-over —
-measured rather than bounded, and it is the quantity the wild-type tubes were included to supply.
+They are no longer at exactly zero overall, and the two events are worth running down rather than
+rounding away, because the UMIs identify what each one is. With the genome-mapped channel folded in,
+**two** wild-type cells carry a junction, both at IS04 — two of 1,213 labelled cells, 0.16%.
+
+- **Rx_5 is index hopping, demonstrated rather than inferred.** The read carries 121 bases of host at
+  MAPQ 255, and its UMI `AGGCGGTTGTGT` appears at the same junction base in **Rx_6** as well — as
+  does its cell barcode. One molecule from one cell, read out under two sample indices. That is the
+  signature, and it is the only one of its kind in the data.
+- **Rx_1 has no such partner.** Its 32-base clip carries UMI `AGGGGTTACCAG`, which appears in no
+  other tube, and neither does its barcode. A single read with no second-index twin is either
+  genuine carry-over of a cell or a chance match; one read cannot distinguish them.
+
+So the demonstrable cross-tube rate is **1 in 1,213**, and the residual is a single unexplained read.
+That is what the wild-type tubes were included to supply, and it is a tighter answer than a
+percentage.
 
 ```{r tier-contribution}
 summary_tbl %>% DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12))
@@ -394,8 +437,24 @@ through the same site caller on its own:
 | both together | 15 |
 
 The genome-mapped channel recovers **every** site the 3′ channel finds — the 3′-only column is
-empty — and adds four of its own. Two more appear only when the two are pooled, each being a 3-cell
-site that neither channel reaches alone.
+empty — and adds four of its own.
+
+That leaves 9 + 4 = 13, and the pooled call gives 15, so the arithmetic needs the third row of this
+breakdown rather than a sentence. `integration_sites.csv` now carries it per site as `called_by`:
+
+| `called_by` | sites | |
+|---|---|---|
+| both channels | 9 | IS01, IS02, IS03, IS04, IS05, IS06, IS07, IS08, IS09 |
+| genomic channel only | 4 | IS10, IS11, IS12, IS13 |
+| **pooled only** | **2** | **IS14, IS15** |
+
+**IS14 and IS15 clear the cell floor only on the two channels' reads summed** — neither channel
+reaches `min_cells` at either locus alone. That is legitimate evidence and it is also the weakest
+evidence in the set, so they are flagged `pooled_only` in the site table. They are the same two
+sites the mini-reference gate holds out for lacking 5′ confirmation, which is not a coincidence:
+nothing independent vouches for either. **Exclude them from any repertoire count, diversity
+statistic or denominator** until a second line of evidence arrives. Saying "15 sites" without that
+caveat overstates what was found; the defensible count is **13**.
 
 The largest addition is not marginal. **IS10, `chr13:5,676,485`, is the fifth largest clone in the
 experiment at 99 cells, and the 3′ channel cannot see it at all.** Not for want of reads: three
@@ -627,6 +686,20 @@ share one five-base span of reference, and `span seen in 5′ reads` is the frac
 5′ reads that actually contain it. It is **1.00 at all four sites** — `GATTC`, `GTTCC`, `GAATA`,
 `GTTCC` — so the reference and the reads agree base for base, and `strand agrees` confirms that the
 sign of Δ matches the called strand in every case.
+
+Two details about that table, both checked rather than assumed. `GTTCC` appears as the duplicated
+span at two different sites, IS01 and IS09. The two values are read independently — each from its own
+locus, `chr13:83,681,307-311` and `chr2:31,009,148-152`, by a separate reference lookup, and each
+confirmed against that site's own 5′ reads — so it is a coincidence between two loci, not a
+carry-over. A repeat among four 5-mers is a ~0.6% coincidence under uniform sampling and rather more
+likely than that given integrase's target-site preference, so it needs no explanation beyond having
+been verified.
+
+And **the check cannot be run on IS10–IS15 at all.** The whole 5′ channel is 76 reads, which reach
+only the largest sites; no 5′ cluster falls within 2 kb of any of the six new loci. Those sites are
+therefore not *failing* the TSD test — they are outside its reach, and the TSD column is empty rather
+than negative for them. For IS14 and IS15 that is the second independent thing missing, which is why
+they are flagged `pooled_only`.
 
 The rest of the table is as informative as the passes:
 
@@ -1234,30 +1307,129 @@ pair_class |>
 
 A doublet process does not know which mouse a cell came from, so it would hit both classes at the
 same rate. Apply the same-mouse rate to the cross-mouse pairs and it predicts **33.9** co-occurrences;
-**one** was observed (Poisson *p* ≈ 7 × 10⁻¹⁴). The same argument from the other side: the cells from
-the three mice are thoroughly mixed in each tube, so most doublets between two labelled cells should
-be cross-mouse, and almost none are.
+**one** was observed (Poisson *p* ≈ 7 × 10⁻¹⁴).
+
+**The obvious objection to that, and why it does not hold here.** A droplet holding cells from two
+mice carries two hashtags, which is exactly what a demultiplexer calls a doublet — so if such
+droplets had been dropped before this test, cross-mouse pairs would have been stripped from the very
+set the test runs on, along the exact axis of the comparison and in the direction of the conclusion.
+That would be fatal. It is not what happened: **this test is run on every labelled barcode,
+hashtag-multiplets included.** Of the 1,131 labelled cells in Rx_4 and Rx_6, 971 are called singlets,
+**130 are called multiplets** and 30 have no call. Splitting the test by the demultiplexer's own
+verdict shows where the one event lives (same minimum site size of three cells throughout, so the
+first row is the table above pooled over both tubes):
+
+| subset of barcodes | cells | cross-mouse obs / exp | same-mouse obs / exp |
+|---|---|---|---|
+| all labelled cells (what the test uses) | 1,131 | 1 / 263.5 | 26 / 202.1 |
+| hashtag **singlets** only | 971 | 0 / 226.0 | 23 / 174.7 |
+| hashtag **multiplets**, negatives, no call | 160 | 1 / 32.8 | 3 / 27.0 |
+
+The single cross-mouse co-occurrence — Rx_4, IS02 + IS10, B0303 + B0304 — **is** a called multiplet,
+precisely as a doublet should be: the demultiplexer caught it rather than hiding it. And in the
+subset most enriched for doublets, cross-mouse co-occurrence is still **33-fold below independence**
+rather than near it, while same-mouse co-occurrence in that same subset sits at the same ratio as
+everywhere else. The depletion is not an artefact of demultiplexing.
 
 **So doublets do not explain the co-occurrences, and the earlier claim that they could is withdrawn.**
 Ambient goes with them: ambient RNA comes from the whole tube's soup, which carries every mouse's
 clones in proportion to their abundance, so it too would produce cross-mouse pairs. One event in 263
-expected is the measured ceiling on both mechanisms together.
+expected is the measured ceiling on both mechanisms together. The reason both are so rare is worth
+stating because it is not obvious: for a doublet to *show* two sites, **both** of its cells must be
+detected, and detection is a few per cent per cell.
 
 What is left is that sites **within one mouse share cells far above that floor**, which is what a
 multi-copy founder looks like. Every one of the 26 co-occurrences is in B0303, and all six
 co-occurring pairs are drawn from IS01, IS02, IS06 and IS08.
 
-**It is not a single clean clone either.** Inverting each pair gives the clone size it would imply:
-IS01 + IS02 implies 2,312 cells in Rx_4 and 3,164 in Rx_6, but IS01 + IS06 implies 365 and IS02 + IS08
-implies 570. If those four sites marked one founder, every pair would imply the same `N`; a six-fold
-spread says they do not. The most likely reading is correlated detection — a cell holding more vector
-RNA shows *both* of its proviruses, which inflates the pairs involving a small site — on top of real
-sharing. Disentangling that needs more than co-occurrence.
+**Which expectation came from which model, because the two point opposite ways.** The 202.1 above is
+`|A|·|B| / N_labelled`: the independence expectation *if every cell of every clone were detected*.
+Same-mouse co-occurrence at 26 against that is running at an eighth of it — and read naively that
+argues against sharing, since cells of a multi-copy founder carry both proviruses by construction.
+It is not the right expectation. Under a shared founder the denominator is the clone's **true** size,
+so the prediction is `|A|·|B| / N_true`, and 26 observed is then a statement about how much larger
+`N_true` is than the detected count — the eight-fold shortfall *is* the detection rate. The
+cross-mouse contrast is immune to this, because both classes use the same convention and the
+comparison is between them, which is why the result rests on it.
 
-**Verdict, revised.** Multi-copy founders in B0303 are now the favoured explanation and doublets are
-excluded as the dominant mechanism; the earlier "undetermined" was too weak, and the original "absent"
-was wrong in the other direction. The structure within B0303 — how many founders, which sites travel
-together — is still open, and the `ambiguous` flag stays as it is so downstream work can decide.
+### The discriminator that uses detection depth
+
+Co-occurrence counts cannot separate "one clone, partly detected" from "two clones plus correlated
+detection", because both are fitted by choosing a denominator. Detection *depth* can. If IS01 and
+IS02 sit in one founder, every cell of it carries both and the only reason both are not seen is how
+many junction molecules that cell yielded. So condition on that count:
+
+```{r dose-response}
+# P(cell carries both sites | how many junction molecules it yielded), against the prediction if the
+# two sites were one clone: k molecules drawn from two proviruses with probability p and 1-p of
+# landing at each, so P(both) = 1 - p^k - (1-p)^k. A cell with one molecule cannot show two sites,
+# which the prediction accounts for rather than being confounded by.
+mol <- assign |>
+  dplyr::filter(tube %in% c("Rx_4", "Rx_6")) |>
+  dplyr::mutate(m = umis_three + umis_genomic)
+depth <- mol |>
+  dplyr::group_by(tube, barcode) |>
+  dplyr::summarise(k = sum(m), sites = list(as.character(site_id)), .groups = "drop")
+
+curve_for <- function(a, b, label) {
+  p <- sum(mol$m[mol$site_id == a]) / sum(mol$m[mol$site_id %in% c(a, b)])
+  depth |>
+    dplyr::mutate(hasA = purrr::map_lgl(sites, ~ a %in% .x),
+                  hasB = purrr::map_lgl(sites, ~ b %in% .x)) |>
+    dplyr::filter(hasA | hasB) |>
+    dplyr::mutate(k = pmin(k, 4L)) |>
+    dplyr::group_by(k) |>
+    dplyr::summarise(cells = dplyr::n(), both = sum(hasA & hasB),
+                     observed = round(mean(hasA & hasB), 3), .groups = "drop") |>
+    dplyr::mutate(pair = label,
+                  `if one clone` = round(1 - p^k - (1 - p)^k, 3))
+}
+
+dplyr::bind_rows(
+  curve_for("IS01", "IS02", "IS01 + IS02 — same mouse (B0303)"),
+  curve_for("IS02", "IS04", "IS02 + IS04 — different mice (control)")) |>
+  dplyr::select(pair, molecules = k, cells, both, observed, `if one clone`) |>
+  knitr::kable()
+```
+
+| molecules in the cell | IS01 + IS02, same mouse | if one clone | IS02 + IS04, different mice |
+|---|---|---|---|
+| 1 | 0 / 491 | 0.000 | 0 / 389 |
+| 2 | **12 / 114 = 0.105** | 0.493 | 0 / 91 |
+| 3 | **7 / 22 = 0.318** | 0.739 | 0 / 20 |
+| 4+ | 1 / 8 = 0.125 | 0.864 | 0 / 8 |
+
+**There is a dose–response, and the matched control is flat at zero.** Sharing rises with detection
+depth for the same-mouse pair — 0, then 10.5%, then 31.8% — and stays at exactly zero for the
+cross-mouse pair at every depth including the eight deepest cells. At matched depth `k = 2` the
+contrast is 12 of 114 against 0 of 91, Fisher exact *p* = 0.0014. Doublets and correlated detection
+do not produce a depth gradient in one pair and a flat zero in another; partial detection of a
+shared founder does.
+
+**But the gradient tops out around a quarter of what full sharing predicts** — 0.105 against 0.493
+at `k = 2`, 0.318 against 0.739 at `k = 3`. Taken at face value that says roughly a quarter to a
+third of these cells carry both proviruses and the rest carry one: a double-insertion sub-clone
+inside B0303 rather than a single founder carrying everything. That also explains the inconsistent
+implied sizes the pair-counting produced — IS01 + IS02 implying 2,312 cells against IS01 + IS06
+implying 365 — which the previous draft could only record as a caveat.
+
+**One piece of internal consistency, worth stating because the hypothesis has little else.** IS03 is
+a B0303 site with 130 cells and it appears in **none** of the 26 co-occurrences. Under the
+sub-clone reading that is exactly right: IS03 is an independent clone in the same mouse. Under a
+doublet mechanism its absence would be unexplained, since doublets do not know which sites travel
+together.
+
+**Verdict.** Doublets and ambient are excluded as the dominant mechanism, by a control that
+survives the one objection that would have killed it. A **double-insertion sub-clone inside B0303**,
+carrying IS01 and IS02 in perhaps a quarter to a third of its cells, is the reading that fits both
+the cross-mouse contrast and the depth gradient; IS03's absence from every co-occurrence is
+consistent with it. The original "multi-copy founders are absent" was wrong, and the "undetermined"
+that replaced it was too weak.
+
+What is still open is the structure, not the existence: how many founders B0303 holds, whether IS06
+and IS08 belong to the same sub-clone, and how much of the shortfall against full sharing is a real
+sub-clone fraction rather than residual correlated detection. The `ambiguous` flag stays as it is so
+downstream work can decide for itself.
 
 What the data *does* settle is **replicate separation**, and the genome-mapped channel sharpened it
 considerably. Every site is mono-replicate — the dominant hashtag class accounts for 96–100% of each
@@ -1274,17 +1446,20 @@ Sites in different animals are necessarily distinct founders, whatever the withi
 proves to be. The change from the previous run is B0304: it had exactly one site, and now it has six,
 headed by IS10 at 99 cells. The seven B0303 sites remain unresolved against each other.
 
-### Clone size: why the capture–recapture estimate is not reportable
+### Clone size: a detection rate that works, and a capture–recapture that cannot
 
 The two channels read the same junctions through different reads, so the tempting argument writes
 itself: a cell carrying a clone can be captured by either channel, the overlap between them measures
 the capture probability, and Chapman's `(n₁+1)(n₂+1)/(m+1) − 1` turns that into the clone size
-*including* the cells neither channel saw. `channel_capture_recapture.csv` carries that calculation.
+*including* the cells neither channel saw. `channel_capture_recapture.csv` carries that calculation,
+and the estimate that replaces it.
 
 ```{r channel-overlap}
 readr::read_csv(file.path(sites_dir, "channel_capture_recapture.csv"), show_col_types = FALSE) |>
   dplyr::transmute(site_id, detected, umis_per_cell = round(umis_per_cell, 2),
-                   frac_one_umi = round(frac_one_umi, 2), n_three, n_genomic, m_both,
+                   frac_one_umi = round(frac_one_umi, 2),
+                   lambda = round(lambda, 2), detection = round(detection, 3), n_ztp,
+                   n_three, n_genomic, m_both,
                    chapman = round(chapman), `± se` = round(chapman_se),
                    m_expected = round(m_exp_molecule, 1), ratio = round(m_ratio, 2)) |>
   DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 15, scrollX = TRUE)) |>
@@ -1292,11 +1467,19 @@ readr::read_csv(file.path(sites_dir, "channel_capture_recapture.csv"), show_col_
 ```
 
 It returns 650–950 cells for the four largest sites against 130–342 detected: the assay would be
-seeing a third to a half of each clone. **That number is not reportable, and the two columns after it
-are why.**
+seeing a third to a half of each clone. **That number has no referent in this design**, and the
+reason is structural rather than a matter of bias.
 
-Lincoln–Petersen needs the two captures to be independent given the cell, and here they are not
-close to it. Which channel a junction read falls in is decided by where its fragment straddles the
+**It is a partition, not two samples.** Lincoln–Petersen estimates a population from two independent
+*samples* of it. These two channels are not two samples — they are a partition of one. Every junction
+molecule belongs to exactly one channel, decided by where its fragment straddles the junction: more
+vector than host and it is read against the contig, more host than vector and it is read against the
+genome. Nothing is released and recaptured, so there is no capture probability to estimate, and
+`n₁n₂/m` is not a biased estimate of the clone — it is a ratio of two halves of one draw. No
+correction rescues a quantity that has nothing to refer to.
+
+The molecule model makes that concrete and predicts the overlap, which is the useful thing a wrong
+model can do. Which channel a junction read falls in is decided by where its fragment straddles the
 junction — more vector than host and it reads against the contig, more host than vector and it reads
 against the genome — and every read of one UMI is a duplicate of one fragment. **The draw happens
 once per molecule, not once per read**, so a cell can appear in both channels only if it holds at
@@ -1320,19 +1503,45 @@ molecules collapsed together by a shared UMI. That residual is *positive* correl
 `N̂` **down**, while the one-molecule mechanism biases it **up**. Two demonstrable biases in opposite
 directions, neither pinned down well enough to net out against the other.
 
-**What to report is `detected`, as a floor.** `chapman` stays in the table because an argument this
-tempting should be inspectable rather than deleted, greyed out because it is not a result. IS05 is
-the one site where the estimate and the count nearly agree — 61 against 57 — and it is also the only
-site averaging 2.6 molecules a cell rather than ~1.1, which is the whole argument in one row.
+#### The estimate the section actually needs
 
-One cross-check is worth recording, because it comes from the other direction entirely. If IS01 and
-IS02 mark one clone — which the cross-mouse control above now favours — inverting their co-occurrence
-gives 2,312 cells in Rx_4 and 3,164 in Rx_6. Chapman, from the channel overlap, gives 948 and 648 for
-the same two sites. Both are biased, in ways that are understood and not equal, and they disagree by
-a factor of three or four — but they agree on the order of magnitude, **10³ cells against 318 and 342
-detected**. That is the most that can honestly be said: the clones are large, the detected counts are
-a floor of a few per cent to a few tens of per cent, and no single number here deserves to be quoted
-as the clone size.
+The same molecule counts that invalidate the overlap support a different estimator, and this one does
+have a referent. If a clone's cells each yield Poisson(λ) *detected* junction molecules, the cells
+with zero are exactly the ones missing from the table, and the mean of the **zero-truncated**
+distribution — `λ / (1 − e^−λ)` — identifies λ from the cells in hand. Then `1 − e^−λ` is a per-cell
+detection rate and `detected / (1 − e^−λ)` a clone size. No second sample is required.
+
+| site | detected | molecules/cell | λ | detection | clone size | Chapman, for contrast |
+|---|---|---|---|---|---|---|
+| IS05 | 57 | 2.65 | 2.41 | **91%** | **63** | 61 |
+| IS02 | 342 | 1.35 | 0.64 | 47% | 728 | 648 |
+| IS11 | 25 | 1.24 | 0.45 | 36% | 69 | 53 |
+| IS08 | 10 | 1.20 | 0.38 | 31% | 32 | 15 |
+| IS01 | 318 | 1.13 | 0.24 | 22% | 1,480 | 948 |
+| IS10 | 99 | 1.12 | 0.23 | 21% | 476 | 244 |
+| IS03, IS04, IS09, … | | ≤ 1.08 | — | — | — | |
+
+**Read the top row and the bottom row together.** IS05 averages 2.65 molecules a cell and the
+estimator returns 63 against 57 detected — a 91% detection rate, tightly determined, and the one
+case in this data where the method can see what it is doing. Everything below it averages 1.1–1.4
+molecules a cell, where the fit is driven almost entirely by how far the mean sits above 1 and swings
+wildly for small changes in it. At a mean of exactly 1.00 the fit is degenerate — λ → 0, clone size
+→ ∞ — so the pipeline returns `NA` rather than a number for the nine sites at or below 1.08,
+including IS03 and IS04. **These are not nine missing values to be filled in later; they are the
+estimator correctly declining.**
+
+So: **`detected` is the floor and should be what gets quoted.** Where the molecule count supports it,
+detection runs at 21–47% for the large clones and 91% for IS05, which puts the large clones at order
+10³ cells — the same order the co-occurrence inversion reaches from the other direction (2,312 for
+IS01 + IS02). `chapman` stays in the CSV as an audit trail, greyed out, because an argument that
+tempting should be inspectable rather than deleted.
+
+Three routes now bear on the size of the two large B0303 clones, and they are independent of each
+other in what they assume: the zero-truncated Poisson gives 728 and 1,480 from molecule counts alone,
+the co-occurrence inversion gives 2,312 from the assumption that IS01 and IS02 share a founder, and
+Chapman gives 648 and 948 from a design that cannot support it. They disagree by a factor of three.
+They agree that the answer is **order 10³ against 318 and 342 detected**, and that is the most that
+should be claimed.
 
 # Limitations
 
@@ -1364,6 +1573,33 @@ return zero hits at every clip length from 10 bp up, which also audits the ancho
 has no junction and any hit passing it would mean the test is mis-implemented. Below 10 bp they
 return 2, which is what set `min_assign`.
 
+**The genome-mapped channel needed its own decoy, and it is a different decoy.** The flank decoys
+bound assignment and say nothing about the channel that now calls four sites on its own and carries
+IS10's 99 cells. That channel's claim is narrower: a read the aligner placed at MAPQ 255, whose
+soft-clipped end matches the last 13 bases of the provirus terminus within the absorption window, is
+a junction read. `genomic_decoy_rate()` tests how often that is true of a terminus that cannot be
+there — the same 13 bases **permuted to the same composition**, which matters, because the real
+13-mer `AAAATCTCTAGCA` carries six adenines and a permutation of the whole 18-base terminus leaves
+only three. A-rich *k*-mers are commoner in a mammalian genome, so a composition-mismatched decoy
+understates the rate in the direction that flatters the channel.
+
+On chr19 in Rx_4 — 27.6M alignments, a slice that contains a real site with 29 reads —
+`CCTACAAAGTTAA` returns **zero hits**. Nothing else on that chromosome in that tube looks like a
+junction once the terminus is scrambled. Stated as a bound rather than as a zero: 0 observed puts a
+95% Poisson ceiling of 3 events on that slice, against 29 real.
+
+That is one chromosome and one tube, so it is a real measurement on a real slice and not yet the
+channel's error rate. **The genome-wide pass is running** — `scripts/slurm/analysis/integration-sites-decoy.sh`,
+job 35768797, ~1 h 50 m — and will convert the one-slice ceiling into a bound on the quantity that
+matters: false junction reads among the 1,422 this channel contributed, which on the chr19 result
+should land under 3 per tube at 95%, or under 0.4% of Rx_4's 800. **The number below is from one
+chromosome until that job lands; the figure to quote is in `genomic_decoy_rate.csv`.**
+
+It is a separate job rather than a stage of the main one because it costs what the genomic scan
+costs, and a control must not sit on the critical path of a run someone is waiting for. It reads the
+real counts from the genomic stage's cache instead of rescanning for them, which is the difference
+between ~1 h 50 m and ~3 h 30 m.
+
 The `≥3 cells and ≥3 UMIs` threshold remains the one genuinely arbitrary parameter in the chain. It
 is also now demonstrably costing real sites: chrX:100,691,113 sat at 2 cells in the 3′ channel and
 was recovered only by searching the single position its 5′ partner predicts.
@@ -1377,31 +1613,73 @@ Separately, read-through termination is multi-site: the vector-portion length di
 shows at least three over-represented positions at molecule level (reads per UMI is flat at ~1.5
 across it), so a λ built on a single termination site is also misspecified.
 
-**Leakage into the mCherry⁻ tubes is animal-structured, not site-structured — but the animal is
-B0304, not B0301.** This is a correction. Counting only sites with at least ten cells, so that no
-site's fraction rests on two or three detections:
+**Leakage into the mCherry⁻ tubes was reported here as animal-structured. On the proper
+denominator it is not, and the correction is instructive.** The figures were B0304 14.0% of its
+labelled cells in the mCherry⁻ tubes, against 3.6% for B0301 and 0.2% for B0303 — a seventy-fold
+spread. Those numbers are arithmetically correct and they measure the wrong thing: they are the
+*composition* of each mouse's labelled cells, and composition follows where that mouse's cells were
+sorted.
 
-| replicate | cells | in Rx_3 or Rx_7 | fraction |
-|---|---|---|---|
-| B0304 | 193 | 27 | **14.0%** |
-| B0301 | 197 | 7 | 3.6% |
-| B0303 | 810 | 2 | 0.2% |
+```{r leakage-rates}
+# Per-mouse, per-sort-fraction cell counts, from the hashtag call. The denominator is the only thing
+# that makes the labelled counts comparable, and it is the quantity the metadata queries asked for.
+sort_of <- function(tb) ifelse(tb %in% c("Rx_4", "Rx_6"), "mCherry+", "mCherry−")
+mouse_cells <- embedding |>
+  dplyr::filter(tube %in% c("Rx_3", "Rx_4", "Rx_6", "Rx_7"),
+                grepl("^TotalSeq-B03", as.character(replicate))) |>
+  dplyr::transmute(cell, tube, mouse = sub("^TotalSeq-", "", replicate), sort = sort_of(tube))
 
-A seventy-fold spread across three animals in the same experiment, carried almost entirely by IS10
-at 26 of 99 cells. The previous run saw B0301 as the only leaking animal because B0304 had only one
-detected site and that site, IS05, happens not to leak at all. The structure is real and it survived;
-the attribution did not.
+dplyr::left_join(
+  dplyr::count(mouse_cells, mouse, sort, name = "cells"),
+  labelled |>
+    dplyr::inner_join(dplyr::select(mouse_cells, cell, mouse), by = "cell") |>
+    dplyr::distinct(cell, mouse, tube) |>
+    dplyr::mutate(sort = sort_of(tube)) |>
+    dplyr::count(mouse, sort, name = "labelled"),
+  by = c("mouse", "sort")) |>
+  dplyr::mutate(labelled = tidyr::replace_na(labelled, 0L),
+                `rate` = sprintf("%.3f%%", 100 * labelled / cells)) |>
+  knitr::kable()
+```
 
-Three sites sit at 100% — IS07, IS13 and IS14, with 3, 6 and 2 cells. Those are **selection, not
-leakage**: each was called *because* of cells in the negative fractions, so the fraction cannot come
-out as anything else, and they are excluded from the table above for that reason.
+B0304 has **92.0%** of its cells in the mCherry⁻ fraction — 20,817 of 22,632 — against 33.7% for
+B0301 and 35.6% for B0303. Divide by that and the picture changes completely. (The figures below are
+counted over every barcode the demultiplexer called; the table above recounts over this report's
+embedding, so the two differ by whatever QC dropped. The ratios are not sensitive to that.)
 
-IS10's leak is not a channel artefact, which is the first thing to check given that the 3′ channel
-cannot see the site at all. Of its 21 cells in Rx_3, 13 come from the genome-mapped channel and 8
-from 3′ clips placed against the mini-reference. Both channels see it.
+| mouse | cells, mCherry⁺ | cells, mCherry⁻ | rate, mCherry⁺ | rate, mCherry⁻ | ⁻ as % of ⁺ |
+|---|---|---|---|---|---|
+| B0301 | 18,122 | 9,217 | 0.94% | 0.054% | **5.8%** |
+| B0303 | 17,557 | 9,724 | 3.74% | 0.103% | **2.7%** |
+| B0304 | 1,815 | 20,817 | 7.93% | 0.130% | **1.6%** |
 
-The pattern still tracks the animal rather than the integration site, so it is still not explained by
-the per-clone expression finding above. Two real observations, no causal link between them.
+The per-cell detection rate in the mCherry⁻ fraction spans 0.054% to 0.130% — a factor of 2.4, not
+70 — and measured against each mouse's *own* mCherry⁺ rate, B0304 leaks the **least** of the three.
+The earlier conclusion is withdrawn in both of its versions: it is not B0301 and it is not B0304.
+
+This is the second time in this report that a composition has been mistaken for a rate, the first
+being the labelled-cell denominator in the co-occurrence test. Both times the error produced a
+large, clean-looking number pointing at a real-sounding conclusion. The guard is mechanical: **never
+divide labelled cells by labelled cells.**
+
+**What is left, and it is the more interesting finding.** B0304's cells are 92% mCherry⁻ while the
+other two mice are near a third, and its mCherry⁺ cells carry the highest detection rate of any
+mouse at 7.93%. That is a statement about the animal — engraftment, sorting, or vector expression —
+and not about any integration site. It is the same phenomenon as the IS05 question below, in the
+same mouse, and the two should be treated as one open item.
+
+**IS10 follows from that, and nothing should be read into its mCherry⁻ fraction.** IS10 is a B0304
+clone — 87 of 87 singlet-called cells — and its 26% mCherry⁻ fraction is its mouse's sorting
+composition, not a property of the locus. Per cell it runs at 0.125% in the negative fraction
+against 4.02% in the positive, a ratio of 3.1% against B0304's 1.6% overall: the same order, nothing
+anomalous. **No silencing or position-effect claim should be built on IS10.**
+
+**The 20 bp clustering window is not hiding junction-base scatter.** Reads are merged into sites
+within `cluster_window = 20`, which could in principle absorb a spread of nearby junction positions
+into one call and make a fuzzy site look exact. It does not: of the 1,396 genome-mapped reads that
+fall inside a called site, **every one sits at offset exactly 0** from that site's junction base — one
+distinct position per site, at all fifteen. The window could be set to 1 and nothing in this channel
+would change. Integration is a point event and these reads resolve it to the base.
 
 **Clip length biases which loci are findable, and that bias is now measured rather than asserted.** A
 junction whose flanking host sequence is repetitive yields clips that align at MAPQ 0 and is silently
@@ -1413,9 +1691,14 @@ still enriched for integrations into sequence unique *at 130 bp* — which is al
 partly confounding the intragenic enrichment used above as a sanity check.
 
 **A replicate's absence from a compartment may be sampling, not biology.** B0304 contributes 1,399
-cells to Rx_4 but only **108** to Rx_6. At IS05's detection rate in Rx_4 (2.64%) that predicts ≈2.9
+cells to Rx_4 but only **108** to Rx_6 after QC (1,614 and 201 before it — the counts in the
+leakage table above are pre-QC, and the argument here uses the post-QC ones because the detection
+rate it multiplies is also post-QC). At IS05's detection rate in Rx_4 (2.64%) that predicts ≈2.9
 labelled cells in Rx_6 against 0 observed, *p* ≈ 0.055 — so the apparent "IS05 is HSC-only" pattern is
-not supported, and no lineage claim should be built on it. B0302 likewise has only 215 cells in Rx_4,
+not supported, and no lineage claim should be built on it. The same caution now has a second
+instance: IS05 is one of six B0304 sites rather than that animal's only clone, and IS10, IS11, IS12,
+IS14 and IS15 are all sampled from the 1,815 mCherry⁺ cells B0304 contributes against 17,557 for
+B0303. **Every B0304 result in this report rests on a tenth of the cells the other animals supply.** B0302 likewise has only 215 cells in Rx_4,
 so its zero labelled cells bound within-tube ambient only weakly (<~1.4%), far less tightly than the
 empty-droplet measurement above. B0304's hashtag-to-animal mapping used to be the one that could not be
 cross-checked by shared clones between compartments, because its only clone was the one missing from
