@@ -1,0 +1,159 @@
+---
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# REPORT TEMPLATE — copy, don't render this file.
+#
+#   1. mkdir notebooks/<name> && cp notebooks/_report-template.qmd notebooks/<name>/<name>.qmd
+#   2. In _targets.R, Reports section:
+#        quarto_report(report_<name_with_underscores>, "<name>", utilities_r),
+#      plus any file the report reads outside targets (config_yaml, a CSV in output/objects/, ...)
+#   3. Replace every <...> below; delete the guidance comments (<!-- ... --> and # TEMPLATE:).
+#   4. tools/quarto.sh render notebooks/<name>/<name>.qmd   (or targets::tar_make(report_<name>))
+#
+# Style (theme, TOC, numbered sections, code folding, figure size/dpi, click-to-zoom lightbox,
+# ragg plots, author, date) comes from _quarto.yml: set here only what this report changes.
+# Files starting with _ are not rendered by Quarto, so this template never builds by itself.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+title: "<Short title — what is measured / compared>"
+subtitle: "<One line: the question this report answers>"
+---
+
+{{< include ../_provenance.qmd >}}
+
+<!-- QUESTION FIRST. One or two paragraphs: what is asked, why it matters for the MPL project,
+     which compartments / samples, and what the reader should take away. Write the conclusion here
+     once the analysis is done, so the report can be read from this paragraph alone. -->
+
+**Question.** <What do we want to know?>
+
+**Short answer.** <Filled in last: the finding in one or two sentences, with the key number.>
+
+```{r}
+#| label: setup
+#| include: false
+library(targets)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+source("src/R/scrna-seq_utilities.R")   # list utilities_r in this report's quarto_report() line
+source("tools/R/provenance.R")
+out <- report_dir()   # artifacts/ next to the HTML: save figures/tables here (emptied each render)
+
+theme_set(theme_bw(base_size = 11))
+tar_load(colors_vec)                    # cell-type colours from the config (plotting: colours:)
+compartments <- c("Stroma", "HSC", "MNC")
+condition_levels <- c("WT", "Het mCh−", "Het mCh+")
+```
+
+<!-- LOADING RULES
+     - Read targets by their literal name: tar_read(x) / tar_load(x). The pipeline scans for these to
+       link the report to its inputs; tar_read_raw(paste0(...)) is invisible to it, so the report
+       would not re-render when that input changes.
+     - Prefer small extract targets (data frames: metadata, UMAP coordinates, counts of a few genes)
+       to whole Seurat objects. If a Seurat object is needed: load → extract → rm() + gc().
+     - Parameters: tar_load(qc_params) / tar_load(proc_params), never hard-coded numbers or paths.
+     - Chunk options that depend on data: #| eval: !expr isTRUE(get0("FLAG")) — a bare !expr FLAG
+       breaks the pipeline's dependency scan, which runs before the report's own code. -->
+
+```{r}
+#| label: load
+# TEMPLATE: one small target per compartment, read by name
+meta <- list(
+  Stroma = tar_read(<target_stroma>),
+  HSC    = tar_read(<target_hsc>),
+  MNC    = tar_read(<target_mnc>)
+) |>
+  bind_rows(.id = "compartment") |>
+  mutate(compartment = factor(compartment, levels = compartments))
+```
+
+# Data
+
+<!-- What goes in: which cells (after QC? which sort fractions?), how many per sample, and anything
+     unusual about them. A table the reader can check numbers against. -->
+
+```{r}
+#| label: cell-counts
+meta |>
+  count(compartment, sample.name, name = "cells") |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 20))
+```
+
+# <Result 1 — a heading that states the finding, e.g. "mCh+ HSCs shift towards the MK branch">
+
+<!-- One section per result. Pattern: a sentence on what the figure shows → the figure (with a
+     caption) → a paragraph on what it means and what it does NOT show (caveats, alternatives). -->
+
+<What this figure shows and how to read it.>
+
+```{r}
+#| label: fig-result-1
+#| fig-cap: "<Caption: what is plotted, what each point/colour is. Shown as the lightbox title.>"
+#| fig-width: 10
+#| fig-height: 4
+p <- ggplot(meta, aes(<x>, <y>, colour = <group>)) +
+  geom_point(size = 0.3) +
+  facet_wrap(~ compartment, nrow = 1) +
+  labs(x = NULL, y = NULL, colour = NULL)
+ggsave(file.path(out, "result-1.png"), p, width = 10, height = 4, dpi = 300)   # for slides / sharing
+p
+```
+
+<Interpretation. Refer to the figure as @fig-result-1. Give the numbers, not just the direction.>
+
+## Per compartment
+
+<!-- Repeated plots for several compartments/samples go in tabs, not one under another. -->
+
+::: {.panel-tabset}
+
+```{r}
+#| label: per-compartment
+#| output: asis
+#| fig-width: 8
+#| fig-height: 5
+for (cmp in compartments) {
+  cat("### ", cmp, "\n\n", sep = "")
+  print(
+    ggplot(filter(meta, compartment == cmp), aes(<x>, <y>)) +
+      geom_point(size = 0.3) +
+      labs(title = cmp)
+  )
+  cat("\n\n")
+}
+```
+
+:::
+
+## Table
+
+<!-- Tables: searchable DT for anything over ~10 rows; round numbers; name columns in words. -->
+
+```{r}
+#| label: tbl-result-1
+result_tbl <- meta |>
+  group_by(compartment, sample.name) |>
+  summarise(cells = n(), .groups = "drop")
+write.csv(result_tbl, file.path(out, "result-1.csv"), row.names = FALSE)
+DT::datatable(result_tbl, rownames = FALSE, filter = "top",
+              caption = "<What each row is.>")
+```
+
+# Caveats
+
+<!-- What could make the result wrong: low cell numbers, one tube per condition (HTO replicates are
+     not biological replicates), ambient RNA, cell-cycle effects, thresholds chosen by eye. -->
+
+- <Caveat 1>
+- <Caveat 2>
+
+# Methods
+
+<!-- Enough to reproduce or write up: the pipeline targets used (by name), tools and versions that
+     matter, parameters (with their config key), statistical tests and multiple-testing correction. -->
+
+- **Input:** `<target names>` (built by the pipeline; see Provenance above).
+- **Method:** <tool / function, key parameters and where they are set in metadata/project_config.yaml>.
+- **Statistics:** <test, correction, thresholds>.
+
+{{< include ../_session-info.qmd >}}

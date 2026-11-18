@@ -32,9 +32,19 @@ format:
     df-print: paged           # data frames as paged, sortable tables
     fig-width: 7
     fig-height: 5
+    fig-dpi: 150              # sharper plots than the default 96 dpi, readable when zoomed in
+    # Click any plot to open it full-screen (Quarto's built-in GLightbox); arrows / swipe step through
+    # the report's plots, Esc closes. An image can opt out with {.nolightbox}.
+    lightbox:
+      match: auto
+      effect: zoom
     anchor-sections: true
     smooth-scroll: true
     embed-resources: false    # keep large reports fast; always share the whole report folder
 
 execute:
   message: false              # keep package startup messages out of reports
+
+knitr:
+  opts_chunk:
+    dev: ragg_png             # ragg: crisper text and faster than the default png device, no Cairo size limits

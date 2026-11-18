@@ -9,28 +9,6 @@ format:
     code-fold: true
     code-tools: true
     number-sections: true
-    include-after-body:
-      text: |
-        <style>
-        #ql-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.92);z-index:9999;cursor:zoom-out}
-        #ql-overlay img{max-width:95vw;max-height:95vh;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);box-shadow:0 0 40px rgba(0,0,0,.8)}
-        </style>
-        <div id="ql-overlay" onclick="this.style.display='none'"><img id="ql-img" src=""></div>
-        <script>
-        document.addEventListener('DOMContentLoaded',function(){
-          document.addEventListener('click',function(e){
-            var img=e.target;
-            if(img.tagName==='IMG'&&!img.closest('#ql-overlay')){
-              document.getElementById('ql-img').src=img.src;
-              document.getElementById('ql-overlay').style.display='block';
-              e.preventDefault();
-            }
-          });
-          document.addEventListener('keydown',function(e){
-            if(e.key==='Escape')document.getElementById('ql-overlay').style.display='none';
-          });
-        });
-        </script>
 execute:
   echo: false
   warning: false
