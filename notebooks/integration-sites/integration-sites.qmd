@@ -362,6 +362,43 @@ for assignment only because assignment is not a search: the flank set is ~3.6 kb
 on one exact offset, and the decoys measure what that costs. 13 bp is not a discovery floor either —
 it is a confirmation on a read whose coordinate came from 120–140 bases of host.
 
+### How low the assignment floor could go, measured
+
+`min_assign = 10` was set from decoy hits in coarse length bands. `clip_table.csv.gz` now carries
+every clip against every flank at every mismatch count with **no floor applied**, so the question can
+be asked one base at a time. The 100 decoy flanks are the instrument: a decoy has no junction, so a
+decoy match at a given length *is* the chance rate, and there is no sample-size limit because decoys
+can be cut at will.
+
+Requiring an **exact** match (`nm == 0`):
+
+| clip length | molecules | matched exactly one real site | hit ≥1 decoy | decoy flanks hit, mean |
+|---|---|---|---|---|
+| 1 bp | 13 | 0 | **13 of 13** | 44.5 |
+| 2 bp | 14 | 2 | **14 of 14** | 11.1 |
+| 3 bp | 4 | 3 | 4 of 4 | 4.0 |
+| 4 bp | 17 | 13 | 10 of 17 | 0.82 |
+| 5 bp | 11 | 10 | 1 of 11 | 0.09 |
+| **6 bp** | **28** | **28 (100%)** | **0** | **0.00** |
+| 7–24 bp | 319 | 319 (100%) | 0 | 0.00 |
+| 25 bp + | 429 | 429 (100%) | 0 | 0.00 |
+
+**The floor could go to 6 bp, and not below.** At 6 bp every molecule matches exactly one real site
+and none of the 100 decoys; at 5 bp one in eleven hits a decoy, at 4 bp more than half do, and at
+1–2 bp a clip matches most of the decoy set — which is the ambiguity the floor exists to prevent,
+visible at last rather than inferred. Read it as a bound: zero hits in 28 × 100 comparisons, not a
+demonstrated zero.
+
+Two conditions. It requires exact matching — under the `L %/% 10` mismatch budget the assignment tier
+normally applies, a one-base clip is allowed one mismatch and therefore matches *everything*, and
+decoy hits persist to 8 bp. And the yield is small: **73 assignments over 47 previously unlabelled
+cells, 4.0% on 1,186**, spread across nine sites. The global check holds — **zero** wild-type-tube
+assignments are added, against the 2 of 1,213 already there.
+
+**The floor is left at 10 here.** Changing it moves every downstream number, the gain is four per
+cent of cells, and it would have to arrive with the mismatch budget changed underneath it. The
+measurement is recorded so the decision is costed rather than argued.
+
 ```{r clip-length}
 junction_clips <- anchor_ends %>%
   dplyr::filter(anchor_end == JUNCTION, !polya)
@@ -1531,13 +1568,33 @@ of molecules predicts 430 — being wrong by a factor of three is what the molec
 worth, and why `cell_site_assignments.csv` carries `umis_three` and `umis_genomic` and not only the
 read counts.
 
-So the mechanism is real and large. It also does not close the question, and it would be dishonest to
-present it as though it did. The 40-cell excess over the molecule model is in the same direction at
-every site and `z = 6` overall, so something beyond molecule count makes the channels agree more
-often than independence-within-a-cell allows: residual heterogeneity in capture, or distinct
-molecules collapsed together by a shared UMI. That residual is *positive* correlation, which biases
-`N̂` **down**, while the one-molecule mechanism biases it **up**. Two demonstrable biases in opposite
-directions, neither pinned down well enough to net out against the other.
+So the mechanism is real and large. An earlier version of this section then reported a 40-cell
+excess of observed overlap over that prediction, `z = 6`, and attributed it to residual correlation in
+capture. **That excess was an artefact of counting, and the diagnostic that found it is one query.**
+
+Under the model a molecule has one anchor length and therefore falls in exactly one channel, so a
+cell holding a single molecule cannot appear in both. Ask whether the cells counted in `m` really
+hold two molecules:
+
+| of the 150 cells counted in both channels | |
+|---|---|
+| share at least one UMI between the channels | **72 (48%)** |
+| hold only **one** distinct molecule in total | **52 (35%)** |
+| `m` recounted on genuinely distinct molecules | **83**, against 150 as counted |
+
+73 of 1,434 molecules appear in both channels, so the split is **not a partition at the molecule
+level** — which is the assumption every channel-overlap estimator rests on — and a third of the
+apparent two-capture cells are one molecule counted twice. With `m` on distinct molecules the totals
+read 83 observed against 109.8 predicted, where before they read 150 against 109.8. The prediction
+sits between the two ways of counting, so the honest statement is that **the overlap is consistent
+with the per-molecule model and the earlier excess is withdrawn**. `m_distinct` and
+`cells_sharing_a_umi` are in the CSV so the arithmetic is inspectable.
+
+The consequence for the estimator is sharper than the consequence for the model. Any λ derived from
+the channel overlap inherits the inflated `m`: fitted on these data it exceeds the molecule-count λ
+at every site where both are defined, by 1.17× to 2.22×, in exactly the direction double counting
+predicts. **That estimator is therefore not used here.** The one below uses the molecule counts,
+which do not require the partition to hold.
 
 #### The estimate the section actually needs
 
@@ -1638,12 +1695,32 @@ On chr19 in Rx_4 — 27.6M alignments, a slice that contains a real site with 29
 junction once the terminus is scrambled. Stated as a bound rather than as a zero: 0 observed puts a
 95% Poisson ceiling of 3 events on that slice, against 29 real.
 
-That is one chromosome and one tube, so it is a real measurement on a real slice and not yet the
-channel's error rate. **The genome-wide pass is running** — `scripts/slurm/analysis/integration-sites-decoy.sh`,
-job 35768797, ~1 h 50 m — and will convert the one-slice ceiling into a bound on the quantity that
-matters: false junction reads among the 1,422 this channel contributed, which on the chr19 result
-should land under 3 per tube at 95%, or under 0.4% of Rx_4's 800. **The number below is from one
-chromosome until that job lands; the figure to quote is in `genomic_decoy_rate.csv`.**
+**The genome-wide pass has now run** (job 35768797, 2 h 00 m, all eight tubes), and the answer is
+not zero:
+
+| tube | Rx_1 | Rx_2 | Rx_3 | Rx_4 | Rx_5 | Rx_6 | Rx_7 | Rx_8 | total |
+|---|---|---|---|---|---|---|---|---|---|
+| real reads | 0 | 12 | 47 | 800 | 1 | 537 | 25 | 0 | **1,422** |
+| decoy reads | 0 | 2 | 3 | 1 | 0 | 4 | 0 | 5 | **15** |
+| decoy positions | 0 | 1 | 1 | 1 | 0 | 2 | 0 | 2 | 9 |
+
+**1.1% of reads, and no callable site.** The 15 decoy reads scatter over 9 positions across 8 tubes —
+at most a few reads at any one of them — while the 1,422 real reads concentrate at 47 positions, 800
+of them at 16 positions in Rx_4 alone. A site needs `min_cells` distinct cells and `min_umis`
+molecules at one base, and nothing in the decoy output approaches that. So the error rate to quote is
+**1.1% at the read level and zero at the site level**, which is the level the site list is built at.
+
+Two details worth keeping. **Rx_8 is the sharpest result in the table**: a wild-type tube, zero real
+reads, and 5 decoy reads — so in material with no provirus at all, the real 13-mer finds nothing and
+a composition-matched random one finds five. The real terminus is not merely better than chance here,
+it is cleanly separated from it. And at the cell level 1.1% of 1,396 folded-in reads is roughly 15
+reads, so of 1,186 labelled cells perhaps 15 could carry a spurious label — the same order as the
+ambient and doublet rates, and not concentrated anywhere.
+
+One limitation of this run, for whoever tightens it: `genomic_decoy_rate()` stores counts per tube,
+not cells per decoy position, so "no callable site" is inferred from reads-per-position rather than
+measured against the floor directly. That is the next thing to add if the bound ever needs to be
+airtight.
 
 It is a separate job rather than a stage of the main one because it costs what the genomic scan
 costs, and a control must not sit on the critical path of a run someone is waiting for. It reads the

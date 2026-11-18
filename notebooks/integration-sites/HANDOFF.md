@@ -293,10 +293,11 @@ registry.
 **What bounds the error in each tier.** The decoy flanks (100 of them, zero hits at 10 bp and above)
 bound the *assignment* tier. The genome-mapped channel has its own decoy now — `genomic_decoy_rate()`,
 run as the `genomic-decoy` stage — which repeats the scan with the terminus permuted to the same base
-composition. On chr19 in Rx_4, 27.6M alignments containing a real 29-read site, it returns **zero**.
-That is one chromosome of one tube: a real measurement on a real slice, not the channel's rate. The
-stage takes a chromosome argument so the bound can be tightened; a full pass costs what the genomic
-stage costs, which is why it is opt-in.
+composition. Genome-wide across all eight tubes (job 35768797, 2 h): **15 decoy reads against 1,422
+real, 1.1%**, scattered over 9 positions where the real reads concentrate at 47. No decoy position is
+dense enough to be called a site, so the rate is **1.1% at the read level and zero at the site
+level**. Rx_8 makes the point best: a wild-type tube with zero real reads and 5 decoy reads, so in
+material with no provirus the real 13-mer finds nothing and a random one finds five.
 
 Composition-match the decoy *k*-mer, not the whole terminus. The real 13-mer `AAAATCTCTAGCA` has six
 adenines; permuting all 18 bases leaves the tested 13 with three, and A-rich *k*-mers are commoner in
@@ -315,6 +316,38 @@ first attempt made exactly that mistake.
 | 1,186 → figures | 5 cells in the stroma tubes (in neither embedded panel) and 33 in no demultiplexer output, leaving 1,148 before QC. The 33 are missing rather than filtered and are worth a look |
 | ambient (#43) | holds, and the new channel is a check on it: junction-bearing barcodes went 568 → 669 while the non-cell count stayed at **15**. Signal added without background |
 | metadata queries 1–2 | computed from `demux_res_*`; see INFORMATION-GAPS. Query 3, the FACS mCherry⁺ fraction, is still outside the data |
+
+**The clip table (step 1 of the statistical-assignment plan), added 2026-11-18.**
+`clip_table.csv.gz` is one row per molecule — tube + barcode + UMI — with no floor applied, and
+`clip_matches.csv.gz` is every clip against every flank at every mismatch count. Three things about
+it matter more than the files:
+
+- **One matcher, several views.** `clip_site_matches()` is the only code that decides whether a clip
+  matches a flank; `assign_clips_exact()` is a two-line filter over it. It records `nm` and `budget`
+  per row rather than a 0/1 verdict, which is what lets a view ask a different question — exact
+  matching is `nm == 0`, a lower floor is one argument — and lets the gate prove the views agree.
+- **The gate is an equality that stops the run.** Filtered at the current floor, the match table must
+  return 15 sites / 1,213 assignments / 1,186 cells. It failed on first run and caught two real bugs:
+  a union across a molecule's reads that let a 5-base read's matches through a floor applied to its
+  30-base sibling (52 spurious assignments), and a dplyr trap where `clip_len = max(clip_len)`
+  followed by `clip = first(clip[clip_len == max(clip_len)])` in one `summarise()` selects an
+  arbitrary row, because by the second line `clip_len` is already the scalar.
+- **The gate belongs on reads, not molecules.** The assignment tier is a per-read filter, so only a
+  per-read view can reproduce it to the row. The molecule table is a convenience built on top.
+
+With it, the floor question is measured rather than argued: under exact matching the 100 decoy flanks
+are clean from **6 bp** up and dirty below (1 of 11 molecules at 5 bp, 10 of 17 at 4 bp, all of them
+at 1–2 bp). Lowering 10 → 6 would add 73 assignments over 47 new cells, 4.0%, with no wild-type
+additions. **The floor stays at 10**; the measurement is recorded so the choice is costed.
+
+**Writes are verified now, because they were silently truncating.** On 2026-11-18 the `/well/ludwig`
+fileset hit its 391 TB limit with ~23 GB left and writes into `output/` began returning short files —
+no header, no error, no warning. A deliberate 5,000-row write produced 88 lines. Four outputs were
+corrupted that way including `cell_site_assignments.csv`, which the report reads. Every table now
+goes through `write_csv_checked()`, which counts the lines back and errors on a mismatch; it caught
+three further truncations and halted instead of leaving plausible-looking corruption. The two large
+artefacts are gzipped (18× smaller) for the same reason. **Do not remove either guard** — the
+filesystem is shared and the condition will recur.
 
 Three checks the pipeline never used as input, so they are genuinely independent:
 
