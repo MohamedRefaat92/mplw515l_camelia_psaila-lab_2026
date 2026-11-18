@@ -974,7 +974,19 @@ summarise_sites <- function(hits, gtf, tubes) {
 
   dplyr::bind_cols(per_site, annotate_positions(per_site$chrom, per_site$pos, gtf)) |>
     dplyr::left_join(per_tube, by = "site_id") |>
-    dplyr::select(site_id, chrom, pos, strand, gene, gene_type, gene_strand, context,
+    # Does this site's read-through signal get counted as its HOST GENE's expression? Cell Ranger
+    # tags these reads with the host gene and sets the xf bit that makes them a UMI count, so for an
+    # affected site the carrying cells gain host-gene UMIs that are vector transcript - in exactly
+    # the cells any cis-effect test would compare. Measured: 20.9% of carriers' Abhd17c UMIs at IS04,
+    # 23.5% of Gm35330 at IS10, 12.1% of Stau2 at IS11, 2.3% of Hells at IS03.
+    #
+    # It needs BOTH conditions, and the second is what keeps it off most sites. The read has to land
+    # inside the gene, and it has to be in the gene's own orientation: an antisense read is tagged
+    # but not counted. Checked against the data at six sites and the rule predicted all six - the
+    # three same-sense intragenic ones carry 2-24% junction UMIs, the three antisense ones 0.0%,
+    # 0.4% and 0.0%.
+    dplyr::mutate(cis_confound = grepl("^intragenic", context) & strand == gene_strand) |>
+    dplyr::select(site_id, chrom, pos, strand, gene, gene_type, gene_strand, context, cis_confound,
                   reads, cells, umis, dplyr::starts_with("cells_"))
 }
 

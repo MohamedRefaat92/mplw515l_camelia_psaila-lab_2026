@@ -795,7 +795,22 @@ larger one:
 A canonical `GT`–`AG` intron running from a *Hells* exon donor into the provirus. For those 32 reads
 this is not read-through at all but **splicing** from a host exon into the vector, which makes it a
 third channel — and one carrying more reads than IS03's own read-in junction (32 against 27), though
-at gene-level rather than base-pair resolution. The pipeline correctly declines to call it a second
+at gene-level rather than base-pair resolution.
+
+**The reads carry physical confirmation of the splice, and it was found by chasing what looked like
+a bug.** 33 of the 76 placed 5′ hits end in a 4-base soft clip — `bwa` aligns the clip and then
+refuses its last four bases. A constant 4-base tail next to a TSD test that expects Δ = 4 looks
+exactly like a coordinate error, so it was run down. All 33 sit at the two spliced junctions
+(`38,932,385` and `38,932,221`), and in every one the four refused bases are **`ATTC`** — the last
+four bases of IS03's duplicated span `GATTC`, which lies **1,357 bp away** at the integration site.
+The host sequence immediately after the exon is `GTAA`, the intron's donor, so `bwa` is right to stop
+there and right to refuse `ATTC`: no contiguous alignment exists.
+
+So the clip physically contains a *Hells* exon joined directly to the target-site duplication of the
+provirus, with the intron absent. That is the splice, in the read, at base resolution — independent
+of the GTF query and the consensus lookups above, which is what makes it worth the detour. It also
+clears the absorbed-base repair in `read_five_prime_clips()`: the four bases are real host sequence
+carried across the splice, not an over-extension. The pipeline correctly declines to call it a second
 integration: `tsd_check()` labels anything beyond 50 bp a `distinct locus` rather than a failure of
 the nearby site. The 1-read neighbour at 38,932,221 has no `GT` after it and remains unexplained.
 
@@ -883,6 +898,27 @@ dplyr::tibble(
              dplyr::n_distinct(labelled$cell))
 ) %>% DT::datatable(rownames = FALSE, options = list(dom = "t"))
 ```
+
+**Where the labelled cells go, since the pipeline's count and the figures' count differ and the
+difference should be named rather than noticed.** The pipeline writes **1,213 assignments over 1,186
+distinct cells**. Counted outside the Seurat objects, they sit in the tubes like this:
+
+| tube | Rx_1 | Rx_2 | Rx_3 | Rx_4 | Rx_5 | Rx_6 | Rx_7 |
+|---|---|---|---|---|---|---|---|
+| labelled cells | 1 | 5 | 36 | 665 | 1 | 466 | 12 |
+
+and reach the joined table above by two subtractions:
+
+- **−5** in the stroma tubes, Rx_1 and Rx_2. Those tubes are in neither embedded panel — the HSC
+  panel is Rx_3/4/5 and the MNC panel Rx_6/7/8 — so their cells cannot join and drop out of every
+  figure below. One of them is the Rx_1 wild-type cell discussed under Limitations.
+- **−33** present in the pipeline but in no demultiplexer output at all. These are barcodes Cell
+  Ranger called as cells, and whose reads carry a junction, that the demultiplexing step did not
+  receive. 2.8% of the labelled cells, and worth a look: they are not filtered, they are missing.
+
+That leaves **1,148** reaching the join before any QC, and the `pass_cell` row in the table above is
+the last step. Only the render can produce that number, because `pass_cell` lives in the Seurat
+objects; everything above it is reproducible from the CSVs alone.
 
 Two separate drops are expected. Assignments in tubes these objects do not cover — the stroma tubes —
 fall out at the second row. The larger drop is at the third: the extraction uses every barcode Cell
@@ -1561,10 +1597,24 @@ assumes comparable depth.
 **Small sites sit near the background, and the wild-type tubes do not bound all of it.** A wild-type
 tube bounds *cross-tube* error — index hopping and carry-over — and nothing else. It cannot bound
 within-tube ambient, where every lysed mCherry⁺ cell sheds vector RNA into the shared soup. That is
-measured separately from sub-threshold droplets: 15 of 568 junction-bearing barcodes in Rx_4 and Rx_6
-are not called cells, a 2.6% ambient fraction, against 2.56M empty droplets and 20,514 cells in Rx_4.
-Per-droplet the ambient junction rate is ~3.9 × 10⁻⁶ against ~1.5% per called cell, a ~4,000-fold
-gap. Scaled by the depth difference between a cell and an empty droplet — the one multiplier not
+measured separately from sub-threshold droplets, and that measurement now covers both channels:
+
+| | Rx_4 | Rx_6 |
+|---|---|---|
+| junction-bearing barcodes | 422 | 247 |
+| of those, **not** a called cell | **11** | **4** |
+| ambient share | 2.6% | 1.6% |
+| rate per called cell | 2.00% | 1.06% |
+| rate per empty droplet | 4.3 × 10⁻⁶ | 1.8 × 10⁻⁶ |
+| ratio | **4,700×** | **6,100×** |
+
+Folding in the genome-mapped channel is a check on this in its own right: it raised the
+junction-bearing barcode count from 568 to 669 and left the non-cell count at **15, unchanged**. The
+new channel added signal without adding ambient, which is what should happen if the extra reads are
+real junctions rather than background — a doubling of a background-driven signal would have doubled
+its background with it. Scaled by the depth difference between a cell and an empty droplet — the one
+multiplier not measured here — this is of order 1–2% of labelled cells, consistent with the doublet
+rate. Scaled by the depth difference between a cell and an empty droplet — the one multiplier not
 measured here — that is of order 1–2% of labelled cells, consistent with the doublet rate.
 
 The assignment tier's own error rate is now measured rather than argued, by **decoy flanks**: 100
@@ -1674,6 +1724,21 @@ composition, not a property of the locus. Per cell it runs at 0.125% in the nega
 against 4.02% in the positive, a ratio of 3.1% against B0304's 1.6% overall: the same order, nothing
 anomalous. **No silencing or position-effect claim should be built on IS10.**
 
+**The 5′ channel advertises a 10 bp floor it does not have.** `classify_five_prime_clips()` sorts
+5′ clips into a discovery tier at `min_discovery` (25 bp) and an assignment tier at `min_assign`
+(10 bp), but only the discovery tier is ever written: `write_clip_fasta(five, "discovery", …)`. The
+assignment tier is computed, counted in the waterfall, and then dropped. `five_prime.fa` contains no
+clip shorter than 25 bases, which confirms it. This is the same family as `-T 30` and `-T 12` — a
+threshold that reads as active and is not — except that here nothing silently discards the reads
+downstream; they are never sent downstream at all.
+
+The gain being left on the table is real but modest: those clips could be matched against the
+mini-reference by the same exact positional test the 3′ assignment tier uses, since the flanks are
+cut ±200 bp around the 3′ junction and so contain the 5′ junction four bases away. It is a design
+change rather than a fix, so it is recorded rather than made. Note also that the 5′ discovery clips
+that *are* sent place poorly — 44% of the 25–34 bp band reaches MAPQ ≥ 30, 54% of 35–49 — so this
+channel sits in the same MAPQ-0 blind spot as the 3′ one.
+
 **The 20 bp clustering window is not hiding junction-base scatter.** Reads are merged into sites
 within `cluster_window = 20`, which could in principle absorb a spread of nearby junction positions
 into one call and make a fuzzy site look exact. It does not: of the 1,396 genome-mapped reads that
@@ -1720,8 +1785,36 @@ bases of anchor. The reads are absent rather than mis-placed — every read over
 MAPQ 255 with no supplementary, secondary or low-MAPQ population, on both plus- and minus-strand
 sites — so there is no hidden yield there, but the cause is not established.
 
-**These reads are counted as host-gene expression.** A genome-mapped junction read is an ordinary
-alignment to the host gene as far as the count matrix is concerned, so cells of a clone carry
-inflated UMIs for the gene the provirus sits in — 177 spurious *Ddx10* UMIs in Rx_4 alone. Any
-cis-effect analysis must exclude them first: a naive "clone X versus the rest" test would return the
-host gene as its top hit, manufacturing exactly the signature such a test goes looking for.
+**These reads are counted as host-gene expression — at four sites of the fifteen, and the rule for
+which is exact.** A genome-mapped junction read is an ordinary alignment to the host gene as far as
+Cell Ranger is concerned: it carries `GN:Z:<host gene>` and `xf:i:25`, and bit 8 of `xf` is the flag
+that makes a read a UMI count. So for an affected site the carrying cells gain host-gene UMIs that
+are really vector transcript, in exactly the cells a cis-effect test would compare.
+
+It needs **two** conditions, and the second keeps it off most sites. The read has to land inside the
+gene, and it has to be in the gene's own orientation — an antisense read is tagged with the gene but
+not counted. An earlier draft of this paragraph cited "177 spurious *Ddx10* UMIs in Rx_4"; that was
+wrong, because IS02's provirus is antisense to *Ddx10* and none of those reads is counted. The
+prediction was tested against the count matrix at six sites and it holds at all six:
+
+| site | host gene | orientation | junction share of carriers' host-gene UMIs |
+|---|---|---|---|
+| IS10 | *Gm35330* | same sense | **23.5%** |
+| IS04 | *Abhd17c* | same sense | **20.9%** |
+| IS11 | *Stau2* | same sense | **12.1%** |
+| IS03 | *Hells* | same sense | 2.3% |
+| IS02 | *Ddx10* | antisense | 0.4% |
+| IS01 | *Mef2c* | antisense | 0.0% |
+| IS09 | *Fnbp1* | antisense | 0.0% |
+
+`integration_sites.csv` carries this as `cis_confound`, true for **IS03, IS04, IS10 and IS11**. For
+those four, any cis-effect test must drop UMIs whose reads contain the provirus terminus before
+comparing anything; for the other eleven the question does not arise. IS03's share is small only
+because *Hells* is highly expressed, not because the mechanism is weaker there.
+
+**What this measurement is not.** Carrying cells do show more host-gene signal than other cells —
+2.5× for *Hells*, 4.0× for *Stau2* — and removing the junction UMIs does not remove that. It is not
+evidence of a cis-effect either, because "other cells" here is every other cell in the tube, which
+mixes cell type with clone identity: a clone is a lineage, and its host gene may simply be a gene
+that lineage expresses. The confound is now quantified and removable; the cis-effect question is
+untouched and needs a matched comparison.

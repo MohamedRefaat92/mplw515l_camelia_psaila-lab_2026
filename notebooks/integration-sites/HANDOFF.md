@@ -303,6 +303,19 @@ adenines; permuting all 18 bases leaves the tested 13 with three, and A-rich *k*
 the genome, so that version understates the rate in the direction that flatters the channel. The
 first attempt made exactly that mistake.
 
+**Open items closed on 2026-11-18, with what each turned out to be:**
+
+| item | outcome |
+|---|---|
+| host-gene UMI confound | **real**, and strand-dependent. Junction reads carry `GN:Z:<host gene>` with `xf` bit 8 set, so they count as host-gene UMIs — but only when the provirus is intragenic *and* in the gene's orientation. `cis_confound` flags the four: IS03, IS04, IS10, IS11. 20.9% of carriers' *Abhd17c* UMIs at IS04, 23.5% of *Gm35330* at IS10, 12.1% of *Stau2* at IS11, 2.3% of *Hells* at IS03. The earlier "177 spurious *Ddx10* UMIs" was wrong — IS02 is antisense |
+| 5′ anchoring | the absorbed-base repair is sound. 2 of 76 placed hits start with a soft clip, 40 are clean end-to-end, NM = 0 throughout |
+| 5′ floor | `min_assign` is advertised for this channel and inert — only the discovery tier is written to `five_prime.fa`, so no clip under 25 bp ever reaches an aligner. Not a silent discard; they are simply never sent |
+| `cluster_window = 20` | hides nothing. All 1,396 genomic reads inside a called site sit at offset exactly 0 |
+| TSD on IS10–IS15 | unreachable, not failing. The whole 5′ channel is 76 reads and none lands within 2 kb of those six loci |
+| 1,186 → figures | 5 cells in the stroma tubes (in neither embedded panel) and 33 in no demultiplexer output, leaving 1,148 before QC. The 33 are missing rather than filtered and are worth a look |
+| ambient (#43) | holds, and the new channel is a check on it: junction-bearing barcodes went 568 → 669 while the non-cell count stayed at **15**. Signal added without background |
+| metadata queries 1–2 | computed from `demux_res_*`; see INFORMATION-GAPS. Query 3, the FACS mCherry⁺ fraction, is still outside the data |
+
 Three checks the pipeline never used as input, so they are genuinely independent:
 
 1. **Integration-site preference — underpowered, do not cite as a validation.** 6 of 8 usable sites
