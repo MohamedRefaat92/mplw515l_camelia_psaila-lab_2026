@@ -1199,7 +1199,48 @@ write_csv_checked <- function(x, path, ...) {
          ". The filesystem accepted a truncated file without erroring - check free space on ",
          "the fileset (df -h) before trusting anything else this run wrote.", call. = FALSE)
   }
+  record_in_manifest(path, nrow(x))
   invisible(path)
+}
+
+#' Record a verified write in the output directory's manifest, so a report can prove the files behind
+#' its numbers are the pipeline's own output.
+#'
+#' Why this and not targets' own file hashing. The report declares these CSVs as inputs, so targets
+#' hashes them - but it hashes them when the report renders, which cannot tell a pipeline output from
+#' one edited by hand, half-regenerated, or left over from a run with different parameters. The
+#' manifest can, because the entry is written by the same call that wrote the data, from the frame
+#' that was just line-counted, and it carries the commit the pipeline ran from. The provenance banner
+#' compares each declared input against it: an md5 that is not the recorded one means the report is
+#' reading something this pipeline did not produce, which is the one failure that otherwise looks
+#' exactly like a normal render.
+#'
+#' A re-run stage replaces its own entries and leaves the others, since the five stages write
+#' different files and are deliberately runnable one at a time.
+#'
+#' The commit is the full 40-character SHA, not the short one, because a short hash is often a valid
+#' number: `8e55518` is 8 x 10^55518, so anything that guesses column types reads it as `Inf`. Read
+#' this file with every column as character.
+record_in_manifest <- function(path, rows) {
+  man <- file.path(dirname(path), "manifest.tsv")
+  entry <- data.frame(
+    file    = basename(path),
+    rows    = as.character(rows),
+    bytes   = as.character(file.info(path)$size),
+    md5     = unname(tools::md5sum(path)),
+    written = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    commit  = tryCatch(system2("git", c("rev-parse", "HEAD"),
+                               stdout = TRUE, stderr = FALSE)[1],
+                       error = function(e) NA_character_),
+    stringsAsFactors = FALSE
+  )
+  old <- if (file.exists(man)) {
+    o <- utils::read.delim(man, colClasses = "character", na.strings = character())
+    o[o$file != entry$file, , drop = FALSE]
+  } else entry[0, , drop = FALSE]
+  out <- rbind(old, entry)
+  utils::write.table(out[order(out$file), ], man, sep = "\t", quote = FALSE, row.names = FALSE)
+  invisible(man)
 }
 
 #' Read a cached genomic-channel table with its schema fixed, never guessed.

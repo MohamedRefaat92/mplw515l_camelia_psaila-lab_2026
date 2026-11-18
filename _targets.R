@@ -2457,17 +2457,34 @@ list(
   # NOTE: this puts the report in tar_make(). If that is not wanted, comment this line out as the
   # block at the end of this list does for other reports - but then the provenance banner goes back
   # to being unable to resolve it.
+  # EVERY file the report reads is listed, not a representative few. This list is what the provenance
+  # banner verifies against the pipeline's manifest.tsv, so a file left out is one whose numbers reach
+  # the report unchecked - and it is also what makes the report re-render when the pipeline's output
+  # moves, so an omission means a stale report that looks current. Keep it in step with the reads:
+  #   grep -oE '"[a-z_0-9]+\.csv(\.gz)?"' notebooks/integration-sites/integration-sites.qmd | sort -u
   quarto_report(
     report_integration_sites, "integration-sites",
     utilities_r, "src/R/integration-sites.R",
     "metadata/integration_site_registry.csv",
+    "metadata/tube_sample_map.csv",
     "output/objects/integration-sites/integration_sites.csv",
     "output/objects/integration-sites/cell_site_assignments.csv",
     "output/objects/integration-sites/site_evidence.csv",
     "output/objects/integration-sites/detection_model.csv",
     "output/objects/integration-sites/clip_floor_curve.csv",
     "output/objects/integration-sites/repertoire_completeness.csv",
-    "output/objects/integration-sites/vector_expression.csv"),
+    "output/objects/integration-sites/vector_expression.csv",
+    "output/objects/integration-sites/ambient_rate.csv",
+    "output/objects/integration-sites/anchor_ends.csv",
+    "output/objects/integration-sites/channel_capture_recapture.csv",
+    "output/objects/integration-sites/clip_table.csv.gz",
+    "output/objects/integration-sites/clip_waterfall.csv",
+    "output/objects/integration-sites/junction_coverage.csv",
+    "output/objects/integration-sites/site_calling_summary.csv",
+    "output/objects/integration-sites/tsd_check.csv",
+    "output/objects/integration-sites/unassigned_molecules.csv",
+    "output/objects/integration-sites/work/called_barcodes.csv.gz",
+    "output/objects/integration-sites/work/hashtag_calls.csv.gz"),
 
   # TEST (temporary): delete these two targets, notebooks/test_report_target/ and
   # output/reports/latest/notebooks/test_report_target/ afterwards

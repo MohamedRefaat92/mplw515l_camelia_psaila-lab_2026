@@ -5,13 +5,22 @@ why the analysis exists, what was tried and rejected, what is assumed, and where
 code explains *what* it does; this explains *why*, and what already went wrong.
 
 Status as of 2026-11-18: pipeline runs end to end on the cluster (job 35742986, 1 h 49 m), **15
-sites** called, 1,213 cell-site assignments over 1,186 cells. Nothing is committed to git — the
-project has a standing rule that commits happen only when asked.
+sites** called, **1,222 cell-site assignments over 1,195 cells**, clip-table gate PASS. Committed
+through the floor change, the called-cell filter and the review responses; the project has a standing
+rule that commits happen only when asked.
+
+**Every number in this file comes from a CSV, and the CSVs move.** These figures were rewritten
+twice in one day — when the assignment floor went 10 → 6, and when assignments were restricted to
+called cells — and both times prose quoting them had to be chased through the report and through
+here. Where a section below quotes a table, regenerate it from the named CSV rather than editing the
+digits. The provenance banner in the report now verifies each of those CSVs against the manifest the
+pipeline wrote beside them (§11), so a figure here that disagrees with the report means this file is
+stale, not that the data moved unnoticed.
 
 What changed on 2026-11-18, since it changes most of the numbers below: the genome-mapped channel
 was already calling sites, but its reads were being discarded afterwards, so clone sizes were built
 from the 3′ channel alone. They now carry both channels. The site count went 9 → 15 and the labelled
-cell count 552 → 1,186. Site labels are now pinned to loci by `metadata/integration_site_registry.csv`
+cell count 552 → 1,195. Site labels are now pinned to loci by `metadata/integration_site_registry.csv`
 rather than assigned by rank — see §7.
 
 **Three results changed direction on the same day, and the pattern is worth more than any of them.**
@@ -29,9 +38,15 @@ Each came from using a denominator that already had the answer built into it:
 
 **Never divide labelled cells by labelled cells.** All three had the shape of a strong result.
 
-**13 sites, not 15, for any repertoire statement.** IS14 and IS15 clear the cell floor only on the
-two channels' reads summed, and have no 5′ junction either. `integration_sites.csv` carries
-`called_by` and `pooled_only` so this does not have to be remembered.
+**12 sites, not 15, for any repertoire statement.** All three excluded sites fail the
+flank-complexity gate (`flank_gated`), so their flanks cannot support quantification: IS07 at
+`JH584304.1:35,417`, IS14 at `chr10:19,804,209`, IS15 at `chr9:82,806,975`. IS14 and IS15
+additionally clear the cell floor only on the two channels' reads summed (`pooled_only`) and have no
+5′ junction. Three exclusions, not two — the count read 13 here and throughout the report until the
+rendered output was inspected against the table it claims to summarise.
+`site_evidence.csv` carries one `defensible` column, derived from all three conditions, so the
+judgement is read rather than remembered. Derive the *reason* from that table too if you quote it:
+the first attempt rendered "IS07: NA; IS14: NA; IS15: NA" by subsetting twice.
 
 ---
 
@@ -166,10 +181,11 @@ silently enforced a 12 bp floor while `min_assign` advertised 8, so 169 reads we
 dropped with no error. The floor is now whatever `assign_floor` says, and it is 6 with exact
 matching required beneath 15 bases - one policy, not two constants.)
 
-Result: cells labelled rise from 339 to **552** on the 3′ channel alone, and to **1,186** once the
+Result: cells labelled rise from 339 to **552** on the 3′ channel alone, and to **1,195** once the
 genome-mapped channel's cells are folded in as well. The wild-type tubes stayed at zero through all
-of that except for two cells — one in Rx_1 and one in Rx_5, both at IS04 — which is the measured
-cross-tube rate, 0.16% of labelled cells.
+of that except for one called cell, the Rx_1 event at IS04: the Rx_5 cell that used to make it two
+was an index-hopping barcode that Cell Ranger never called, so restricting to called cells removed
+it. The measured cross-tube rate is **1 in 1,222 assignments**.
 
 **A third trap, hit on 2026-11-18: the cache that only breaks on restart.** The genomic stage writes
 one CSV a tube so the expensive scan can be resumed. Read back with guessed column types, that cache
@@ -313,7 +329,8 @@ first attempt made exactly that mistake.
 | 5′ floor | `min_assign` is advertised for this channel and inert — only the discovery tier is written to `five_prime.fa`, so no clip under 25 bp ever reaches an aligner. Not a silent discard; they are simply never sent |
 | `cluster_window = 20` | hides nothing. All 1,396 genomic reads inside a called site sit at offset exactly 0 |
 | TSD on IS10–IS15 | unreachable, not failing. The whole 5′ channel is 76 reads and none lands within 2 kb of those six loci |
-| 1,186 → figures | 5 cells in the stroma tubes (in neither embedded panel) and 33 in no demultiplexer output, leaving 1,148 before QC. The 33 are missing rather than filtered and are worth a look |
+| 1,186 → figures | 5 cells in the stroma tubes (in neither embedded panel) and 33 in no demultiplexer output, leaving 1,148 before QC. **Closed, and the 33 are gone:** see the demultiplexer row below |
+| the demultiplexer's cell list | **closed.** Cell Ranger calls 161,168 cells, the demultiplexer emits 161,091 — the gap that showed as 20,502 against 20,514 in Rx_4. It is one-directional (no barcode is in the demux output that Cell Ranger did not call) and the 77 missing are **exactly** the 77 cells with zero HTO counts across all four tags: `identical(sort(zero_HTO_called), sort(dropped))` is TRUE. deMULTIplex2 cannot place a cell with no tag reads, so it drops it before classification — which is why they carry no call rather than a "negative" call. **None of the 1,195 labelled cells is among them** (0 observed against 0.57 expected by chance), so nothing in the report is affected. The "33 labelled cells in no demultiplexer output" predated the called-cell filter and is now 0 of 1,195 |
 | ambient (#43) | holds, and the new channel is a check on it: junction-bearing barcodes went 568 → 669 while the non-cell count stayed at **15**. Signal added without background |
 | metadata queries 1–2 | computed from `demux_res_*`; see INFORMATION-GAPS. Query 3, the FACS mCherry⁺ fraction, is still outside the data |
 
@@ -327,7 +344,9 @@ it matter more than the files:
   per row rather than a 0/1 verdict, which is what lets a view ask a different question — exact
   matching is `nm == 0`, a lower floor is one argument — and lets the gate prove the views agree.
 - **The gate is an equality that stops the run.** Filtered at the current floor, the match table must
-  return 15 sites / 1,213 assignments / 1,186 cells. It failed on first run and caught two real bugs:
+  reproduce the pipeline's own output row for row — currently 15 sites / 1,222 assignments / 1,195
+  cells, but the gate compares against what the run produced rather than against a number written
+  here, which is why it survived the floor change. It failed on first run and caught two real bugs:
   a union across a molecule's reads that let a 5-base read's matches through a floor applied to its
   30-base sibling (52 spurious assignments), and a dplyr trap where `clip_len = max(clip_len)`
   followed by `clip = first(clip[clip_len == max(clip_len)])` in one `summarise()` selects an
@@ -335,10 +354,28 @@ it matter more than the files:
 - **The gate belongs on reads, not molecules.** The assignment tier is a per-read filter, so only a
   per-read view can reproduce it to the row. The molecule table is a convenience built on top.
 
-With it, the floor question is measured rather than argued: under exact matching the 100 decoy flanks
-are clean from **6 bp** up and dirty below (1 of 11 molecules at 5 bp, 10 of 17 at 4 bp, all of them
-at 1–2 bp). Lowering 10 → 6 would add 73 assignments over 47 new cells, 4.0%, with no wild-type
-additions. **The floor stays at 10**; the measurement is recorded so the choice is costed.
+With it, the floor question is measured rather than argued, and the measurement moved the floor.
+**It is now 6 bp with exact matching required below 15 bp**, held in one object,
+`IS_DEFAULTS$assign_floor = list(min_len = 6L, exact_below = 15L)`, with a load-time assertion that
+refuses an incoherent pair — tested by feeding it one. The two numbers are a single decision: under
+the `L %/% 10` mismatch budget, 21 of the 35 molecules at 6 bp match a decoy, a 60% error rate, so a
+6-bp floor is defensible only with exact matching beneath it. Do not treat `min_len` as adjustable
+on its own.
+
+Three stages of being wrong about this are worth knowing, because each looked like a result:
+
+- **8 bp**, from the wrong instrument (decoys that could not have matched anyway).
+- **10 bp**, from the right instrument read at too coarse a resolution.
+- **"clean from 6 bp up" at 100 decoy flanks**, which was an *absence of evidence*: chance alone
+  predicts only 1.67 hits across the 35 molecules at that length, so zero carried *p* = 0.19.
+
+At `n_decoy = 1000` the measurement exists: **15 observed against 13.5 predicted at 6 bp**,
+obs/exp = 1.11, which validates the matcher against the analytic 4⁻ᴸ rate rather than merely failing
+to contradict it. The floor's licence is reported as an absolute count — **0.31 expected spurious
+across 931 accepted molecules** against 1,222 real, 0.02 per site — because both percentage framings
+invite overreading. Decoy comparisons are capped at `exact_below`, since chance matching at 30 bases
+is 4⁻³⁰ and comparing 1,000 flanks against the 748 longer molecules was paying for nothing: that
+capping is what kept `assign` at 3 m 52 s while the decoy count went up ninefold.
 
 **Writes are verified now, because they were silently truncating.** On 2026-11-18 the `/well/ludwig`
 fileset hit its 391 TB limit with ~23 GB left and writes into `output/` began returning short files —
@@ -374,15 +411,24 @@ is underdispersed by construction (0.41, 0.17), so comparing it to 1 invents a p
 fits: 240 IS02 cells at one molecule against 232 expected, 76 at two against 85. The overdispersion
 the plan expected came from the shared-UMI artefact and disappeared with it.
 
-**Repertoire completeness, answered without the FACS record.** The denominator needed is the mCherry⁺
-cells *sequenced*, which is in hand: 43,332 across Rx_4 and Rx_6, of which 1,131 are labelled — a
-**2.6% assumption-free floor** — and ~2,900 after detection correction, so the fifteen sites account
-for roughly **7% of the sorted mCherry⁺ population**. The missing 93% leave a trace that is
-accounted for rather than mysterious: of 1,422 junction-bearing cells, 236 carry a molecule matching
-no called site, and of the 76 long enough to place, 67 land at MAPQ < 30 (repetitive flank), 15 do
-not place, and 29 sit at seven uncalled positions with 1–2 cells each — all below `min_cells = 3`.
-So the missing repertoire visible here is seven micro-loci plus the blind spot, not a hidden
-population. Step 4's posteriors are not needed for this.
+**Repertoire completeness, answered without the FACS record — and the denominator was wrong once.**
+The first answer used the mCherry⁺ cells *sequenced*, 43,332 across Rx_4 and Rx_6, giving a 2.6%
+floor and ~7% after detection correction. That denominator assumes the sort gate is pure, and it is
+not: a free, junction-independent discriminator — vector transcript from the three reporter genes in
+the reference — says **65.2% of Rx_4 and 43.2% of Rx_6 called cells carry any, 53.6% pooled, against
+4 of 26,822 in the wild-type control**. So the gate is about half pure.
+
+`repertoire_completeness()` therefore reports **two** denominators: sorted cells as the upper bound,
+vector-positive cells as the defensible one — a **5.3% floor and a 12.5% ceiling**. Use the second.
+
+**What the unaccounted remainder is, and what cannot be said about it.** Of 1,422 junction-bearing
+cells, 236 carry a molecule matching no called site; of the 76 long enough to place, 67 land at
+MAPQ < 30 (repetitive flank), 15 do not place, and 29 sit at seven uncalled positions with 1–2 cells
+each, all below `min_cells = 3`. That census is worth having. It does **not** license the conclusion
+this file used to draw from it — "the missing repertoire is seven micro-loci plus the blind spot, not
+a hidden population" — because a molecule census has no power over a population defined by yielding
+no junction molecule. The claim spent the detection correction twice and is withdrawn. Step 4's
+posteriors would not rescue it either.
 
 **Step 4 (posteriors over K+1 hypotheses) is not built, and here is the number that decided it.**
 Across the whole dataset **25 molecules match more than one called site exactly**, all with clips of
@@ -587,17 +633,58 @@ Read this before debugging anything. Several of these cost hours.
 | | |
 |---|---|
 | `src/R/integration-sites.R` | all logic, as functions. Attaches no packages — `source()` it and step through. All thresholds in `IS_DEFAULTS`. |
-| `scripts/R/call-integration-sites.R` | driver, two entry points (`extract`, `call`) because bwa runs between them |
-| `scripts/slurm/analysis/integration-sites.sh` | the job. ~1 min, 4.7 GB peak. |
+| `scripts/R/call-integration-sites.R` | driver, five stages (`extract`, `genomic`, `genomic-decoy`, `sites`, `assign`), separate because bwa runs between them and because a control must not sit on the critical path of a run someone is waiting for |
+| `scripts/R/export-hashtag-calls.R` | exports the demultiplexer's calls to `work/hashtag_calls.csv.gz`, which is what lets the report resolve replicates without loading a 2 GB Seurat object |
+| `scripts/R/record-output-manifest.R` | records existing outputs in `manifest.tsv`. Not part of a run — the pipeline writes it as it goes. For outputs that predate it, or a lost manifest. |
+| `scripts/slurm/analysis/integration-sites.sh` | the job. 1 h 49 m for the full five stages (job 35742986); the genome-mapped scan dominates. |
 | `scripts/slurm/setup/bwa-index.sh` | one-off index build, ~50 min |
-| `notebooks/integration-sites/integration-sites.qmd` | the report |
-| `output/objects/integration-sites/*.csv` | 7 output tables, including `tsd_check.csv` |
+| `notebooks/integration-sites/integration-sites.qmd` | the report, registered in `_targets.R` |
+| `output/objects/integration-sites/*.csv` | 22 output tables plus `manifest.tsv`; `work/` holds the per-tube genomic cache, the called-barcode list and the hashtag calls |
 | `data_hub/10x_resources/reference_additions/README.md` | contig derivation and verification — **outside git, not version controlled** |
 
 ```bash
 sbatch scripts/slurm/analysis/integration-sites.sh
-tools/quarto.sh render notebooks/integration-sites/integration-sites.qmd
+tools/quarto.sh render notebooks/integration-sites/integration-sites.qmd   # renders AND archives
 ```
 
-Not done: the report is **not registered in `_targets.R`** (the report block there is the user's), and
-`tools/catalogue-data.sh` has not been run on the new Cell Ranger inputs.
+Render from `tools/quarto.sh`, not `env/bin/quarto`: conda's quarto needs the variables its
+activation script sets, and `./env` is never activated here. A bare `quarto render` fails three times
+in a row on three different missing tools, with errors that read like a broken install rather than a
+relocated one. The wrapper also archives the result, which matters because
+`output/reports/latest/` is overwritten on every render and the dated copy under
+`output/reports/archive/` is the only permanent one.
+
+Not done: `tools/catalogue-data.sh` has not been run on the new Cell Ranger inputs.
+
+## 11. Provenance — what is verified, and what that is worth
+
+Every number in the report has to be reproducible from data and code that is available, which means
+something has to check that the files behind those numbers are the pipeline's own output. Three
+layers do, and they catch different failures:
+
+1. **`write_csv_checked()` — the write happened in full.** Counts the lines back and errors on a
+   mismatch. This exists because the fileset filled and writes began *truncating* silently (§8); do
+   not remove it.
+2. **`manifest.tsv` — the file is still the one the pipeline wrote.** `record_in_manifest()` records
+   size, md5, timestamp and the full commit SHA in the same call that line-counted the write. The
+   report's provenance banner compares each declared input against it: `matches pipeline manifest`
+   is a pass, `DIFFERS from pipeline manifest` is a red banner, because every number downstream of
+   an unaccounted file is then computed from something nobody can account for. A re-run stage
+   replaces its own rows and leaves the others.
+3. **The declaration in `_targets.R` — the list of files being checked is complete.** The report's
+   target lists *every* CSV the report reads, not a representative few. A file left off that list is
+   a file whose numbers reach the report unverified, and the report also stops re-rendering when it
+   moves — a stale report that looks current.
+
+Two cautions. The manifest records the **full 40-character SHA** deliberately: a short hash is often
+a valid number, and `8e55518` parses as 8 × 10⁵⁵⁵¹⁸, i.e. `Inf`, which is how the first printout of
+it came out. Read that file with every column as character. And
+`scripts/R/record-output-manifest.R` attests **less** than the pipeline does — it records whatever is
+on disk now, so it can bless a file that was already wrong. Re-run the pipeline rather than that
+script if there is any doubt.
+
+What is *not* verified: the banner's "Pipeline" check reads amber because the report has never been
+built by `tar_make()`. Building it would rebuild twenty upstream targets, the whole Seurat chain
+among them, so the inputs are read from the target's declaration instead
+(`declared_inputs()`). That is an honest amber, not a missing feature — but if the Seurat chain is
+ever rebuilt for other reasons, build the report target in the same run and the check turns green.

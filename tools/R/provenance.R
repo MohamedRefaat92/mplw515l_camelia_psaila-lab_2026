@@ -56,6 +56,27 @@ uncommitted_files <- function(path = ".") {
   sub("^.. ", "", git_lines("status", "--porcelain", "--", path))
 }
 
+#' The path, if git tracks it; character(0) otherwise. Used to decide whether git can vouch for a
+#' declared input that is neither data nor pipeline output - a shared config or a sourced script.
+git_tracked <- function(path) {
+  git_lines("ls-files", "--error-unmatch", "--", path)
+}
+
+#' One declared input against the manifest the pipeline wrote beside it.
+#'
+#' Read with every column as character: a commit hash is often a valid number, and the short form of
+#' `8e55518` parses as 8 x 10^55518, i.e. Inf. The manifest records the full SHA for that reason.
+manifest_check <- function(path, md5, manifest = "manifest.tsv") {
+  man <- file.path(dirname(path), manifest)
+  if (!file.exists(man)) return("no pipeline manifest")
+  m <- tryCatch(read.delim(man, colClasses = "character", na.strings = character()),
+                error = function(e) NULL)
+  if (is.null(m) || !all(c("file", "md5") %in% names(m))) return("unreadable pipeline manifest")
+  row <- m[m$file == basename(path), , drop = FALSE]
+  if (nrow(row) != 1L) return("not in pipeline manifest")
+  if (identical(row$md5[[1]], md5)) "matches pipeline manifest" else "DIFFERS from pipeline manifest"
+}
+
 #' TRUE / FALSE: do the installed R packages match renv.lock? NA if renv isn't active.
 renv_synced <- function() {
   if (!requireNamespace("renv", quietly = TRUE) || !nzchar(Sys.getenv("RENV_PROJECT"))) return(NA)
@@ -73,11 +94,43 @@ report_input <- function() {
 #' Name of the pipeline target that renders this report (the tar_quarto() whose command names this file).
 #' (targets::tar_name() can't tell: Quarto runs the report's code in a separate R process.)
 report_target <- function() {
-  m <- tryCatch(targets::tar_manifest(fields = c("name", "command"), callr_arguments = quiet_callr),
-                error = function(e) NULL)
-  if (is.null(m)) return(NA_character_)
+  m <- pipeline_manifest()
+  if (!nrow(m)) return(NA_character_)
   hit <- m$name[grepl(report_input(), m$command, fixed = TRUE)]
   if (length(hit) == 0) NA_character_ else hit[1]
+}
+
+#' The manifest of the pipeline as defined, computed once per session (each call costs a callr
+#' subprocess, and three of the functions below want it).
+.manifest_cache <- new.env(parent = emptyenv())
+pipeline_manifest <- function() {
+  if (is.null(.manifest_cache$m)) {
+    .manifest_cache$m <- tryCatch(
+      targets::tar_manifest(fields = c("name", "command"), callr_arguments = quiet_callr),
+      error = function(e) data.frame(name = character(), command = character()))
+  }
+  .manifest_cache$m
+}
+
+#' The files a report declares as inputs, taken from its target's command.
+#'
+#' tar_meta() is the better source and is used whenever it has the target. But a report target that
+#' has never been built by tar_make() has no meta row, and a report reading the output of a pipeline
+#' run outside targets - by sbatch, say - is exactly the kind that gets rendered directly, so this is
+#' the common case rather than the edge one. Building the target just to populate meta is not a
+#' substitute: for this report it would rebuild twenty upstream targets, the whole Seurat chain among
+#' them, which is a great deal of compute to make a banner green.
+#'
+#' The command text is then the only record of what the report declared, so the quoted paths are
+#' read out of it. Anything that is not a file on disk is dropped, which also drops the target names
+#' and arguments that share the quoting.
+declared_inputs <- function(target) {
+  m <- pipeline_manifest()
+  row <- m[m$name == target, , drop = FALSE]
+  if (nrow(row) != 1L) return(character())
+  quoted <- regmatches(row$command[[1]], gregexpr('"[^"]+"', row$command[[1]]))[[1]]
+  paths <- gsub('"', "", quoted)
+  unique(paths[file.exists(paths) & !dir.exists(paths)])
 }
 
 #' Every target `target` depends on, directly or indirectly (not the target itself).
@@ -108,11 +161,35 @@ file_md5 <- function(path, auto = "metadata/auto_catalogue_data.tsv") {
   unname(tools::md5sum(path))
 }
 
-#' The input files this report's pipeline read (its upstream file targets), checked against the catalogue.
-#' Files in data/ must be in the reviewed catalogue with the same md5; files in metadata/ are covered by git.
+#' The input files this report's pipeline read, checked against whatever can vouch for each one.
+#' Files in data/ must be in the reviewed catalogue with the same md5; files under output/ against
+#' the manifest the pipeline wrote beside them; anything else tracked in git is covered by git.
+#'
+#' Two things here were wrong and made the check vacuous for a report whose inputs are produced
+#' outside targets. Only the FIRST path of each file target was taken, and a tar_quarto() target is
+#' one file target whose paths are the rendered output, the sources and every declared input - so all
+#' but one input was dropped. And only UPSTREAM targets were consulted, which for such a report is
+#' none of them. The report's own target is now included, and its own output and sources are removed
+#' instead (they are what the Code and Pipeline checks are for), leaving exactly its inputs.
 input_files <- function(meta, catalogue = "metadata/catalogue_data.tsv") {
   files <- meta[meta$format %in% "file", , drop = FALSE]
-  paths <- vapply(files$path, function(p) p[[1]], character(1))
+  # as.character(), because unlist() of an empty list is NULL rather than character(0) and every
+  # filter below is a string operation - collect_provenance() calls this with no files at all to
+  # build the empty frame, and that call is the one that reached startsWith(NULL, ...).
+  paths <- unique(as.character(unlist(files$path, use.names = FALSE)))
+  paths <- paths[!is.na(paths)]
+  if (length(paths) == 0) {
+    return(data.frame(path = character(), kind = character(), size = character(), md5 = character(),
+                      check = character()))
+  }
+  # Inputs only: not the report's own rendered output, not its sources, and not the code and config
+  # it declares alongside them (git-tracked, outside data/, metadata/ and output/) - a sourced .R
+  # file and renv.lock are what the Code and R-packages checks are for, and listing them here as
+  # "input data" is noise that makes the rows that matter harder to see.
+  paths <- paths[!startsWith(paths, "output/reports/") & !grepl("\\.qmd$|\\.rmarkdown$", paths)]
+  is_data <- startsWith(paths, "data/") | startsWith(paths, "metadata/") |
+             startsWith(paths, "output/")
+  paths <- paths[is_data | !vapply(paths, function(p) length(git_tracked(p)) > 0, logical(1))]
   if (length(paths) == 0) {
     return(data.frame(path = character(), kind = character(), size = character(), md5 = character(),
                       check = character()))
@@ -121,6 +198,18 @@ input_files <- function(meta, catalogue = "metadata/catalogue_data.tsv") {
     read.delim(catalogue, colClasses = "character", na.strings = character())
   } else data.frame(file = character(), kind = character(), md5 = character())
   rows <- lapply(paths, function(p) {
+    # A directory target - Cell Ranger's per-sample matrix folder is one - has no md5, and md5sum()
+    # returning NA for it used to be reported as "missing". That is the one wrong thing a provenance
+    # check can say about a file that is sitting right there: it reads as data loss. It is reported
+    # as unhashed instead, which keeps the banner amber (nothing was verified) without the false
+    # alarm. Hashing the contents would be real verification and is not free - these are the count
+    # matrices - so it is a deliberate gap, not an oversight.
+    if (dir.exists(p)) {
+      n <- length(list.files(p))
+      return(data.frame(path = p, kind = "directory",
+                        size = sprintf("%d file%s", n, if (n == 1L) "" else "s"),
+                        md5 = NA_character_, check = "directory (not hashed)"))
+    }
     md5 <- if (file.exists(p)) file_md5(p) else NA_character_
     if (startsWith(p, "data/")) {
       entry <- cat_tab[cat_tab$file == sub("^data/", "", p), , drop = FALSE]
@@ -130,12 +219,23 @@ input_files <- function(meta, catalogue = "metadata/catalogue_data.tsv") {
         else if (!nzchar(entry$md5)) "catalogued (no md5)"
         else if (entry$md5 == md5) "matches catalogue"
         else "DIFFERS from catalogue"
-    } else if (startsWith(p, "metadata/")) {
-      kind <- "metadata"
+    } else if (file.exists(file.path(dirname(p), "manifest.tsv"))) {
+      # Produced by a pipeline outside targets, so neither the catalogue nor git can vouch for it.
+      # Its own run can: the stage that wrote it recorded size and md5 in manifest.tsv beside it, in
+      # the same call that line-counted the write. A file whose md5 is not the recorded one is not
+      # the pipeline's output, which is the failure that otherwise renders as a normal report.
+      #
+      # Keyed on the manifest being there rather than on the path starting with output/, so that a
+      # pipeline writing anywhere else is checked the same way. Testing this with a file in a
+      # scratch directory is what showed the path prefix silently skipping the check.
+      kind  <- "pipeline output"
+      check <- if (is.na(md5)) "missing" else manifest_check(p, md5)
+    } else if (startsWith(p, "metadata/") || length(git_tracked(p))) {
+      kind <- if (startsWith(p, "metadata/")) "metadata" else "code"
       check <- if (is.na(md5)) "missing" else if (length(uncommitted_files(p))) "uncommitted" else "in git"
     } else {
       kind <- ""
-      check <- if (is.na(md5)) "missing" else "outside data/ and metadata/"
+      check <- if (is.na(md5)) "missing" else "outside data/, metadata/ and output/"
     }
     data.frame(path = p, kind = kind, size = human_size(file.info(p)$size), md5 = md5, check = check)
   })
@@ -164,11 +264,20 @@ collect_provenance <- function(catalogue = "metadata/catalogue_data.tsv") {
                               fields = tidyselect::any_of(c("data", "format", "path")))
     # One hash of every upstream result: identical fingerprints = identical upstream state, anywhere
     p$fingerprint <- substr(md5_of_lines(sort(paste(meta$name, meta$data))), 1, 12)
-    p$inputs <- input_files(meta, catalogue)
+    # The report's own target as well, because a report whose inputs are produced outside targets
+    # declares them on its own tar_quarto() target and has no upstream file target at all. When that
+    # target has never been built there is no meta row either, and the declaration is read from the
+    # command instead - see declared_inputs().
+    own <- targets::tar_meta(names = tidyselect::any_of(p$report),
+                             fields = tidyselect::any_of(c("data", "format", "path")))
+    if (!nrow(own)) {
+      own <- data.frame(format = "file", path = I(list(declared_inputs(p$report))))
+    }
+    p$inputs <- input_files(rbind(meta[, names(own)], own), catalogue)
   }
 
   # One row per check: "ok", "warning" (check before trusting) or "error" (can't be trusted as rendered)
-  inputs_ok <- p$inputs$check %in% c("matches catalogue", "in git")
+  inputs_ok <- p$inputs$check %in% c("matches catalogue", "in git", "matches pipeline manifest")
   p$checks <- data.frame(
     check = c("Code", "R&nbsp;packages", "Pipeline", "Input&nbsp;data"),
     level = c(
@@ -177,7 +286,10 @@ collect_provenance <- function(catalogue = "metadata/catalogue_data.tsv") {
       if (p$built_by_targets && !is.na(p$report)) "ok" else "warning",
       # all() of an empty vector is TRUE, so a report with no declared inputs used to come out
       # GREEN here - the one state that should never read as a pass, because nothing was checked.
-      if (any(p$inputs$check %in% c("DIFFERS from catalogue", "missing"))) "error"
+      # A file that is not the one the pipeline wrote is an error, not a warning: every number in the
+      # report downstream of it is then computed from something unaccounted for.
+      if (any(p$inputs$check %in% c("DIFFERS from catalogue", "DIFFERS from pipeline manifest",
+                                    "missing"))) "error"
         else if (nrow(p$inputs) == 0L || !all(inputs_ok)) "warning" else "ok"
     )
   )
@@ -210,7 +322,8 @@ render_summary <- function(p) {
   pipeline <- if (is.na(p$report)) "not a target in `_targets.R`: no pipeline information"
               else if (!p$built_by_targets) "rendered outside the pipeline: upstream results may be out of date"
               else paste0("built by targets &middot; upstream fingerprint `", p$fingerprint, "`")
-  bad <- p$inputs[!p$inputs$check %in% c("matches catalogue", "in git"), , drop = FALSE]
+  bad <- p$inputs[!p$inputs$check %in% c("matches catalogue", "in git",
+                                         "matches pipeline manifest"), , drop = FALSE]
   # "0 of 0 file(s) verified" is worse than a failure: it reads as a pass when in fact nothing was
   # checked, which is what a report whose inputs are not declared as targets produces. Say so.
   inputs <- if (nrow(p$inputs) == 0L) {

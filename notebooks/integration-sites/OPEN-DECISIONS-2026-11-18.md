@@ -1,11 +1,18 @@
-# Two parameter decisions needing guidance
+# Two parameter decisions needing guidance — BOTH RESOLVED
 
-Both arose from implementing task T1 of the 2026-11-18 report review. Every figure here is read from
+**Resolved 2026-11-18. The file is kept because the measurements in it are the justification for the
+two settings now in `IS_DEFAULTS`, and they should not have to be re-derived to be questioned.**
+
+| decision | outcome |
+|---|---|
+| **7 — `n_decoy = 1000` on the critical path** | **Kept at 1,000, and the question dissolved rather than being decided.** The premise was a 9× cost: `sites` + `assign` had gone from ~2 min to 14 m 13 s. Capping decoy comparisons at `exact_below` removed it — chance matching at 30 bases is 4⁻³⁰, so comparing 1,000 flanks against the 748 molecules of 15 bases and up was paying for nothing. `assign` runs in **3 m 52 s** with the decoy count unchanged, so option 3 (an opt-in stage) is unnecessary and the control stays where a control belongs: in every run. |
+| **8 — `min_assign = 6` at the 1% tolerance** | **Kept at 6, on guidance that the tolerance applies to the assignment set as a whole.** The whole-set figure is 0.31 expected spurious across 931 accepted molecules, 0.03%. The 6-bp band's own ~1.0% is recorded in the report as the sharper reading rather than hidden, and the floor is reported as an absolute count for that reason. `exact_below = 15` is not separable from this: under the mismatch budget 21 of the 35 molecules at 6 bp match a decoy, which is why the two live in one object with a load-time assertion that refuses an incoherent pair. |
+
+Both arose from implementing task T1 of the 2026-11-18 report review. Every figure below is read from
 `clip_floor_curve.csv` or a timed run, not from notes. Written against commit `4279063` plus the
-uncommitted T1 work.
-
-Neither is blocking: the pipeline runs, the gate passes, 15 sites / 1,222 assignments / 1,195 cells.
-Both are cases where I can state the trade-off precisely and have no principled basis for choosing.
+then-uncommitted T1 work; the pipeline runs, the gate passes, 15 sites / 1,222 assignments / 1,195
+cells. The analysis as originally written follows — note that the cost figures in decision 7 are the
+pre-capping ones, which is the point of its resolution.
 
 ---
 
