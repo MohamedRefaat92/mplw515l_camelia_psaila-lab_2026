@@ -18,6 +18,113 @@ editor_options:
 
 {{< include ../_provenance.qmd >}}
 
+# What this report found
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(readr)
+library(ggplot2)
+library(patchwork)
+library(scales)
+library(DT)
+library(targets)
+
+source("src/R/integration-sites.R")   # IS_DEFAULTS: the thresholds the pipeline actually used
+
+sites_dir <- "output/objects/integration-sites"
+stopifnot(dir.exists(sites_dir))
+
+anchor_ends <- readr::read_csv(file.path(sites_dir, "anchor_ends.csv"), show_col_types = FALSE)
+waterfall   <- readr::read_csv(file.path(sites_dir, "clip_waterfall.csv"), show_col_types = FALSE)
+sites       <- readr::read_csv(file.path(sites_dir, "integration_sites.csv"), show_col_types = FALSE)
+assign      <- readr::read_csv(file.path(sites_dir, "cell_site_assignments.csv"), show_col_types = FALSE)
+summary_tbl <- readr::read_csv(file.path(sites_dir, "site_calling_summary.csv"), show_col_types = FALSE)
+tsd         <- readr::read_csv(file.path(sites_dir, "tsd_check.csv"), show_col_types = FALSE)
+coverage    <- readr::read_csv(file.path(sites_dir, "junction_coverage.csv"), show_col_types = FALSE)
+
+# The molecule-level table and its companions. clip_tbl is ONE ROW PER MOLECULE with channel
+# membership as logicals, which is why nothing below adds umis_three to umis_genomic - that sum
+# double-counts the 83 molecules present in both channels.
+clip_tbl        <- readr::read_csv(file.path(sites_dir, "clip_table.csv.gz"), show_col_types = FALSE)
+detect_tbl      <- readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FALSE)
+called_barcodes <- readr::read_csv(file.path(sites_dir, "work", "called_barcodes.csv.gz"),
+                                   show_col_types = FALSE)
+# Tube -> what it is, so figures can say "HSC Het mCh+" rather than "Rx_4".
+tube_map <- readr::read_csv("metadata/tube_sample_map.csv", show_col_types = FALSE)
+
+# One factor with every site as a level, so a clone keeps the same colour in every panel even where
+# it has no cells. As a bare character it would be re-levelled per panel and the colours would shift.
+assign$site_id <- factor(assign$site_id, levels = sites$site_id)
+
+# Clone colours. These are nominal categories with no order, so a sampled continuous ramp (viridis,
+# turbo) is the wrong tool: neighbouring clones come out as neighbouring hues. glasbey is built by
+# maximising distance in CIELAB, and measurably wins here - the closest pair of colours is 67 dE
+# apart against 28 for the project's .discrete_colours() at n = 9 and 24 for turbo. Its first entry
+# is black, dropped so no clone is confused with text or an axis.
+#
+# The trade-off, stated because it is real: glasbey is not optimised for colour vision deficiency
+# (closest pair under deuteranopia ~9 dE). Okabe-Ito and Tol muted do better there (~17) but are far
+# worse for normal vision (~26 and ~23), and their low chroma washes out at this point size. If a
+# reader needs CVD-safe output, swap this one line.
+# Keyed on the site LABEL, not on its position in the table. The labels are pinned to loci by the
+# registry, but the table is sorted by size, so keying the palette on position would move every
+# clone's colour the moment one changed rank - the same failure the registry fixed for the labels,
+# and harder to notice in a figure. Sorted ids mean IS01 keeps its colour and a new site appends.
+pal_ids      <- sort(levels(assign$site_id))
+site_palette <- stats::setNames(as.character(pals::glasbey(length(pal_ids) + 1))[-1], pal_ids)
+
+# Taken from the pipeline rather than restated, so the figures cannot drift from the run.
+JUNCTION <- IS_DEFAULTS$junction
+MIN_DISC <- IS_DEFAULTS$min_discovery
+MIN_ASSIGN <- IS_DEFAULTS$assign_floor$min_len
+CLEAVAGE <- 3152L   # measured from the polyA clips; see reference_additions/README.md
+
+theme_set(theme_minimal(base_size = 11))
+```
+
+```{r headline}
+#| echo: false
+ev   <- readr::read_csv(file.path(sites_dir, "site_evidence.csv"), show_col_types = FALSE)
+comp <- readr::read_csv(file.path(sites_dir, "repertoire_completeness.csv"),
+                        show_col_types = FALSE)
+dt   <- readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FALSE)
+vec  <- comp[comp$denominator == "cells carrying vector transcript", ]
+fcur <- readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = FALSE)
+big  <- dt[!is.na(dt$clone_size), ][order(-dt$cells[!is.na(dt$clone_size)]), ][1:2, ]
+
+dplyr::tibble(
+  what = c("Integration sites called",
+           "Cells carrying a clone label",
+           "Largest clones, detection-corrected",
+           "Share of the transduced population these clones account for",
+           "Assignment error, measured against the decoy flanks"),
+  value = c(
+    sprintf("**%d**, of which **%d** are defensible (%s clear the cell floor only on pooled reads)",
+            nrow(ev), sum(ev$defensible), paste(ev$site_id[!ev$defensible], collapse = ", ")),
+    sprintf("**%s** across %d sites", scales::comma(sum(ev$cells)), nrow(ev)),
+    sprintf("**%s** and **%s** cells, against %d and %d detected",
+            scales::comma(big$clone_size[1]), scales::comma(big$clone_size[2]),
+            big$cells[1], big$cells[2]),
+    sprintf("**%.1f%% floor, %.1f%% ceiling** \u2014 a small minority",
+            100 * vec$floor_share, 100 * vec$corrected_share),
+    sprintf("**%.2f expected spurious** assignments across all %s accepted molecules",
+            sum(fcur$expected_spurious[fcur$at_or_above_floor]),
+            scales::comma(sum(fcur$molecules[fcur$at_or_above_floor]))))
+) |>
+  knitr::kable(col.names = NULL)
+```
+
+**The judgement that is not a number.** Two of the fifteen sites, IS14 and IS15, reach the cell floor
+only when both channels' reads are pooled and have no 5′ junction to vouch for them; a third, IS07,
+has a flank that cannot support quantification. **Quote 13, not 15**, for anything that counts sites.
+`site_evidence.csv` carries a `defensible` column so this does not have to be remembered.
+
+**The one open question.** Roughly 88% of vector-expressing mCherry⁺ cells belong to no called site.
+That is either a repertoire far larger than fifteen clones or residual gate impurity, and the junction
+data cannot separate them — a molecule census has no power over clones that produce no molecules. The
+FACS mCherry⁺ fraction per animal is the measurement that would.
+
 # Introduction
 
 The transgene assay tells us *whether* a cell carries the lentiviral cassette. This report asks a
@@ -198,60 +305,8 @@ alignment whenever it matches the host's first base, and without the tolerance t
 returns zero hits at a site known to be there — a failure that presents as "the channel doesn't
 work" rather than as a bug.
 
-The thresholds used for the tables in this report:
+The thresholds used for the tables in this report are listed below; the setup that loads them runs first.
 
-```{r setup}
-library(dplyr)
-library(tidyr)
-library(readr)
-library(ggplot2)
-library(patchwork)
-library(scales)
-library(DT)
-library(targets)
-
-source("src/R/integration-sites.R")   # IS_DEFAULTS: the thresholds the pipeline actually used
-
-sites_dir <- "output/objects/integration-sites"
-stopifnot(dir.exists(sites_dir))
-
-anchor_ends <- readr::read_csv(file.path(sites_dir, "anchor_ends.csv"), show_col_types = FALSE)
-waterfall   <- readr::read_csv(file.path(sites_dir, "clip_waterfall.csv"), show_col_types = FALSE)
-sites       <- readr::read_csv(file.path(sites_dir, "integration_sites.csv"), show_col_types = FALSE)
-assign      <- readr::read_csv(file.path(sites_dir, "cell_site_assignments.csv"), show_col_types = FALSE)
-summary_tbl <- readr::read_csv(file.path(sites_dir, "site_calling_summary.csv"), show_col_types = FALSE)
-tsd         <- readr::read_csv(file.path(sites_dir, "tsd_check.csv"), show_col_types = FALSE)
-coverage    <- readr::read_csv(file.path(sites_dir, "junction_coverage.csv"), show_col_types = FALSE)
-
-# One factor with every site as a level, so a clone keeps the same colour in every panel even where
-# it has no cells. As a bare character it would be re-levelled per panel and the colours would shift.
-assign$site_id <- factor(assign$site_id, levels = sites$site_id)
-
-# Clone colours. These are nominal categories with no order, so a sampled continuous ramp (viridis,
-# turbo) is the wrong tool: neighbouring clones come out as neighbouring hues. glasbey is built by
-# maximising distance in CIELAB, and measurably wins here - the closest pair of colours is 67 dE
-# apart against 28 for the project's .discrete_colours() at n = 9 and 24 for turbo. Its first entry
-# is black, dropped so no clone is confused with text or an axis.
-#
-# The trade-off, stated because it is real: glasbey is not optimised for colour vision deficiency
-# (closest pair under deuteranopia ~9 dE). Okabe-Ito and Tol muted do better there (~17) but are far
-# worse for normal vision (~26 and ~23), and their low chroma washes out at this point size. If a
-# reader needs CVD-safe output, swap this one line.
-# Keyed on the site LABEL, not on its position in the table. The labels are pinned to loci by the
-# registry, but the table is sorted by size, so keying the palette on position would move every
-# clone's colour the moment one changed rank - the same failure the registry fixed for the labels,
-# and harder to notice in a figure. Sorted ids mean IS01 keeps its colour and a new site appends.
-pal_ids      <- sort(levels(assign$site_id))
-site_palette <- stats::setNames(as.character(pals::glasbey(length(pal_ids) + 1))[-1], pal_ids)
-
-# Taken from the pipeline rather than restated, so the figures cannot drift from the run.
-JUNCTION <- IS_DEFAULTS$junction
-MIN_DISC <- IS_DEFAULTS$min_discovery
-MIN_ASSIGN <- IS_DEFAULTS$min_assign
-CLEAVAGE <- 3152L   # measured from the polyA clips; see reference_additions/README.md
-
-theme_set(theme_minimal(base_size = 11))
-```
 
 ```{r is-defaults}
 dplyr::tibble(parameter = names(IS_DEFAULTS),
@@ -394,15 +449,100 @@ readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = F
                   backgroundColor = DT::styleInterval(0, c("#e8f5e9", "#fde8e8")))
 ```
 
-**Clean from 6 bp up, dirty below.** At 6 bp, 27 molecules match exactly one real site and **none of
-the 100 decoys**; at 5 bp one molecule in nine hits a decoy, at 4 bp ten of seventeen do, and at 1–2
-bp a clip matches most of the decoy set — the prior-inflation hazard made visible rather than argued.
-Read it as a bound: zero hits in 35 × 100 comparisons at 6 bp, not a demonstrated zero.
+```{r floor-plot}
+#| fig-cap: "Why the floor is 6 bp. Left: with 1,000 decoy flanks, observed chance matching tracks
+#|   the 4^-L prediction - 15 hits against 13.5 at 6 bp - so the rate is measured rather than
+#|   assumed. Right: that same rate applied to the fifteen real flanks, which is what a spurious
+#|   assignment would have to match: 0.31 expected across every accepted length. Shaded is accepted."
+#| fig-width: 8
+#| fig-height: 3.8
 
-**The 6 bp row also shows why the two thresholds are one decision.** Under the `L %/% 10` mismatch
-budget, **21 of those 35 molecules hit a decoy**. Under exact matching, zero do. A 6-base clip allowed
-one mismatch matches almost anything, so lowering the floor without `exact_below` would have been
-strictly worse than leaving it at 10.
+fc <- readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = FALSE) |>
+  dplyr::filter(clip_len <= 12)
+
+# Okabe-Ito pair, checked rather than assumed: OKLab dE 31.2 normal, 28.1 deuteranopia,
+# 21.9 protanopia, against thresholds of 15 and 8.
+pal <- c(observed = "#D55E00", `expected by chance` = "#0072B2")
+
+floor_long <- dplyr::bind_rows(
+  dplyr::transmute(fc, clip_len, panel = paste0("chance matching, measured (", IS_DEFAULTS$n_decoy, " decoys)"),
+                   series = "observed", n = decoy_exact),
+  dplyr::transmute(fc, clip_len, panel = paste0("chance matching, measured (", IS_DEFAULTS$n_decoy, " decoys)"),
+                   series = "expected by chance", n = expected_decoy),
+  dplyr::transmute(fc, clip_len, panel = "expected spurious assignments (real flanks)",
+                   series = "expected by chance", n = expected_spurious))
+
+ggplot(floor_long, aes(clip_len, n, colour = series)) +
+  annotate("rect", xmin = IS_DEFAULTS$assign_floor$min_len - 0.5, xmax = 12.5, ymin = -Inf, ymax = Inf,
+           fill = "grey92", colour = NA) +
+  geom_vline(xintercept = IS_DEFAULTS$assign_floor$min_len - 0.5, colour = "grey55", linewidth = 0.4) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.2, stroke = 0) +
+  scale_colour_manual(values = pal, name = NULL) +
+  scale_x_continuous(breaks = seq(2, 12, 2)) +
+  facet_wrap(~ panel, scales = "free_y") +
+  labs(x = "clip length (bases)", y = "molecules",
+       title = paste0("The assignment floor at ", IS_DEFAULTS$assign_floor$min_len,
+                      " bp: chance matching is measured, and it costs 0.3 assignments")) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+        legend.position = "bottom", plot.title = element_text(size = 11),
+        strip.text = element_text(size = 9))
+```
+
+**`n_decoy` is 1,000, and it had to be.** At 100 decoy flanks this curve showed **zero** hits at 6 bp
+and that looked like a clean result. It was an absence of evidence: with 100 flanks chance alone
+predicts only 1.67 hits across the 35 molecules at that length, so a zero carries *p* = 0.19 and
+resolves nothing. Raising the decoy set tenfold costs about a ninefold slower matching step — 14
+minutes rather than 2 for `sites` plus `assign` — and buys the measurement:
+
+| clip length | molecules | decoy hits | predicted by chance |
+|---|---|---|---|
+| 5 bp | 9 | 8 | 7.7 |
+| **6 bp** | **35** | **15** | **13.5** |
+| 7 bp | 29 | 1 | 3.3 |
+| 8 bp | 8 | 0 | 0.2 |
+
+**Chance matching at 6 bp is real, measured, and matches theory to 11%** — 15 observed against 13.5
+predicted. It was simply invisible at 100 flanks. That is the left panel, and it is a validation of
+the 4⁻ᴸ rate rather than an argument about the floor.
+
+**The floor rests on the right panel instead**, which applies that validated rate to the flank set
+that actually matters: the **15 real** flanks, not the 1,000 decoys. A clip only causes harm if it
+matches a *wrong real* site.
+
+| clip length | molecules | chance vs the real flanks | expected spurious |
+|---|---|---|---|
+| 4 bp | 17 | 11.1% | 1.89 |
+| 5 bp | 9 | 2.9% | 0.26 |
+| **6 bp** | **35** | **0.73%** | **0.26** |
+| 7 bp | 29 | 0.18% | 0.05 |
+| 8 bp + | 850 | ≤ 0.05% | 0.01 |
+
+**Read the total as a count, not a rate.** Across every accepted length — 931 molecules — **0.31
+spurious assignments are expected, against 1,222 real ones.** Chance matching is uniform per flank,
+so those 0.31 events distribute evenly across the fifteen sites: **0.02 per site**. For IS01 at 318
+cells that is nothing; for IS06 or IS08 at 10 cells it is 0.2% of the clone. It changes no clone
+size, no interval, no figure and no conclusion in this report.
+
+Two percentages were tempting here and both invite overreading. "0.03% of accepted molecules" makes
+it sound safer than any measurement could establish; "1.0% of the 25 assignments the 6 bp band adds"
+makes it sound like a tolerance being brushed, when a rate on a denominator of 25 is not a tolerance
+test at all — it is 0.26 events. **The general rule, since this will recur: a marginal error rate is
+the right frame when the increment will be interpreted on its own, and an absolute count is the right
+frame when it will be pooled.** Nothing in this analysis interprets the 6 bp band separately.
+
+Dropping to 5 bp would roughly double the total to 0.57 and 4 bp would take it to 2.5. One honest
+wrinkle: at 9 and 10 bp a single decoy hit appears where chance predicts ~0.1, the same
+non-uniformity of real genomic sequence that makes short clips match a little more often than 4⁻ᴸ
+implies. It does not move the total, and it is why the analytic rate is validated against decoys
+rather than trusted on its own.
+
+**And here is the fact the floor actually rests on.** Under the `L %/% 10` mismatch budget, **21 of
+those 35 molecules at 6 bp match a decoy flank — a 60% error rate.** Under exact matching, the rate is
+the 0.73% above. A 6-base clip allowed one mismatch matches most of a decoy set, so `min_len = 6`
+without `exact_below` would be far worse than leaving the floor at 10. That coupling is the whole
+case for the current setting, and it is why the two numbers are stored as a single `assign_floor`
+policy with a load-time assertion rather than as two constants a reader is asked not to separate.
 
 **What the change cost and bought.** Against the previous rule — floor 10, budget throughout — the
 new rule gains **57** three-prime assignments and loses **5**:
@@ -510,6 +650,40 @@ sites %>%
   DT::datatable(rownames = FALSE, filter = "top",
                 options = list(pageLength = 20, scrollX = TRUE)) %>%
   DT::formatStyle("cells", fontWeight = "bold")
+```
+
+```{r site-map}
+#| fig-cap: "The fifteen called sites in genomic coordinates. Point area is cells carrying the site;
+#|   colour is which channel called it; an open point is a site that clears the cell floor only on
+#|   the two channels' reads pooled, and should be excluded from repertoire counts."
+#| fig-width: 7.5
+#| fig-height: 4.6
+
+# Evidence tier as identity, in a fixed order - these three categories mean the same thing in every
+# figure, so the hues are assigned to the category and not to its rank in this run's table.
+tier_pal <- c(`both channels` = "#0072B2", `genomic channel only` = "#D55E00",
+              `pooled only` = "#009E73")
+
+site_map <- sites |>
+  dplyr::mutate(
+    chrom = factor(chrom, levels = rev(c(paste0("chr", c(1:19, "X")),
+                                         setdiff(unique(chrom), paste0("chr", c(1:19, "X")))))),
+    mb = pos / 1e6,
+    tier = factor(called_by, levels = names(tier_pal)))
+
+ggplot(site_map, aes(mb, chrom, colour = tier)) +
+  geom_point(aes(size = cells, shape = pooled_only), stroke = 0.9, fill = NA) +
+  ggrepel::geom_text_repel(aes(label = site_id), size = 3, min.segment.length = 0.2,
+                           seed = 1, show.legend = FALSE, colour = "grey20") +
+  scale_shape_manual(values = c(`FALSE` = 19, `TRUE` = 1), guide = "none") +
+  scale_colour_manual(values = tier_pal, name = NULL) +
+  scale_size_area(max_size = 9, breaks = c(10, 100, 300), name = "cells") +
+  labs(x = "position (Mb)", y = NULL,
+       title = "Called integration sites by genomic position") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey93"),
+        legend.position = "bottom", legend.box = "horizontal",
+        plot.title = element_text(size = 11))
 ```
 
 ### What each channel contributes
@@ -937,9 +1111,16 @@ cell_embedding <- function(srt, panel) {
     sample      = as.character(srt$sample.name.long),
     # the hashtag demultiplex call: which replicate mouse this cell came from. "multiplet" and
     # "negative" are failures of the call, not animals, and appear mostly before QC.
-    replicate   = factor(as.character(srt$dm2_class),
-                         levels = c("TotalSeq-B0301", "TotalSeq-B0302", "TotalSeq-B0303",
-                                    "TotalSeq-B0304", "negative", "multiplet")),
+    # NOT srt$dm2_class. Replicate attribution is load-bearing in three places - the cross-mouse
+    # co-occurrence control, the mono-replicate assignment check, and every B0304 caveat - and
+    # taking it from the Seurat object meant it was computed at render time from a 2 GB dependency:
+    # not diffable between runs, and silently different if an upstream target is rebuilt. It is
+    # joined from hashtag_calls.csv.gz below instead, written by
+    # scripts/R/export-hashtag-calls.R. The column is kept here so the join has something to
+    # check against, which is also a check on the file.
+    replicate_srt = factor(as.character(srt$dm2_class),
+                           levels = c("TotalSeq-B0301", "TotalSeq-B0302", "TotalSeq-B0303",
+                                      "TotalSeq-B0304", "negative", "multiplet")),
     compartment = as.character(srt$compartment),
     pass_cell   = srt$pass_cell,
     UMAP_1      = emb[, 1],
@@ -952,7 +1133,16 @@ cell_embedding <- function(srt, panel) {
 hsc <- cell_embedding(tar_read(mpn_processed_hsc_fullcc), "HSC"); gc(verbose = FALSE)
 mnc <- cell_embedding(tar_read(mpn_processed_mnc),        "MNC"); gc(verbose = FALSE)
 
+# The demultiplex calls, from a file rather than from the objects above. The assertion is the point:
+# if the file and the Seurat column ever disagree, one of them is stale and the report should say so
+# rather than quietly pick one.
+hashtag_calls <- readr::read_csv(file.path(sites_dir, "work", "hashtag_calls.csv.gz"),
+                                 show_col_types = FALSE)
+
 embedding <- dplyr::bind_rows(hsc, mnc) %>%
+  dplyr::left_join(dplyr::transmute(hashtag_calls, cell, replicate = factor(
+    call, levels = c("TotalSeq-B0301", "TotalSeq-B0302", "TotalSeq-B0303",
+                     "TotalSeq-B0304", "negative", "multiplet"))), by = "cell") %>%
   # A factor with all three levels, not a character: the wild-type samples contain no labelled cells,
   # so as a character the facet below would silently drop the column that matters most.
   dplyr::mutate(sorted = factor(
@@ -961,6 +1151,11 @@ embedding <- dplyr::bind_rows(hsc, mnc) %>%
       grepl("_negative$", sample) ~ "FACS mCherry−",
       grepl("wildtype",   sample) ~ "wild-type (no vector)"),
     levels = c("FACS mCherry+", "FACS mCherry−", "wild-type (no vector)")))
+
+# The file against the object. If these ever disagree, one is stale - most likely the file, after an
+# upstream target was rebuilt - and the report should stop rather than report whichever it picked.
+stopifnot(identical(as.character(embedding$replicate), as.character(embedding$replicate_srt)))
+embedding$replicate_srt <- NULL
 rm(hsc, mnc); gc(verbose = FALSE)
 
 # tube + barcode is the Seurat cell name, e.g. Rx_4 + AAACCAAAGAATCATC-1 -> Rx_4_AAACCAAAGAATCATC-1
@@ -1033,41 +1228,6 @@ false-negative discussion in the transgene-detection report.
 
 ## Where the clones sit on the UMAP
 
-### Before QC filtering
-
-The embedding used everywhere else in this report is built from cells that passed QC. It is worth
-looking at the unfiltered one first, from `mpn_raw_processed_hsc` and `mpn_raw_processed_mnc`, for one
-reason: a clone label is attached to a *barcode*, and the extraction never consulted the QC flags. If
-labelled cells were concentrated in the part of the manifold that QC later removes — debris, dying
-cells, ambient-heavy droplets — that would undercut the whole analysis.
-
-```{r raw-embedding}
-raw_hsc <- cell_embedding(tar_read(mpn_raw_processed_hsc), "HSC"); gc(verbose = FALSE)
-raw_mnc <- cell_embedding(tar_read(mpn_raw_processed_mnc), "MNC"); gc(verbose = FALSE)
-embedding_raw <- dplyr::bind_rows(raw_hsc, raw_mnc)
-rm(raw_hsc, raw_mnc); gc(verbose = FALSE)
-
-labelled_raw <- assign |>
-  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
-  dplyr::inner_join(dplyr::select(embedding_raw, -tube), by = "cell")
-```
-
-```{r umap-raw, fig.height=6, fig.width=11}
-raw_umap <- function(panel_name) {
-  bg <- dplyr::filter(embedding_raw, panel == panel_name)
-  fg <- dplyr::filter(labelled_raw,  panel == panel_name)
-  ggplot(bg, aes(UMAP_1, UMAP_2)) +
-    geom_point(colour = "grey88", size = 0.25, stroke = 0) +
-    geom_point(data = fg, aes(colour = site_id), size = 1.5, alpha = 0.9) +
-    scale_colour_manual(values = site_palette, drop = FALSE) +
-    labs(title = panel_name, colour = "clone",
-         subtitle = sprintf("%s barcodes before QC, %s carrying a detected integration site",
-                            scales::comma(nrow(bg)), scales::comma(nrow(fg)))) +
-    theme(axis.text = element_blank(), panel.grid = element_blank())
-}
-
-raw_umap("HSC") | raw_umap("MNC")
-```
 
 ```{r raw-vs-clean}
 labelled_raw |>
@@ -1324,37 +1484,6 @@ for (cmp in levels(factor(embedding$panel))) {
 
 :::
 
-The same clones, one tab each, with HSC and MNC side by side: where a clone sits in one
-compartment against where it sits in the other.
-
-::: {.panel-tabset}
-
-```{r umap-facet-by-clone, fig.height=5, fig.width=10, results="asis"}
-# Each compartment has its own embedding, so scales are free; the grey layer carries `panel`, so
-# each side gets its own compartment's cells. drop = FALSE keeps a compartment with no cells of the
-# clone as an empty map, which is itself the result.
-clone_ids <- levels(factor(labelled$site_id))
-bg_cells  <- dplyr::select(dplyr::filter(embedding, pass_cell), panel, UMAP_1, UMAP_2)
-for (clone in clone_ids) {
-  cells <- dplyr::filter(labelled, pass_cell, site_id == clone)
-  n_by  <- table(factor(cells$panel, levels = levels(factor(bg_cells$panel))))
-  cat("### ", clone, "\n\n", sep = "")
-  print(
-    ggplot(cells, aes(UMAP_1, UMAP_2)) +
-      geom_point(data = bg_cells, colour = "grey90", size = 0.15, stroke = 0) +
-      geom_point(colour = "firebrick", size = 1.3) +
-      facet_wrap(~ panel, nrow = 1, scales = "free", drop = FALSE,
-                 labeller = labeller(panel = function(p) sprintf("%s (%d cells)", p, n_by[p]))) +
-      labs(title = paste0("Clone ", clone, ": HSC and MNC"), x = NULL, y = NULL) +
-      theme(axis.text = element_blank(), axis.ticks = element_blank(),
-            panel.grid = element_blank(), aspect.ratio = 1)
-  )
-  cat("\n\n")
-}
-```
-
-:::
-
 A clone confined to one region of the embedding would suggest its cells share a state; one scattered
 across the map suggests the opposite. With these numbers, treat any apparent clustering cautiously —
 a handful of cells will look clustered by chance on a map of tens of thousands.
@@ -1526,44 +1655,76 @@ IS02 sit in one founder, every cell of it carries both and the only reason both 
 many junction molecules that cell yielded. So condition on that count:
 
 ```{r dose-response}
-# P(cell carries both sites | how many junction molecules it yielded), against the prediction if the
-# two sites were one clone: k molecules drawn from two proviruses with probability p and 1-p of
-# landing at each, so P(both) = 1 - p^k - (1-p)^k. A cell with one molecule cannot show two sites,
-# which the prediction accounts for rather than being confounded by.
-mol <- assign |>
+# Depth is DISTINCT MOLECULES per cell, taken from the clip table's one-row-per-molecule shape.
+# It must not be umis_three + umis_genomic: that double-counts the 83 molecules seen in both
+# channels and pushes single-molecule cells into the two-molecule stratum, where a cell cannot show
+# two sites by construction - which deflates sharing exactly where the fraction is read off.
+depth <- clip_tbl |>
+  dplyr::semi_join(called_barcodes, by = c("tube", "barcode")) |>
   dplyr::filter(tube %in% c("Rx_4", "Rx_6")) |>
-  dplyr::mutate(m = umis_three + umis_genomic)
-depth <- mol |>
   dplyr::group_by(tube, barcode) |>
-  dplyr::summarise(k = sum(m), sites = list(as.character(site_id)), .groups = "drop")
+  dplyr::summarise(k = dplyr::n(), .groups = "drop") |>
+  dplyr::inner_join(
+    assign |>
+      dplyr::filter(tube %in% c("Rx_4", "Rx_6")) |>
+      dplyr::group_by(tube, barcode) |>
+      dplyr::summarise(s = list(as.character(site_id)), .groups = "drop"),
+    by = c("tube", "barcode"))
 
-curve_for <- function(a, b, label) {
-  p <- sum(mol$m[mol$site_id == a]) / sum(mol$m[mol$site_id %in% c(a, b)])
+# p comes from the FITTED lambdas, not from each site's share of molecules across both sites' cells:
+# that share includes the non-shared cells and so biases p.
+lam <- stats::setNames(detect_tbl$lambda, detect_tbl$site_id)
+
+depth_curve <- function(a, b, label) {
+  p <- lam[[a]] / (lam[[a]] + lam[[b]])
   depth |>
-    dplyr::mutate(hasA = purrr::map_lgl(sites, ~ a %in% .x),
-                  hasB = purrr::map_lgl(sites, ~ b %in% .x)) |>
+    dplyr::mutate(hasA = purrr::map_lgl(s, ~ a %in% .x),
+                  hasB = purrr::map_lgl(s, ~ b %in% .x)) |>
     dplyr::filter(hasA | hasB) |>
     dplyr::mutate(k = pmin(k, 4L)) |>
     dplyr::group_by(k) |>
     dplyr::summarise(cells = dplyr::n(), both = sum(hasA & hasB),
-                     observed = round(mean(hasA & hasB), 3), .groups = "drop") |>
+                     observed = mean(hasA & hasB), .groups = "drop") |>
     dplyr::mutate(pair = label,
-                  `if one clone` = round(1 - p^k - (1 - p)^k, 3))
+                  `if one clone` = 1 - p^k - (1 - p)^k)
 }
 
-dplyr::bind_rows(
-  curve_for("IS01", "IS02", "IS01 + IS02 — same mouse (B0303)"),
-  curve_for("IS02", "IS04", "IS02 + IS04 — different mice (control)")) |>
-  dplyr::select(pair, molecules = k, cells, both, observed, `if one clone`) |>
+dose <- dplyr::bind_rows(
+  depth_curve("IS01", "IS02", "IS01 + IS02 — same mouse"),
+  depth_curve("IS02", "IS04", "IS02 + IS04 — different mice"))
+
+dose |>
+  dplyr::transmute(pair, `molecules in the cell` = k, cells, both,
+                   observed = round(observed, 3),
+                   `if one clone` = round(`if one clone`, 3)) |>
   knitr::kable()
 ```
 
-| molecules in the cell | IS01 + IS02, same mouse | if one clone | IS02 + IS04, different mice |
-|---|---|---|---|
-| 1 | 0 / 491 | 0.000 | 0 / 389 |
-| 2 | **12 / 114 = 0.105** | 0.493 | 0 / 91 |
-| 3 | **7 / 22 = 0.318** | 0.739 | 0 / 20 |
-| 4+ | 1 / 8 = 0.125 | 0.864 | 0 / 8 |
+```{r dose-plot}
+#| fig-cap: "Sharing against detection depth. The same-mouse pair rises with the number of junction
+#|   molecules a cell yielded; the cross-mouse control is flat at zero at every depth, including the
+#|   deepest cells. The dashed line is what full sharing would predict from the fitted detection
+#|   rates - the gap between it and the observed series bounds the sub-clone fraction."
+#| fig-width: 7.5
+#| fig-height: 4
+
+pair_pal <- c(`IS01 + IS02 — same mouse` = "#D55E00",
+              `IS02 + IS04 — different mice` = "#0072B2")
+
+ggplot(dose, aes(k, observed, colour = pair)) +
+  geom_line(aes(y = `if one clone`), linetype = "22", linewidth = 0.6, na.rm = TRUE) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(size = cells), stroke = 0) +
+  scale_colour_manual(values = pair_pal, name = NULL) +
+  scale_size_area(max_size = 7, breaks = c(10, 100, 500), name = "cells") +
+  scale_x_continuous(breaks = 1:4, labels = c("1", "2", "3", "4+")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "junction molecules in the cell", y = "carrying both sites",
+       title = "Sharing rises with depth for one pair and not the other") +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+        legend.position = "bottom", legend.box = "horizontal",
+        plot.title = element_text(size = 11))
+```
 
 **There is a dose–response, and the matched control is flat at zero.** Sharing rises with detection
 depth for the same-mouse pair — 0, then 10.5%, then 31.8% — and stays at exactly zero for the
@@ -1584,6 +1745,83 @@ a B0303 site with 130 cells and it appears in **none** of the 26 co-occurrences.
 sub-clone reading that is exactly right: IS03 is an independent clone in the same mouse. Under a
 doublet mechanism its absence would be unexplained, since doublets do not know which sites travel
 together.
+
+### Testing the sub-clone on something other than co-occurrence
+
+Everything above is one statistic read several ways. If a double-insertion sub-clone really exists
+inside B0303, its cells are a coherent subpopulation and should look like one in data that the
+co-occurrence test never touched: where they sit on the UMAP, and in what ratio they carry the two
+proviruses. A real sub-clone predicts the sharing cells carry IS01 and IS02 at a balanced ratio and
+occupy the same region as the single-site cells of their own clone; correlated detection predicts no
+such structure, just the deepest cells of a mixed population.
+
+```{r subclone-test}
+#| fig-cap: "Cells carrying IS01, IS02 or both, on the HSC and MNC embeddings, with the within-cell
+#|   molecule ratio for the sharing cells. A sub-clone predicts the both-sites cells sit with the
+#|   single-site cells rather than apart, and carry the two proviruses at a balanced ratio."
+#| fig-width: 8
+#| fig-height: 4.2
+
+share_class <- assign |>
+  dplyr::filter(site_id %in% c("IS01", "IS02")) |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::group_by(cell) |>
+  dplyr::summarise(sites = paste(sort(unique(as.character(site_id))), collapse = "+"),
+                   .groups = "drop") |>
+  dplyr::mutate(class = dplyr::recode(sites, "IS01" = "IS01 only", "IS02" = "IS02 only",
+                                      "IS01+IS02" = "both sites"))
+
+share_pal <- c(`IS01 only` = "#0072B2", `IS02 only` = "#D55E00", `both sites` = "#009E73")
+
+sub_umap <- dplyr::inner_join(share_class, embedding, by = "cell") |>
+  dplyr::filter(pass_cell)
+
+p_umap <- ggplot(dplyr::filter(embedding, pass_cell), aes(UMAP_1, UMAP_2)) +
+  geom_point(colour = "grey90", size = 0.2, stroke = 0) +
+  geom_point(data = sub_umap, aes(colour = class), size = 1.3, alpha = 0.9) +
+  scale_colour_manual(values = share_pal, name = NULL) +
+  facet_wrap(~ panel) +
+  labs(title = "Where the sharing cells sit") +
+  theme(axis.text = element_blank(), panel.grid = element_blank(),
+        legend.position = "bottom", plot.title = element_text(size = 11))
+
+# Within-cell ratio: of a sharing cell's molecules that name one of the two sites, what share is
+# IS01? A sub-clone carrying both predicts a spread around the detection-implied value, not a pile
+# at the extremes.
+ratio <- clip_tbl |>
+  dplyr::filter(match_sites %in% c("IS01", "IS02")) |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::group_by(cell) |>
+  dplyr::summarise(n1 = sum(match_sites == "IS01"), n2 = sum(match_sites == "IS02"),
+                   .groups = "drop") |>
+  dplyr::filter(n1 + n2 >= 2) |>
+  dplyr::mutate(frac1 = n1 / (n1 + n2),
+                class = ifelse(n1 > 0 & n2 > 0, "both sites", "one site only"))
+
+p_ratio <- ggplot(ratio, aes(frac1, fill = class)) +
+  geom_histogram(bins = 9, colour = "white", linewidth = 0.4) +
+  scale_fill_manual(values = c(`both sites` = "#009E73", `one site only` = "grey70"),
+                    name = NULL) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "share of the cell's molecules naming IS01", y = "cells",
+       title = "Within-cell ratio, cells with \u2265 2 molecules") +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+        plot.title = element_text(size = 11))
+
+patchwork::wrap_plots(p_umap, p_ratio, widths = c(2, 1))
+```
+
+**Read this as the weakest link in the finding rather than its confirmation.** The sharing cells are
+too few to settle their own position — 20 of them across both tubes — so the UMAP panel can show
+that they are not obviously a separate island, which is consistent with a sub-clone, and cannot show
+that they form one. The ratio panel is the sharper of the two: a sub-clone carrying both proviruses
+predicts a spread of ratios, while a doublet of two single-site cells predicts the extremes. What it
+cannot do is distinguish a sub-clone from correlated detection within one clone, because both put
+balanced ratios in deep cells.
+
+So the structure remains open, exactly as stated above. This figure is here because the finding
+should be inspectable, not because it closes it — and a cell-barcode-level DNA assay on sorted B0303
+cells is what would.
 
 **Verdict.** Doublets and ambient are excluded as the dominant mechanism, by a control that
 survives the one objection that would have killed it. A **double-insertion sub-clone inside B0303**,
@@ -1661,15 +1899,29 @@ power at the band that matters — 94 molecules at 6–9 bp — is not close to 
 | 10% | 93% |
 
 So it can exclude an error rate above ~5% and cannot certify one below 1%, which is the only decision
-a floor needs. The decoy flanks measure chance matching alone, and 100 of them can be cut against 94
-real molecules, so they have the sample size this lacks. **Set the floor from decoys; read this curve
-as a sanity check that happens to agree.** One detail worth recording either way: all seven
+a floor needs. The decoys measure chance matching alone and can be cut in any number, so they have
+the sample size this lacks. **Set the floor from decoys.**
+
+**And do not read this curve's agreement as support for the floor** — it is consistent with almost
+anything. The accepted set expects 0.31 spurious assignments in total, of which roughly 60% would
+land in another mouse, so the expected cross-mouse count among the 96 molecules at 6–9 bp is about
+**0.16**. Observing zero there is what you would see whether the floor were right or wrong. The
+pooled improvement from 0.62% to 0.50% is not about the floor either: it happened because two of the
+five rejected 10–12 bp assignments were themselves errors, which is the mismatch rule doing the work.
+This control earns its place by being an independent check that *could* have objected, not by having
+agreed. One detail worth recording either way: all seven
 cross-mouse landings are on IS01 or IS02, the two largest clones, which is the prior-inflation
 signature — ambiguous evidence drifting onto the biggest hypothesis — showing up even at the current
 floor.
 
 
-### Clone size: a detection rate that works, and a capture–recapture that cannot
+# Clone size
+
+The two results below — how large the clones are, and what share of the transduced
+population they account for — are what this report is most likely to be cited for. They used to sit
+three levels down, under a methods question about cells carrying more than one site.
+
+## A detection rate that works, and a capture–recapture that cannot
 
 The two channels read the same junctions through different reads, so the tempting argument writes
 itself: a cell carrying a clone can be captured by either channel, the overlap between them measures
@@ -1746,7 +1998,7 @@ at every site where both are defined, by 1.17× to 2.22×, in exactly the direct
 predicts. **That estimator is therefore not used here.** The one below uses the molecule counts,
 which do not require the partition to hold.
 
-#### The estimate the section actually needs
+### The estimate the section actually needs
 
 The same molecule counts that invalidate the overlap support a different estimator, and this one does
 have a referent. If a clone's cells each yield Poisson(λ) *detected* junction molecules, the cells
@@ -1768,7 +2020,15 @@ readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FA
 
 **Read the top row and the bottom row together.** IS05 averages 2.63 molecules a cell and the
 estimator returns 63 against 57 detected — 91% detection, tightly bounded, and the one case where
-the method can see what it is doing. The nine sites at or below 1.09 molecules a cell get `NA`: at
+the method can see what it is doing.
+
+**But be precise about what IS05 validates.** It is the only site with within-cell replication, the
+only one where the fit can be checked against itself, and the anchor for the claim that this
+machinery works — and it sits at **91% detection**, where the correction is a factor of 1.1 and
+barely matters. The sites where the correction is large have no comparable check: IS01 at 28%
+detection is a **3.6× extrapolation** with nothing validating it at that depth. IS05 also belongs to
+B0304, the animal supplying a tenth of the mCherry⁺ cells. **IS05 validates the fit, not the
+extrapolation.** The nine sites at or below 1.09 molecules a cell get `NA`: at
 exactly 1.00 the fit is degenerate, λ → 0 and the clone size goes to infinity, so the pipeline
 declines rather than printing a number. **Those are not nine gaps to fill later** — for a 2-cell site
 the correction would be meaningless against its own uncertainty.
@@ -1781,39 +2041,76 @@ fixed there is nothing left to refit. (Do not read the fit from the variance-to-
 zero-truncated Poisson with small λ is underdispersed by construction, 0.41 at IS02 and 0.17 at IS01,
 so comparing it to 1 suggests a problem that is not there.)
 
-### Repertoire completeness: what fraction of the transduced population these sites account for
+# Repertoire completeness, and what the denominator should be
 
-Detection-corrected clone sizes make a question answerable that sat open for several rounds, and the
-denominator it needs was in hand all along — the mCherry⁺ cells **sequenced**, not the FACS record.
+Detection-corrected clone sizes make completeness answerable, and the first attempt used the obvious
+denominator — the 43,332 sorted mCherry⁺ cells. That denominator is wrong, and the test that shows it
+is independent of junctions entirely.
+
+```{r vector-expression}
+#| fig-cap: "Cells carrying vector transcript, by tube. Measured from reads on the reporter contig
+#|   (mCherry, DRE, WPRE-LTR), so it is independent of the junction data. The wild-type tubes are the
+#|   control: 4 and 6 cells, which is the false-positive rate of the measurement."
+#| fig-width: 7.5
+#| fig-height: 3.4
+
+vexp <- readr::read_csv(file.path(sites_dir, "vector_expression.csv"), show_col_types = FALSE) |>
+  dplyr::left_join(dplyr::select(tube_map, tube = Tube, label = Label), by = "tube") |>
+  dplyr::mutate(label = ifelse(is.na(label), tube, paste0(tube, "  ", label)),
+                sorted = dplyr::case_when(tube %in% c("Rx_4", "Rx_6") ~ "sorted mCherry+",
+                                          tube %in% c("Rx_3", "Rx_7") ~ "sorted mCherry−",
+                                          TRUE ~ "wild-type / stroma"),
+                label = stats::reorder(label, vector_share))
+
+ggplot(vexp, aes(vector_share, label, fill = sorted)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * vector_share)),
+            hjust = -0.15, size = 3.1, colour = "grey20") +
+  scale_fill_manual(values = c(`sorted mCherry+` = "#D55E00",
+                               `sorted mCherry−` = "#0072B2",
+                               `wild-type / stroma` = "#999999"), name = NULL) +
+  scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "called cells carrying any vector transcript", y = NULL,
+       title = "The mCherry+ gate is about half pure") +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        legend.position = "bottom", plot.title = element_text(size = 11))
+```
+
+**Only 65.2% of Rx_4 and 43.2% of Rx_6 called cells carry any vector transcript — 53.6% pooled.** The
+wild-type tubes give 4 of 26,822 and 6 of 17,784, so the measurement has essentially no
+false-positive rate and the shortfall is real. A cell with no vector transcript cannot produce a
+junction read, whether it was never transduced or its provirus is wholly silent, so it has no place
+in the denominator of a junction-based completeness figure.
 
 ```{r completeness}
 readr::read_csv(file.path(sites_dir, "repertoire_completeness.csv"), show_col_types = FALSE) |>
-  dplyr::transmute(
-    `mCherry+ cells sequenced` = scales::comma(mcherry_cells_sequenced),
-    sites, `labelled cells` = scales::comma(detected_cells),
-    `floor (no model)` = sprintf("%.1f%%", 100 * floor_share),
-    `detection-corrected cells` = scales::comma(corrected_cells),
-    `corrected share` = sprintf("%.1f%%", 100 * corrected_share),
-    `unaccounted` = sprintf("%.1f%%", 100 * unaccounted_share),
-    `sites using imputed detection` = sites_with_imputed_detection) |>
-  t() |> as.data.frame() |> setNames("value") |>
+  dplyr::transmute(denominator, cells = scales::comma(cells),
+                   `labelled` = scales::comma(detected_cells),
+                   `floor (model-free)` = sprintf("%.1f%%", 100 * floor_share),
+                   `corrected cells` = scales::comma(corrected_cells),
+                   `corrected (upper bound)` = sprintf("%.1f%%", 100 * corrected_share)) |>
   knitr::kable()
 ```
 
-Two numbers, reported together because they bracket the answer from opposite sides. **2.8% is a
-floor that assumes nothing**: even at perfect detection the fifteen sites cannot account for less of
-the mCherry⁺ population than the cells they already label. **6.7% is the detection-corrected
-estimate**, and it inherits λ's uncertainty — nine of the fifteen sites have no estimable λ and are
-corrected by the median of those that do, which is the weakest step in the calculation and is
-exactly why the floor is printed beside it.
+Against the defensible denominator the fifteen sites account for **5.3% as a model-free floor and
+12.5% as an upper bound**. Both numbers are bounds and in opposite directions, which is why both are
+printed: the floor assumes nothing, and the corrected figure assumes the nine sites without an
+estimable λ detect as well as the six that have one.
 
-Either way the direction is not in doubt: **these fifteen sites are a small minority of the
-transduced population**, and any statement about the clonal repertoire should say so.
+**That assumption flatters the result, and the direction is knowable.** λ is estimable only where
+molecules per cell clears 1.10 — a sample *selected for high detection* — so imputing their median
+to the rest overstates detection, understates those nine clone sizes, and therefore overstates
+completeness. **Quote 5.3% as the floor and 12.5% as the ceiling; never the corrected figure alone.**
 
-#### Where the rest of the junctions are, since they are visible
+## What the remaining cells are, and what cannot settle it
 
-That invites the obvious objection — if ~93% of mCherry⁺ cells belong to no called site, why are
-there no junction reads from them? There are, and the clip table says what becomes of them.
+So roughly 88% of vector-expressing mCherry⁺ cells belong to no called site. An earlier draft of this
+section argued two incompatible things about them at once — that the unassigned-molecule census shows
+"not a large population of undetected clones", and that those cells are clones which "never yielded a
+captured junction molecule at all". **Both cannot hold, and the second one makes the first
+unmeasurable:** a clone that yields no junction molecule leaves none to count, so a molecule census
+has no power over precisely the population it was being used to reassure about. That claim is
+withdrawn.
 
 ```{r unassigned}
 readr::read_csv(file.path(sites_dir, "unassigned_molecules.csv"), show_col_types = FALSE) |>
@@ -1822,28 +2119,30 @@ readr::read_csv(file.path(sites_dir, "unassigned_molecules.csv"), show_col_types
   knitr::kable()
 ```
 
-The decisive split is between the last two rows. A molecule whose clip is long enough to place and
-which still matches no called site is either **at a real locus that failed the cell floor** — 20
-molecules at a handful of positions, each with one or two cells, every one below `min_cells = 3`,
-one of them `chrX:100,691,113` which the target-site-duplication rescue identified and which was
-never promoted to a site — or it is **unplaceable**, 59 molecules at MAPQ < 30 or unmapped, which is
-the repetitive-flank blind spot the genome-mapped channel partly repairs.
+What the census *does* settle is narrower and still worth having: of the junction molecules we have,
+the ones matching no called site are overwhelmingly explained. The long, placeable ones split between
+a handful of loci that failed `min_cells = 3` — one of them `chrX:100,691,113`, which the
+target-site-duplication rescue identified and which was never promoted — and the repetitive-flank
+blind spot. So **we are not discarding evidence of a large hidden repertoire**; we simply have no
+evidence about clones that produce no junctions, and with per-cell detection at 26–52% there should
+be many of them.
 
-So the repertoire missing *within this data* is a few micro-loci below the calling floor plus that
-blind spot — **not** a large population of undetected clones leaving no trace. The two findings are
-consistent: the unaccounted 93% are cells of clones whose proviruses never yielded a captured
-junction molecule at all, which is what a per-cell detection rate of 26–52% implies, so they are
-invisible here by construction rather than by oversight. That is also why this estimate needs no
-posterior model to reach it.
+The remaining gap is therefore one open question rather than a finding: whether the unaccounted cells
+are a repertoire far larger than fifteen clones, or residual gate impurity beyond the vector-transcript
+test. The FACS mCherry⁺ fraction per animal is the measurement that separates them, which returns it
+to load-bearing rather than a cross-check.
 
-Three routes now bear on the size of the two large B0303 clones, and they differ in what they
-assume: the zero-truncated Poisson gives **660 and 1,154** from molecule counts alone, with bootstrap
-intervals of 593–753 and 942–1,480; the co-occurrence inversion gives **2,312** on the assumption
-that IS01 and IS02 share a founder; and Chapman gives 648 and 948 from a design that cannot support
-it. The first is the one to quote — it has a referent, an interval, and a fit check that passes.
-All three agree the answer is **order 10³ against 318 and 342 detected**, and the co-occurrence
-figure being the highest is consistent with its own assumption: if the two sites are one clone, its
-size is the sum of what each sees, not either alone.
+**One estimator, not three in agreement.** The zero-truncated Poisson gives **660 and 1,154** for
+IS02 and IS01, with bootstrap intervals of 593–753 and 942–1,480. It is the one to quote: it has a
+referent, an interval, and a fit check that passes.
+
+The other two should not be lined up beside it as corroboration. Chapman's 648 and 948 come from a
+design that cannot support the estimator at all — a partition of one capture is not two samples — so
+their closeness to the right answer is a coincidence, not agreement. And the co-occurrence inversion's
+2,312 assumes IS01 and IS02 are **fully** shared, which the depth analysis above has just argued
+against: under partial sharing the inversion is not a clone-size estimate of anything. Quoting three
+numbers that "agree on order 10³" dressed one estimate up as a consensus. **It is one estimate, and
+order 10³ against 318 and 342 detected is what it says.**
 
 # Limitations
 

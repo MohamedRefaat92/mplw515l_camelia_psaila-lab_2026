@@ -64,6 +64,16 @@ if (stage == "extract") {
   called <- read_called_barcodes(bam_dir, tubes)
   write_csv_checked(called, file.path(work, "called_barcodes.csv.gz"))
   write_csv_checked(count_barcodes(bam_dir, tubes), file.path(work, "barcode_counts.csv"))
+
+  # Vector transcript per tube, independent of junctions. The discriminator for what the completeness
+  # denominator should be: a sorted mCherry+ cell with no vector transcript is outside this assay's
+  # reach whatever the reason. ~75 s for eight tubes.
+  write_csv_checked(vector_expression(bam_dir, tubes), file.path(out, "vector_expression.csv"))
+  # Per cell as well as per tube: the per-tube share says whether the sort gate is pure, the per-cell
+  # table is what the per-clone expression comparisons and any "transduced but unplaced" question
+  # need. Only cells with at least one vector UMI, which is about a sixth of them.
+  write_csv_checked(vector_expression_cells(bam_dir, tubes),
+                    file.path(out, "vector_expression_cells.csv.gz"))
   message("=== called barcodes: ", nrow(called), " over ", dplyr::n_distinct(called$tube), " tubes")
 
   # Second channel: the provirus's 5' junction, read off the same BAMs.
@@ -257,9 +267,19 @@ if (stage == "extract") {
   # positional anchoring is not doing what it claims and nothing downstream can be trusted.
   eps <- decoy_error_rate(mini_all, n_real = nrow(site_table))
   write_csv_checked(eps, file.path(out, "decoy_error_rate.csv"))
+  # Decoy hits are NOT required to be zero, and the old assertion that they were only looked right
+  # because n_decoy was 100. Chance matching scales with the number of decoy flanks: at 1000 flanks a
+  # short clip matches one by chance often, and the expected count runs to tens. The test is observed
+  # against expected-under-chance per clip length, which decoy_error_rate() and clip_floor_curve()
+  # both report. What would mean broken anchoring is hits at long clip lengths, where chance is
+  # negligible - a 20-base clip has a 4^-20 chance per flank and should never hit one.
   n_decoy_hits <- sum(startsWith(mini_all$site_id, IS_DEFAULTS$decoy_prefix))
-  message("=== decoy flanks hit at the junction base: ", n_decoy_hits,
-          if (n_decoy_hits == 0L) "  (as required)" else "  <-- ANCHORING IS BROKEN")
+  long_decoy <- sum(startsWith(mini_all$site_id, IS_DEFAULTS$decoy_prefix) &
+                      mini_all$clip_len >= 15L)
+  message("=== decoy flanks hit at the junction base: ", n_decoy_hits, " over ",
+          IS_DEFAULTS$n_decoy, " decoys; ", long_decoy, " of them on clips >= ",
+          IS_DEFAULTS$assign_floor$exact_below, " bp",
+          if (long_decoy == 0L) "  (as required)" else "  <-- ANCHORING IS BROKEN")
   if (nrow(eps)) print(as.data.frame(eps), row.names = FALSE)
 
   mini <- dplyr::semi_join(mini_all, dplyr::select(site_table, site_id), by = "site_id") |>
@@ -326,9 +346,11 @@ if (stage == "extract") {
     write_csv_checked(dplyr::filter(raw, nm <= budget),
                       file.path(out, "clip_matches.csv.gz"))
     message("=== clip table: ", nrow(clip_tbl), " molecules (",
-            sum(clip_tbl$channel == "three_prime"), " three-prime, ",
-            sum(clip_tbl$channel == "genomic"), " genomic), ",
-            sum(clip_tbl$clip_len < IS_DEFAULTS$min_assign, na.rm = TRUE), " below the floor")
+            sum(clip_tbl$channels == "three_prime"), " 3' only, ",
+            sum(clip_tbl$channels == "genomic"), " genomic only, ",
+            sum(clip_tbl$channels == "both"), " both), ",
+            sum(clip_tbl$clip_len < IS_DEFAULTS$assign_floor$min_len, na.rm = TRUE),
+            " below the floor")
 
     # THE EQUALITY GATE. Filtered at the current floor and tolerance, the clip table must reproduce
     # the pipeline's own output exactly. If it does not, the table is wrong and nothing built on it
@@ -349,7 +371,8 @@ if (stage == "extract") {
     # Every number the report quotes about floors, ambient and completeness is computed here, not
     # typed into the prose. A figure in a rendered report that cannot be regenerated from the code
     # and the data is a figure nobody can check.
-    write_csv_checked(clip_floor_curve(clip_tbl), file.path(out, "clip_floor_curve.csv"))
+    write_csv_checked(clip_floor_curve(clip_tbl, sites = site_table),
+                      file.path(out, "clip_floor_curve.csv"))
     write_csv_checked(unassigned_molecules(clip_tbl, discovery_for_unassigned, cell_table),
                       file.path(out, "unassigned_molecules.csv"))
     counts_f <- file.path(work, "barcode_counts.csv")
@@ -359,7 +382,12 @@ if (stage == "extract") {
         file.path(out, "ambient_rate.csv"))
     }
     mch <- if (file.exists(called_f)) sum(called$tube %in% c("Rx_4", "Rx_6")) else NA_integer_
-    write_csv_checked(repertoire_completeness(det, mch),
+    vec_f <- file.path(out, "vector_expression.csv")
+    vpos <- if (file.exists(vec_f)) {
+      v <- readr::read_csv(vec_f, show_col_types = FALSE)
+      sum(v$vector_positive[v$tube %in% c("Rx_4", "Rx_6")], na.rm = TRUE)
+    } else NA_integer_
+    write_csv_checked(repertoire_completeness(det, mch, vpos),
                       file.path(out, "repertoire_completeness.csv"))
     if (nrow(det)) {
       message("=== detection model (NA where the truncated mean is too close to 1 to fit)")
@@ -389,6 +417,16 @@ if (stage == "extract") {
 
   tsd <- tsd_check(site_table, five, genome_fa = genome_fa)
   write_csv_checked(tsd, file.path(out, "tsd_check.csv"))
+
+  # One row per site with every flag that bears on trusting it, so downstream work can filter on
+  # `defensible` instead of re-deriving a judgement this analysis has now made three times. Placed
+  # here because it needs both tsd and the detection model, and an earlier placement referenced tsd
+  # before it existed - caught by checking the statement order rather than by running it.
+  write_csv_checked(
+    site_evidence(site_table, tsd = tsd,
+                  detection = if (exists("det")) det else NULL,
+                  flank_fa = file.path(work, "site_flanks.fa")),
+    file.path(out, "site_evidence.csv"))
 
   # Orphan 5' junctions, tested at the one position their partner must occupy. Reports the
   # denominator alongside the hits, because a single Delta = 4 match with no idea how many positions

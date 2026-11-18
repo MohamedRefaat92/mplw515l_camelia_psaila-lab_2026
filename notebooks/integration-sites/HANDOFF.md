@@ -418,6 +418,32 @@ cross-mouse landings sitting on IS01 and IS02).
 
 Current counts: **15 sites, 1,222 assignments over 1,195 cells**, gate passing.
 
+**The assignment floor is ONE OBJECT, not two constants (2026-11-18).** `IS_DEFAULTS$assign_floor` is
+`list(min_len = 6L, exact_below = 15L)` and there is a load-time assertion that refuses an incoherent
+pair. This is a guard, not tidiness: under the `L %/% 10` mismatch budget **21 of the 35 molecules at
+6 bp match a decoy flank — a 60% error rate** — so `min_len = 6` is defensible only with exact
+matching beneath it. Asking a reader not to separate the two numbers is not a guard; making them one
+value is. The assertion was tested by feeding it an incoherent policy, and it rejects at `source()`.
+
+**What licenses the floor, and what does not.** 0.31 expected spurious assignments across the 931
+accepted molecules, against 1,222 real — **0.02 per site**, which changes no clone size, interval or
+figure. Report that absolute count, not a percentage: a rate on the 25 assignments the 6 bp band adds
+reads as a tolerance being brushed when it is 0.26 events. *General rule, since it recurs: a marginal
+error rate is the right frame when the increment will be interpreted on its own, an absolute count
+when it will be pooled.* Two things that look like supporting evidence and are not: the
+mono-replicate control's zero cross-mouse errors in that band (only ~0.16 were expected, so zero is
+consistent with anything), and the wild-type tubes (as always).
+
+**`n_decoy` is 1,000, and decoy comparisons are capped at `exact_below`.** At 100 flanks the curve
+showed zero hits at 6 bp, which read as clean and was an absence of evidence — chance predicts 1.67,
+so *p* = 0.19. At 1,000 the measurement exists: **15 observed against 13.5 predicted, obs/exp = 1.11**,
+which validates the matcher against theory and is the form the standing check should read. Capping
+decoy comparisons at 15 bp cost nothing — chance matching at 30 bases is 4⁻³⁰ — and took `assign`
+from ~13 minutes back to **3 m 52 s** with the decoy count unchanged. `ratio_interpretable` marks the
+lengths where obs/exp can be read at all; below an expectation of ~5 events a single chance hit sends
+the ratio to 30, and a standing check that alarms on Poisson noise is the monotonicity test's mistake
+again.
+
 Three checks the pipeline never used as input, so they are genuinely independent:
 
 1. **Integration-site preference — underpowered, do not cite as a validation.** 6 of 8 usable sites

@@ -175,8 +175,10 @@ collect_provenance <- function(catalogue = "metadata/catalogue_data.tsv") {
       if (length(p$uncommitted)) "warning" else "ok",
       if (isTRUE(p$renv_synced)) "ok" else "warning",
       if (p$built_by_targets && !is.na(p$report)) "ok" else "warning",
+      # all() of an empty vector is TRUE, so a report with no declared inputs used to come out
+      # GREEN here - the one state that should never read as a pass, because nothing was checked.
       if (any(p$inputs$check %in% c("DIFFERS from catalogue", "missing"))) "error"
-        else if (!all(inputs_ok)) "warning" else "ok"
+        else if (nrow(p$inputs) == 0L || !all(inputs_ok)) "warning" else "ok"
     )
   )
   p$state <- if (any(p$checks$level == "error")) "error" else if (any(p$checks$level == "warning")) "warning" else "ok"
@@ -209,7 +211,13 @@ render_summary <- function(p) {
               else if (!p$built_by_targets) "rendered outside the pipeline: upstream results may be out of date"
               else paste0("built by targets &middot; upstream fingerprint `", p$fingerprint, "`")
   bad <- p$inputs[!p$inputs$check %in% c("matches catalogue", "in git"), , drop = FALSE]
-  inputs <- sprintf("%d of %d file(s) verified (details below)", nrow(p$inputs) - nrow(bad), nrow(p$inputs))
+  # "0 of 0 file(s) verified" is worse than a failure: it reads as a pass when in fact nothing was
+  # checked, which is what a report whose inputs are not declared as targets produces. Say so.
+  inputs <- if (nrow(p$inputs) == 0L) {
+    "**no input files declared** - nothing was verified, which is not the same as a pass"
+  } else {
+    sprintf("%d of %d file(s) verified (details below)", nrow(p$inputs) - nrow(bad), nrow(p$inputs))
+  }
   if (nrow(bad)) inputs <- paste0(inputs, ": ", paste0("`", bad$path, "` ", bad$check, collapse = "; "))
 
   tab <- data.frame(mark = mark[p$checks$level], check = p$checks$check,

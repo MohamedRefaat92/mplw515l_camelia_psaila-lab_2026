@@ -67,13 +67,12 @@ IS_DEFAULTS <- list(
   # budget, which is the right instrument read at the wrong resolution: in bands, and with one
   # mismatch allowed, 6-9 bp looks dirty. Raise or lower this only against a fresh per-base decoy
   # curve, and never without deciding exact_below in the same breath.
-  min_assign     = 6L,
-  # Below this length a clip must match EXACTLY. The mismatch budget below is L %/% 10, which is one
-  # mismatch for anything under 20 bases - and one mismatch allowed on a 6-base clip lets it match
-  # almost every flank, which is why decoy hits persisted to 8 bp under the budget and vanish at 6 bp
-  # under exact matching. The floor and this constant are one decision, not two: min_assign = 6 is
-  # only defensible with exact matching beneath it.
-  exact_below    = 15L,
+  # ONE OBJECT, NOT TWO CONSTANTS, and that is the guard rather than a tidiness preference.
+  # min_len = 6 is only defensible with exact matching beneath exact_below: under the L %/% 10
+  # mismatch budget a 6-base clip is allowed one mismatch and 21 of the 35 molecules at that length
+  # match a decoy flank - a 60% error rate. Asking a reader not to separate the two numbers is not a
+  # guard; making them one value is. Anything that wants to move the floor has to move the policy.
+  assign_floor   = list(min_len = 6L, exact_below = 15L),
   flank          = 200L,    # bases either side of a called site in the mini-reference
   # A flank containing a long homopolymer attracts clips that belong nowhere. JH584304.1:35,417 has a
   # 23-base run against 5-6 for every genuine site, and the mini-reference inflated it 3 -> 14 cells,
@@ -96,7 +95,12 @@ IS_DEFAULTS <- list(
   # matching, and conflating the two is a reasoning error this analysis has already made once.
   # They must share the FASTA with the real flanks - a separate run would not share the aligner's
   # view of the search space, which is the thing being measured.
-  n_decoy        = 100L,
+  # 1000, not 100. With 100 the decoy curve has no power where it matters: observed hits track
+  # expected-under-chance at every length (10 against 9.24 at 4 bp, 0 against 1.67 at 6 bp), so a
+  # zero at the floor carries p = 0.19 and resolves nothing. At 1000 flanks chance predicts ~13 hits
+  # at 6 bp, so a zero there is a measurement rather than an absence of evidence. The cost is the
+  # matcher, which runs over every flank: ~9x more comparisons in the assignment step.
+  n_decoy        = 1000L,
   decoy_seed     = 20261117L,
   decoy_prefix   = "DECOY",
   # The genome-mapped channel: reads STAR placed on the host genome with the vector soft-clipped,
@@ -123,6 +127,24 @@ IS_DEFAULTS <- list(
   # genuinely is a unique alignment. Only the clip's sequence gives it away.
   psi_prefix     = "GTGGCGCCCGAACAGG"
 )
+
+# Checked when this file is sourced, not left to a reader's discretion. The floor and the exact-match
+# threshold are one policy (see assign_floor): a clip admitted below ~15 bases MUST be matched
+# exactly, because the L %/% 10 budget allows it one mismatch and a 6-base clip with one mismatch
+# matches 60% of a decoy set. If someone lowers the floor without the exact-match rule reaching it,
+# this stops the run at source() rather than producing a quietly worse table.
+local({
+  fl <- IS_DEFAULTS$assign_floor
+  if (!(fl$min_len >= 15L || fl$exact_below >= 15L)) {
+    stop("assign_floor is incoherent: min_len = ", fl$min_len, " admits clips below 15 bases while ",
+         "exact matching is only required below ", fl$exact_below, ". A short clip under the ",
+         "mismatch budget matches most of a decoy set; see clip_floor_curve.csv.", call. = FALSE)
+  }
+  if (fl$exact_below < fl$min_len) {
+    stop("assign_floor is incoherent: exact_below (", fl$exact_below, ") is below min_len (",
+         fl$min_len, "), so no admitted clip is ever matched exactly.", call. = FALSE)
+  }
+})
 
 
 # ── Stage 1: pull the clipped tails out of one BAM ────────────────────────────────────────────────
@@ -258,7 +280,7 @@ classify_five_prime_clips <- function(clips, opt = IS_DEFAULTS) {
     polya_frac >= opt$polya_fraction ~ "polyA tail",
     is.na(barcode) | is.na(umi)      ~ "no cell barcode or UMI",
     clip_len >= opt$min_discovery    ~ "discovery",
-    clip_len >= opt$min_assign       ~ "assign",
+    clip_len >= opt$assign_floor$min_len       ~ "assign",
     TRUE                             ~ "clip too short to place"
   ))
 }
@@ -435,7 +457,7 @@ classify_clips <- function(clips, opt = IS_DEFAULTS) {
     polya_frac >= opt$polya_fraction      ~ "polyA tail",
     is.na(barcode) | is.na(umi)           ~ "no cell barcode or UMI",
     clip_len >= opt$min_discovery         ~ "discovery",
-    clip_len >= opt$min_assign            ~ "assign",
+    clip_len >= opt$assign_floor$min_len            ~ "assign",
     TRUE                                  ~ "clip too short to place"
   ))
 }
@@ -626,6 +648,18 @@ write_site_flanks <- function(sites, genome_fa, path, opt = IS_DEFAULTS) {
   if (length(decoys)) {
     message("    plus ", length(decoys), " decoy flanks, to measure the assignment error rate")
     seqs <- c(seqs, decoys)
+    # The decoys set the assignment floor, so the floor can move with nothing else changing if they
+    # are redrawn differently. They are already seeded (opt$decoy_seed), but a seed is only a promise
+    # until something checks it: the digest of the drawn set is recorded next to the flanks, and a
+    # change in it is visible in the diff of a run rather than only in the numbers it produces.
+    dg <- paste(substr(openssl::md5(paste(names(decoys), as.character(decoys), collapse = "|")),
+                       1, 12), collapse = "")
+    writeLines(c(paste0("n_decoy\t", length(decoys)),
+                 paste0("decoy_seed\t", opt$decoy_seed),
+                 paste0("flank\t", opt$flank),
+                 paste0("digest\t", dg)),
+               file.path(dirname(path), "decoy_provenance.tsv"))
+    message("    decoy set digest ", dg, " (seed ", opt$decoy_seed, ")")
   }
   Biostrings::writeXStringSet(seqs, path)
   invisible(length(seqs))
@@ -754,10 +788,19 @@ clip_site_matches <- function(clip_fa, flank_fa, opt = IS_DEFAULTS, min_len = 1L
   }
   revcomp <- function(x) as.character(Biostrings::reverseComplement(Biostrings::DNAStringSet(x)))
 
+  # Decoys are only compared against SHORT clips, and that is where most of the cost went. Chance
+  # matching at 30 bases is 4^-30: there is nothing to measure there, and comparing 1000 decoy flanks
+  # against the 748 molecules of 7 bases and up was paying for it anyway. Capping decoy comparisons
+  # at exact_below keeps every comparison that carries information and drops the rest.
+  is_decoy_flank <- startsWith(fref[, 1], opt$decoy_prefix)
+  decoy_max_len <- opt$assign_floor$exact_below
+
   out <- list()
   for (s in seq_along(fseq)) {
     j <- fjun[s]; fl <- fseq[s]; n <- nchar(fl)
-    for (L in sort(unique(len))) {
+    lens <- sort(unique(len))
+    if (is_decoy_flank[s]) lens <- lens[lens <= decoy_max_len]
+    for (L in lens) {
       k <- which(len == L)
       # Forward: the clip's first base IS the junction base, so it starts at j and runs right.
       if (j + L - 1L <= n) {
@@ -808,13 +851,14 @@ empty_match_table <- function() {
 
 #' The rule that turns a match into an assignment. Defined once so nothing can test a different one.
 #'
-#' Two thresholds, and they are a single decision: a clip must reach `min_assign`, and beneath
+#' Two thresholds held as one policy, `assign_floor`: a clip must reach `min_len`, and beneath
 #' `exact_below` it must match exactly rather than within the L %/% 10 budget. Keeping them in one
 #' predicate is not tidiness - the equality gate exists to prove the clip table and the pipeline
 #' agree, and it can only do that if both ask the same question. When this was two copies of a
 #' filter, changing the floor in one place would have left the gate passing against the old rule.
 assign_keep <- function(clip_len, nm, budget, opt = IS_DEFAULTS) {
-  clip_len >= opt$min_assign & nm <= ifelse(clip_len < opt$exact_below, 0L, budget)
+  fl <- opt$assign_floor
+  clip_len >= fl$min_len & nm <= ifelse(clip_len < fl$exact_below, 0L, budget)
 }
 
 #' Assign clips to sites: the floor-and-tolerance VIEW over clip_site_matches().
@@ -825,7 +869,7 @@ assign_keep <- function(clip_len, nm, budget, opt = IS_DEFAULTS) {
 #' here and nowhere else - `min_assign` on the clip length, and the same `L %/% 10` mismatch budget
 #' the bwa path used to apply through NM.
 assign_clips_exact <- function(clip_fa, flank_fa, opt = IS_DEFAULTS) {
-  m <- clip_site_matches(clip_fa, flank_fa, opt, min_len = opt$min_assign)
+  m <- clip_site_matches(clip_fa, flank_fa, opt, min_len = opt$assign_floor$min_len)
   if (nrow(m) == 0L) return(empty_hit_table())
   m |>
     dplyr::filter(assign_keep(clip_len, nm, budget, opt)) |>
@@ -1270,36 +1314,30 @@ genomic_site_hits <- function(gen, site_table, opt = IS_DEFAULTS) {
 #' Collapse the matcher's output to ONE ROW PER MOLECULE, with no floor applied.
 #'
 #' The unit is the molecule - tube + barcode + UMI - because that is the unit of capture. Reads of
-#' one UMI are duplicates of one fragment, and counting them as separate evidence is the mistake
-#' that put 150 cells in both channels when 83 belong there. `clip_len` and `clip` come from the
-#' molecule's LONGEST read, which is its most informative one; `match_sites` is the union over all
-#' of the molecule's reads, so a molecule is not silently stripped of a site that only a shorter
-#' read matched. `n_reads` records how many there were.
+#' one UMI are duplicates of one fragment, and counting them as separate evidence is the mistake that
+#' put 150 cells in both channels when 83 belong there.
 #'
-#' Decoy flanks are matched too, because clip_site_matches() tests whatever is in the flank file and
-#' the decoys live there. They are kept, labelled, and excluded by the views - a decoy match at a
-#' given clip length is the error rate, so dropping it here would throw away the measurement.
+#' One row per molecule, with channel membership as FLAGS. This shape is deliberate and it is a fix
+#' rather than a preference. The table used to carry one row per molecule PER CHANNEL, and the cell
+#' table carried `umis_three` and `umis_genomic` as separate counts - and as long as two counts sit
+#' side by side, something will add them. Something did: the depth variable in the sharing analysis
+#' was `umis_three + umis_genomic`, which double-counts the 83 molecules present in both channels and
+#' pushes single-molecule cells into the two-molecule stratum, where a cell cannot show two sites by
+#' construction. The same error was fixed for lambda and not propagated. With `in_three`/`in_genomic`
+#' as logicals and one row per molecule, `dplyr::n()` is the molecule count and the wrong sum is not
+#' expressible.
 #'
-#' No floor and no tolerance are applied. At 1-9 bases the budget is 1 mismatch, so a one-base clip
-#' matches every flank in both orientations and `n_match` comes out at K. That is not a defect in the
-#' table, it is the ambiguity the floor exists to prevent, finally visible instead of inferred.
+#' `clip_len` and `clip` come from the molecule's LONGEST three-prime read, which is its most
+#' informative one; `host_len` carries the genomic channel's host anchor separately, because the
+#' two are different quantities and were previously merged into one column. `match_sites` comes
+#' from the representative read alone - a union across a molecule's reads let a 5-base read's
+#' matches through a floor applied to its 30-base sibling.
+#'
+#' Decoy flanks are matched too and are kept, labelled, because a decoy match at a given clip length
+#' is the error rate and dropping it here would throw away the measurement.
 molecule_clip_table <- function(raw, gen_site_hits = NULL, sites = NULL, opt = IS_DEFAULTS) {
   is_decoy <- function(x) startsWith(x, opt$decoy_prefix)
   three <- if (nrow(raw)) {
-    # The molecule's REPRESENTATIVE read is its longest clip, and matches are taken from that read
-    # alone. Two mistakes were made here and the gate caught both.
-    #
-    # First, taking the union of matches across a molecule's reads let a 5-base read's matches
-    # through a floor that was being applied to its 30-base sibling: at 1-9 bases the budget is one
-    # mismatch, so a short read matches almost every flank, and 52 spurious assignments arrived that
-    # way. A molecule's reads are duplicates of one fragment, so the longest carries the most
-    # sequence and the shorter ones are subsets of it - there is nothing to union.
-    #
-    # Second, `clip_len = max(clip_len)` followed by `clip = first(clip[clip_len == max(clip_len)])`
-    # inside one summarise() does not do what it reads like: dplyr evaluates sequentially, so by the
-    # second line `clip_len` is already the scalar maximum and the subscript is all TRUE. The
-    # representative read is therefore selected by filter() before the summarise, where it cannot
-    # be quietly wrong.
     rep <- raw |>
       dplyr::group_by(tube, barcode, umi) |>
       dplyr::mutate(reads = dplyr::n_distinct(clip_len), longest = max(clip_len)) |>
@@ -1308,41 +1346,53 @@ molecule_clip_table <- function(raw, gen_site_hits = NULL, sites = NULL, opt = I
     rep |>
       dplyr::group_by(tube, barcode, umi) |>
       dplyr::summarise(
-        channel   = "three_prime",
-        n_reads   = dplyr::first(reads),
+        n_reads_three = dplyr::first(reads),
         clip_len  = dplyr::first(clip_len),
         clip      = dplyr::first(clip),
         best_nm   = min(nm),
-        n_match   = dplyr::n_distinct(site_id[nm <= budget & !is_decoy(site_id)]),
+        n_match_three = dplyr::n_distinct(site_id[nm <= budget & !is_decoy(site_id)]),
         n_decoy_match = dplyr::n_distinct(site_id[nm <= budget & is_decoy(site_id)]),
-        # Exact-match counts as well as budgeted ones. The floor curve is read off these, and
-        # recording both is what lets the curve be recomputed rather than quoted.
         n_match_exact = dplyr::n_distinct(site_id[nm == 0L & !is_decoy(site_id)]),
         n_decoy_exact = dplyr::n_distinct(site_id[nm == 0L & is_decoy(site_id)]),
-        match_sites = paste(sort(unique(site_id[nm <= budget & !is_decoy(site_id)])),
+        sites_three = paste(sort(unique(site_id[nm <= budget & !is_decoy(site_id)])),
                             collapse = ";"),
         .groups = "drop")
   } else {
-    dplyr::tibble()
+    dplyr::tibble(tube = character(), barcode = character(), umi = character())
   }
   gen <- if (!is.null(gen_site_hits) && nrow(gen_site_hits)) {
     gen_site_hits |>
       dplyr::group_by(tube, barcode, umi) |>
-      dplyr::summarise(
-        channel   = "genomic",
-        n_reads   = dplyr::n(),
-        clip_len  = max(clip_len),      # host anchor length in this channel, not a vector clip
-        clip      = NA_character_,
-        best_nm   = 0L,                 # placed by coordinate, not by flank comparison
-        n_match   = dplyr::n_distinct(site_id),
-        n_decoy_match = 0L,
-        match_sites = paste(sort(unique(site_id)), collapse = ";"),
-        .groups = "drop")
+      dplyr::summarise(n_reads_genomic = dplyr::n(),
+                       host_len = max(clip_len),
+                       sites_genomic = paste(sort(unique(site_id)), collapse = ";"),
+                       n_match_genomic = dplyr::n_distinct(site_id),
+                       .groups = "drop")
   } else {
-    dplyr::tibble()
+    dplyr::tibble(tube = character(), barcode = character(), umi = character())
   }
-  dplyr::bind_rows(three, gen) |>
-    dplyr::arrange(tube, barcode, umi, channel)
+
+  dplyr::full_join(three, gen, by = c("tube", "barcode", "umi")) |>
+    dplyr::mutate(
+      in_three   = !is.na(n_reads_three),
+      in_genomic = !is.na(n_reads_genomic),
+      channels   = dplyr::case_when(in_three & in_genomic ~ "both",
+                                    in_three ~ "three_prime", TRUE ~ "genomic"),
+      dplyr::across(c(n_reads_three, n_reads_genomic, n_match_three, n_match_genomic,
+                      n_decoy_match, n_match_exact, n_decoy_exact),
+                    ~ tidyr::replace_na(.x, 0L)),
+      # The union across channels, which is what "does this molecule name a site" means.
+      match_sites = vapply(seq_along(in_three), function(i) {
+        s <- c(strsplit(tidyr::replace_na(sites_three[i], ""), ";")[[1]],
+               strsplit(tidyr::replace_na(sites_genomic[i], ""), ";")[[1]])
+        paste(sort(unique(s[nzchar(s)])), collapse = ";")
+      }, character(1)),
+      n_match = pmax(n_match_three, n_match_genomic)) |>
+    dplyr::select(tube, barcode, umi, channels, in_three, in_genomic,
+                  n_reads_three, n_reads_genomic, clip_len, host_len, clip, best_nm,
+                  n_match, n_match_three, n_match_genomic, n_match_exact,
+                  n_decoy_match, n_decoy_exact, match_sites) |>
+    dplyr::arrange(tube, barcode, umi)
 }
 
 #' Does the matcher, filtered at the current floor, reproduce the pipeline's own output?
@@ -1388,38 +1438,189 @@ clip_table_gate <- function(matches, site_table, cell_table, gen_site_hits = NUL
     dplyr::mutate(agrees = pipeline == clip_table)
 }
 
+#' Per-cell vector-transcript UMIs, for every called cell that carries any.
+#'
+#' The per-tube share answers whether the sort gate is pure. This answers the per-cell questions
+#' that depend on it: whether a cell with no junction molecule is nonetheless transduced, and
+#' whether the per-clone expression differences that this report reads off vector UMIs are
+#' confounded by anything. Same three reporter genes, same matrix, one row per cell rather than one
+#' per tube.
+#'
+#' Only cells with at least one vector UMI are returned - about 26,000 of 161,000 - because a table
+#' of zeros is the same information at six times the size. A cell absent from this table has none.
+vector_expression_cells <- function(bam_dir, tubes, genes = c("mCherry", "DRE", "WPRE-LTR")) {
+  dplyr::bind_rows(lapply(tubes, function(tube) {
+    d <- file.path(bam_dir, paste0("cellranger_", tube), "sample_filtered_feature_bc_matrix")
+    f_feat <- file.path(d, "features.tsv.gz"); f_mtx <- file.path(d, "matrix.mtx.gz")
+    f_bc   <- file.path(d, "barcodes.tsv.gz")
+    if (!all(file.exists(f_feat, f_mtx, f_bc))) return(dplyr::tibble())
+    feat <- readLines(gzfile(f_feat))
+    want <- which(sub("\t.*", "", feat) %in% genes)
+    bcs  <- readLines(gzfile(f_bc))
+    hdr_raw <- readLines(gzfile(f_mtx), n = 10L)
+    n_comment <- sum(startsWith(hdr_raw, "%"))
+    trip <- data.table::fread(f_mtx, skip = n_comment + 1L, showProgress = FALSE,
+                              col.names = c("row", "col", "val"))
+    hit <- trip[trip$row %in% want, ]
+    if (!nrow(hit)) return(dplyr::tibble())
+    dplyr::tibble(tube = tube, barcode = bcs[hit$col],
+                  gene = sub("\t.*", "", feat[hit$row]), umis = hit$val) |>
+      dplyr::group_by(tube, barcode) |>
+      dplyr::summarise(vector_umis = sum(umis),
+                       genes_detected = dplyr::n_distinct(gene), .groups = "drop")
+  }))
+}
+
+#' One row per site, every flag that bears on whether to trust it, in one place.
+#'
+#' The flags exist already and are scattered across five outputs, so deciding which sites are
+#' defensible means re-deriving a judgement that has already been made three times in this analysis.
+#' Collected here, downstream work can filter to the defensible set without reconstructing the
+#' reasoning: `defensible` is the single column to filter on, and the columns beside it say why.
+#'
+#' `defensible` is FALSE for a site that clears the cell floor only on the two channels' reads pooled
+#' (`pooled_only`) or whose flank cannot support quantification (`flank_gated`). It is deliberately
+#' not a quality score - there is no threshold being applied to a continuum here, just two named
+#' disqualifications and the evidence for each.
+site_evidence <- function(site_table, tsd = NULL, detection = NULL, five = NULL,
+                          flank_fa = NULL, opt = IS_DEFAULTS) {
+  if (nrow(site_table) == 0L) return(dplyr::tibble())
+  in_mini <- if (!is.null(flank_fa) && file.exists(flank_fa)) {
+    nm <- grep("^>", readLines(flank_fa), value = TRUE)
+    sub("\\|.*", "", sub("^>", "", nm))
+  } else NA_character_
+
+  ev <- dplyr::tibble(
+    site_id      = site_table$site_id,
+    chrom        = site_table$chrom,
+    pos          = site_table$pos,
+    strand       = site_table$strand,
+    gene         = site_table$gene,
+    cells        = site_table$cells,
+    umis         = site_table$umis,
+    called_by    = site_table$called_by,
+    pooled_only  = site_table$pooled_only,
+    cis_confound = site_table$cis_confound,
+    flank_gated  = if (length(in_mini) == 1L && is.na(in_mini[1])) NA
+                   else !site_table$site_id %in% in_mini)
+
+  if (!is.null(tsd) && nrow(tsd)) {
+    st <- tsd |>
+      dplyr::filter(!is.na(site_id)) |>
+      dplyr::group_by(site_id) |>
+      dplyr::summarise(tsd_status = dplyr::first(tsd),
+                       tsd_seq = dplyr::first(tsd_seq),
+                       n_5prime_reads = sum(reads_5p), .groups = "drop")
+    ev <- dplyr::left_join(ev, st, by = "site_id")
+  }
+  if (!is.null(detection) && nrow(detection)) {
+    ev <- dplyr::left_join(
+      ev, dplyr::transmute(detection, site_id, molecules_per_cell = mean_molecules,
+                           lambda_estimable = !is.na(lambda), detection, clone_size),
+      by = "site_id")
+  }
+  ev |>
+    dplyr::mutate(
+      tsd_status = tidyr::replace_na(tsd_status, "no 5' reads"),
+      n_5prime_reads = tidyr::replace_na(n_5prime_reads, 0L),
+      defensible = !pooled_only & !tidyr::replace_na(flank_gated, FALSE)) |>
+    dplyr::arrange(dplyr::desc(cells))
+}
+
+#' Cells carrying vector transcript, per tube, from the filtered feature-barcode matrix.
+#'
+#' The discriminator the completeness figure needed, and it is independent of junctions entirely:
+#' vector expression is measured from reads on the reporter contig, which the reference carries as
+#' three genes - mCherry, DRE and WPRE-LTR. A sorted mCherry-positive cell with no vector transcript
+#' at all is not a cell this assay can ever place, whether because the sort admitted it or because
+#' its provirus is silent.
+#'
+#' It settles a question the junction data cannot. 93% of sorted mCherry+ cells belong to no called
+#' site, and that is either a repertoire far larger than fifteen clones or an impure gate. The answer
+#' is the gate: 65.2% of Rx_4 and 43.2% of Rx_6 called cells carry any vector UMI, 53.6% pooled - not
+#' the ~93% the large-repertoire reading requires. The wild-type tube is the control and it works: 4
+#' cells of 26,822, so the measurement has essentially no false-positive rate.
+#'
+#' Read the matrix directly rather than through Seurat: only three rows of it are needed, and the
+#' triplet file can be streamed.
+vector_expression <- function(bam_dir, tubes, genes = c("mCherry", "DRE", "WPRE-LTR")) {
+  dplyr::bind_rows(lapply(tubes, function(tube) {
+    d <- file.path(bam_dir, paste0("cellranger_", tube), "sample_filtered_feature_bc_matrix")
+    f_feat <- file.path(d, "features.tsv.gz"); f_mtx <- file.path(d, "matrix.mtx.gz")
+    if (!file.exists(f_feat) || !file.exists(f_mtx)) {
+      return(dplyr::tibble(tube = tube, cells = NA_integer_, vector_positive = NA_integer_,
+                           vector_umis = NA_integer_))
+    }
+    feat <- readLines(gzfile(f_feat))
+    want <- which(sub("\t.*", "", feat) %in% genes)
+    # fread, not readLines + strsplit and not scan(): the triplet body of a filtered matrix runs to
+    # tens of millions of lines. Splitting it in R takes minutes and scan() in chunks was no better;
+    # fread reads it in seconds. Only three of ~33,000 feature rows are wanted, but the triplets are
+    # ordered by cell, so there is nothing to skip - the file has to be read and filtered.
+    head_lines <- readLines(gzfile(f_feat), n = 1L)  # force the connection, then read the matrix
+    hdr_raw <- readLines(gzfile(f_mtx), n = 10L)
+    n_comment <- sum(startsWith(hdr_raw, "%"))
+    hdr <- scan(text = hdr_raw[n_comment + 1L], what = integer(), quiet = TRUE)
+    ncell <- if (length(hdr) >= 2L) hdr[2] else NA_integer_
+    trip <- data.table::fread(f_mtx, skip = n_comment + 1L, showProgress = FALSE,
+                              col.names = c("row", "col", "val"))
+    hit <- trip[trip$row %in% want, ]
+    pos <- hit$col
+    umis <- sum(hit$val)
+
+    dplyr::tibble(tube = tube, cells = ncell,
+                  vector_positive = dplyr::n_distinct(pos), vector_umis = umis)
+  })) |>
+    dplyr::mutate(vector_share = vector_positive / cells)
+}
+
 #' Repertoire completeness: what share of the transduced population the called sites account for.
 #'
 #' The denominator this needed turned out to be in hand all along - the mCherry-positive cells
 #' SEQUENCED, not the FACS record. Two numbers come out, and they should always be reported together
 #' because they bracket the answer from opposite sides.
 #'
-#' `floor_share` is labelled cells over mCherry+ cells. It assumes nothing: even at perfect detection
-#' the called sites cannot account for less than this. `corrected_share` divides each site's detected
-#' count by its own per-cell detection rate first, and so inherits lambda's uncertainty - sites
-#' without an estimable lambda are corrected by the median of those that have one, which is the
-#' weakest step here and is why the floor is reported beside it.
+#' TWO DENOMINATORS, because the obvious one is wrong. Sorted mCherry+ cells were used at first, and
+#' vector_expression() shows that gate is impure: only 65.2% of Rx_4 and 43.2% of Rx_6 called cells
+#' carry any vector transcript, 53.6% pooled. A cell with no vector transcript cannot produce a
+#' junction read - whether it was never transduced or its provirus is wholly silent - so it does not
+#' belong in the denominator of a junction-based completeness measure. Both are reported: the sorted
+#' count is the upper bound on the population, the vector-positive count the defensible one.
 #'
-#' What it cannot see, stated so nobody has to rediscover it: a clone whose proviruses never yielded
-#' a captured junction molecule contributes nothing to the numerator and is still in the denominator.
-#' That is the point - it is the only measure here that counts those clones at all.
-repertoire_completeness <- function(detection_tbl, mcherry_cells) {
+#' `floor_share` is labelled cells over the denominator. It assumes nothing: even at perfect
+#' detection the called sites cannot account for less than this. `corrected_share` divides each
+#' site's detected count by its own per-cell detection rate first, and so inherits lambda's
+#' uncertainty.
+#'
+#' THE IMPUTATION HAS A DIRECTION, and it is the one that flatters the result. lambda is estimable
+#' only at the six sites with the highest molecules per cell - a sample selected for high detection -
+#' so imputing their median to the other nine OVERSTATES detection, understates those clone sizes and
+#' overstates completeness. `corrected_share` is therefore an UPPER bound and `floor_share` the only
+#' model-free figure. Never quote the corrected number without the floor beside it.
+#'
+#' What it cannot do, stated because this was got wrong once: the unassigned-molecule census does NOT
+#' bound the hidden population. A clone that yields no junction molecule leaves none to count, so a
+#' molecule census has no power over exactly the population it was being used to reassure about.
+repertoire_completeness <- function(detection_tbl, mcherry_cells,
+                                   vector_positive_cells = NA_integer_) {
   if (nrow(detection_tbl) == 0L) return(dplyr::tibble())
   med <- stats::median(detection_tbl$detection, na.rm = TRUE)
   d <- dplyr::mutate(detection_tbl,
                      detection_used = ifelse(is.na(detection), med, detection),
                      imputed = is.na(detection),
                      size_used = cells / detection_used)
+  corrected <- sum(d$size_used)
   dplyr::tibble(
-    mcherry_cells_sequenced = mcherry_cells,
+    denominator = c("sorted mCherry+ cells", "cells carrying vector transcript"),
+    cells = c(mcherry_cells, vector_positive_cells),
     sites = nrow(d),
     detected_cells = sum(d$cells),
-    floor_share = sum(d$cells) / mcherry_cells,
+    floor_share = sum(d$cells) / c(mcherry_cells, vector_positive_cells),
     median_detection_used = med,
     sites_with_imputed_detection = sum(d$imputed),
-    corrected_cells = round(sum(d$size_used)),
-    corrected_share = sum(d$size_used) / mcherry_cells,
-    unaccounted_share = 1 - sum(d$size_used) / mcherry_cells)
+    corrected_cells = round(corrected),
+    corrected_share = corrected / c(mcherry_cells, vector_positive_cells),
+    unaccounted_share = 1 - corrected / c(mcherry_cells, vector_positive_cells))
 }
 
 #' The floor curve: what a clip of each length matches, real sites and decoy flanks alike.
@@ -1433,10 +1634,25 @@ repertoire_completeness <- function(detection_tbl, mcherry_cells) {
 #' Reported under both rules, because the floor and the mismatch tolerance are one decision: `_exact`
 #' columns require nm == 0, the others allow the L %/% 10 budget. Under the budget a 6-base clip is
 #' allowed a mismatch and decoy hits persist to 8 bp; under exact matching they stop at 6.
-clip_floor_curve <- function(clip_tbl, opt = IS_DEFAULTS) {
+#'
+#' AND WITH THE POWER OF EACH ZERO, because "no decoy hits" is not one statement. The decoy dimension
+#' has no sample-size limit - 100 flanks can be 1,000 - but the binding constraint is MOLECULES, and
+#' there are only 35 at 6 bp. `expected_decoy` is how many of them chance alone should have put on a
+#' decoy: a specific window of length L matches by chance at 4^-L, each flank is tested in both
+#' orientations, so the per-molecule rate is 1 - (1 - 2*4^-L)^n_decoy. At 6 bp that is 4.8% and
+#' expects 1.7 hits across 35 molecules, so observing zero carries p = 0.18 under chance alone -
+#' unremarkable. `p_zero_under_chance` states that directly.
+#'
+#' `upper_bound` is the number the floor should actually be read from: with zero observed, the 95%
+#' Poisson ceiling is 3 events, which bounds the per-molecule error against the real flank set at
+#' 3 * n_real / (molecules * n_decoy * orientations). At 6 bp that is ~0.5-1%, sitting AT the 1%
+#' tolerance rather than below it. A zero with no power behind it should not be mistaken for a clean
+#' one, which is why these columns exist rather than the bare count.
+clip_floor_curve <- function(clip_tbl, sites = NULL, opt = IS_DEFAULTS, orientations = 2L) {
   if (nrow(clip_tbl) == 0L) return(dplyr::tibble())
+  n_real <- if (is.null(sites)) NA_integer_ else nrow(sites)
   clip_tbl |>
-    dplyr::filter(channel == "three_prime") |>
+    dplyr::filter(in_three) |>
     dplyr::group_by(clip_len) |>
     dplyr::summarise(
       molecules       = dplyr::n(),
@@ -1449,8 +1665,35 @@ clip_floor_curve <- function(clip_tbl, opt = IS_DEFAULTS) {
       decoy_flanks_exact = mean(n_decoy_exact),
       .groups = "drop") |>
     dplyr::mutate(
-      at_or_above_floor = clip_len >= opt$min_assign,
-      exact_required    = clip_len < opt$exact_below) |>
+      at_or_above_floor = clip_len >= opt$assign_floor$min_len,
+      exact_required    = clip_len < opt$assign_floor$exact_below,
+      n_decoy           = opt$n_decoy,
+      # chance of a specific length-L window matching, per flank, per orientation
+      per_flank_chance  = 4^-clip_len,
+      per_molecule_chance = 1 - (1 - orientations * per_flank_chance)^opt$n_decoy,
+      expected_decoy    = molecules * per_molecule_chance,
+      p_zero_under_chance = exp(-expected_decoy),
+      # The standing test is this ratio, not the raw count. A count tells you how many chance
+      # matches a given decoy set produced; the ratio tells you whether the matcher still behaves as
+      # theory says, which is what a regression check needs and what the 100-decoy version could not
+      # measure at all. 15 observed against 13.5 predicted at 6 bp is the form to read.
+      obs_over_expected = ifelse(expected_decoy > 0, decoy_exact / expected_decoy, NA_real_),
+      # ...and where that ratio can be read at all. With an expectation below a few events a single
+      # chance hit sends the ratio to 12 or 30 - which is what 9 bp and 10 bp do here - and a
+      # standing check that alarms on Poisson noise is the monotonicity test's mistake again. Compare
+      # obs/exp only where this is TRUE; everywhere else read expected_decoy and decoy_exact directly.
+      ratio_interpretable = expected_decoy >= 5,
+      # 95% Poisson ceiling on zero observed, expressed against the REAL flank set
+      upper_bound = ifelse(decoy_exact == 0L & molecules > 0L & !is.na(n_real),
+                           3 * n_real / (molecules * opt$n_decoy * orientations), NA_real_),
+      # THE NUMBER THAT LICENSES THE FLOOR. The decoy zero does not: observed hits track
+      # expected-under-chance at every length (10 against 9.24 at 4 bp, 1 against 1.60 at 5 bp,
+      # 0 against 1.67 at 6 bp), so with 100 flanks the decoys measure 4^-L and resolve no
+      # transition. What they do establish, where they have power, is that real genomic sequence
+      # matches at about the analytic rate - and that rate can then be applied to the flank set that
+      # actually matters, the real one.
+      chance_vs_real = 1 - (1 - orientations * per_flank_chance)^n_real,
+      expected_spurious = molecules * chance_vs_real) |>
     dplyr::arrange(clip_len)
 }
 
@@ -1478,8 +1721,8 @@ unassigned_molecules <- function(clip_tbl, discovery, cell_table, opt = IS_DEFAU
     dplyr::mutate(
       placed_uniquely = tidyr::replace_na(placed_uniquely, FALSE),
       class = dplyr::case_when(
-        channel == "genomic"            ~ "genome-mapped, no called site within the window",
-        clip_len < opt$min_assign       ~ "below the assignment floor",
+        !in_three                       ~ "genome-mapped, no called site within the window",
+        clip_len < opt$assign_floor$min_len       ~ "below the assignment floor",
         clip_len < opt$min_discovery    ~ "above the floor, below the discovery length",
         placed_uniquely                 ~ "long and placed uniquely: a locus below the cell floor",
         TRUE                            ~ "long but unplaceable: MAPQ < 30 or unmapped")) |>
@@ -1571,10 +1814,14 @@ count_barcodes <- function(bam_dir, tubes) {
 #' `unattributed` is the molecules that match no called site. They are real captures at an uncalled
 #' or unplaceable position, and they belong in the capture depth even though they name no clone.
 cell_junction_molecules <- function(clip_tbl) {
+  # One row per molecule in the clip table, so n() IS the molecule count. It used to be
+  # n_distinct(umi) over a table with one row per molecule per channel, which was correct but only
+  # by vigilance; the table's shape now carries the invariant instead.
   clip_tbl |>
     dplyr::group_by(tube, barcode) |>
-    dplyr::summarise(molecules = dplyr::n_distinct(umi),
-                     unattributed = dplyr::n_distinct(umi[n_match == 0L]),
+    dplyr::summarise(molecules = dplyr::n(),
+                     unattributed = sum(n_match == 0L),
+                     in_both_channels = sum(in_three & in_genomic),
                      .groups = "drop")
 }
 
@@ -1970,6 +2217,11 @@ summarise_cells <- function(hits) {
                      # assumption any channel-overlap estimator rests on.
                      umis_shared = dplyr::n_distinct(
                        intersect(umi[channel == "three_prime"], umi[channel == "genomic"])),
+                     # The distinct-molecule count, so no consumer ever has to add umis_three and
+                     # umis_genomic. That sum double-counts the shared molecules and it has already
+                     # been added by mistake once, in the sharing analysis, after being fixed for
+                     # lambda and not propagated. Use this column.
+                     molecules = dplyr::n_distinct(umi),
                      .groups = "drop") |>
     dplyr::group_by(tube, barcode) |>
     dplyr::mutate(n_sites_in_cell = dplyr::n_distinct(site_id),

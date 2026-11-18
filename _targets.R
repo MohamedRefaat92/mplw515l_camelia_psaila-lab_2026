@@ -2446,6 +2446,29 @@ list(
 
   quarto_report(report_demultiplex_diagnostics, "demultiplex-diagnostics", utilities_r),
 
+  # Integration sites. Registered so the provenance banner can resolve it: an unregistered report
+  # reports "not a target in _targets.R" and, worse, "0 of 0 input files verified", which reads as a
+  # pass when in fact nothing was checked.
+  #
+  # The extra files are the ones it reads outside targets. The pipeline that produces them is run by
+  # sbatch (scripts/slurm/analysis/integration-sites.sh), not by targets, so they are listed here as
+  # inputs rather than produced as targets - the report re-renders when the pipeline's output moves.
+  #
+  # NOTE: this puts the report in tar_make(). If that is not wanted, comment this line out as the
+  # block at the end of this list does for other reports - but then the provenance banner goes back
+  # to being unable to resolve it.
+  quarto_report(
+    report_integration_sites, "integration-sites",
+    utilities_r, "src/R/integration-sites.R",
+    "metadata/integration_site_registry.csv",
+    "output/objects/integration-sites/integration_sites.csv",
+    "output/objects/integration-sites/cell_site_assignments.csv",
+    "output/objects/integration-sites/site_evidence.csv",
+    "output/objects/integration-sites/detection_model.csv",
+    "output/objects/integration-sites/clip_floor_curve.csv",
+    "output/objects/integration-sites/repertoire_completeness.csv",
+    "output/objects/integration-sites/vector_expression.csv"),
+
   # TEST (temporary): delete these two targets, notebooks/test_report_target/ and
   # output/reports/latest/notebooks/test_report_target/ afterwards
   tar_target(test_report_data, {
