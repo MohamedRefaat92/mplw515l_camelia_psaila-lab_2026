@@ -49,9 +49,16 @@ IS_DEFAULTS <- list(
   # Assignment is a different question from discovery and gets a different threshold. Discovery asks
   # "is there an integration anywhere in 2.7 Gb?"; assignment asks "does this clip match one of the
   # handful of flanks already called?". The second search space is ~3.6 kb, and the clip must land at
-  # one exact offset in it, so a far shorter clip is decisive. 8 bp placed against the mini-reference
-  # is safer than 25 bp placed genome-wide: with it, both wild-type tubes still yield zero cells.
-  min_assign     = 8L,
+  # one exact offset in it, so a far shorter clip is decisive: 10 bp against the mini-reference is a
+  # stricter test than 25 bp placed genome-wide, not a looser one.
+  #
+  # Set to 10 by the decoy measurement, not by argument. Across 100 decoy flanks carried through the
+  # identical positional test, hits are zero in every clip-length band at 10 bp and above, and
+  # non-zero below it: the <=9 band returns 2 decoy hits, an epsilon of 0.004 and 0.16 expected
+  # spurious assignments. 8 was the number the earlier reasoning reached from the wild-type tubes
+  # being empty, which bound cross-tube hopping rather than within-tube chance matching - the wrong
+  # instrument for this question. Raise or lower this only against a fresh decoy run.
+  min_assign     = 10L,
   flank          = 200L,    # bases either side of a called site in the mini-reference
   # A flank containing a long homopolymer attracts clips that belong nowhere. JH584304.1:35,417 has a
   # 23-base run against 5-6 for every genuine site, and the mini-reference inflated it 3 -> 14 cells,
@@ -64,6 +71,36 @@ IS_DEFAULTS <- list(
   min_cells      = 3L,
   min_umis       = 3L,
   polya_fraction = 0.8,
+  # Decoys measure the assignment tier's error rate instead of arguing about it. They are flanks cut
+  # from random positions carrying no provirus, passed through the identical positional test, so
+  # under the null a decoy is exchangeable with a real flank and its hit rate IS epsilon:
+  #   expected spurious assignments to real sites ~= n_real * decoy_hits / n_decoys
+  # They also audit the positional filter itself. A decoy has no junction, so ANY decoy hit that
+  # passes anchoring means the anchoring is mis-implemented. That is a stronger statement than the
+  # wild-type tubes can make: those bound cross-tube hopping and carry-over, not within-tube chance
+  # matching, and conflating the two is a reasoning error this analysis has already made once.
+  # They must share the FASTA with the real flanks - a separate run would not share the aligner's
+  # view of the search space, which is the thing being measured.
+  n_decoy        = 100L,
+  decoy_seed     = 20261117L,
+  decoy_prefix   = "DECOY",
+  # The genome-mapped channel: reads STAR placed on the host genome with the vector soft-clipped,
+  # the mirror image of the 3' channel. Discovery needs the clip to match the provirus terminus
+  # exactly over at least this many bases, measured AT the clip boundary. 13 is set by specificity,
+  # not taste: boundary-constrained on chr19's 5.34M soft-clipped reads, 13 returns 29 hits at one
+  # position (IS03) and nothing else, and the yield saturates by 12 (32 hits), so there is nothing
+  # below it to gain. Scale any background claim genome-wide before quoting it - one chromosome is
+  # 2.3% of the genome and cannot see a rate this low.
+  min_genomic    = 13L,
+  # MANDATORY, not a refinement. The provirus's terminal A is absorbed into the host alignment
+  # whenever it matches the host's first base, so the terminus overhangs the clip boundary by 1-2
+  # bases. Without this tolerance the boundary test returns ZERO hits at a site known to be there,
+  # and the failure presents as "the channel does not work" rather than as a bug.
+  absorb_window  = 2L,
+  # The provirus 3' terminus, as it appears at the clip boundary. Forward for a plus-strand site;
+  # read_genomic_clips() reverse-complements it for the minus-strand case, which is the orientation
+  # trap that made the first probe of this channel return zero at every site.
+  terminus       = "TGTGGAAAATCTCTAGCA",
   # The plasmid's two LTRs are byte-identical over all 181 bases and the contig keeps only one copy,
   # so a molecule spanning the *5'* LTR's junction with psi matches the contig's 3' terminus
   # perfectly: it is placed at the junction with MAPQ 255 and clips into vector sequence,
@@ -211,6 +248,164 @@ classify_five_prime_clips <- function(clips, opt = IS_DEFAULTS) {
   ))
 }
 
+# ── The genome-mapped channel ─────────────────────────────────────────────────────────────────────
+
+#' Junction reads STAR placed on the HOST genome, with the vector soft-clipped.
+#'
+#' The mirror image of read_junction_clips(). A read spanning an integration junction has a vector
+#' part and a host part, and STAR keeps whichever alignment scores better. When the host part is the
+#' longer one the read is reported against the genome, with the vector clipped - so the junction's
+#' genomic coordinate is already resolved, at MAPQ 255, with 120-140 bases of host behind it. That is
+#' an order of magnitude better placement than the 25-50 bp clips the 3' channel has to align.
+#'
+#' Those reads were invisible to this analysis because nothing looked for them: the 3' channel reads
+#' one window of one contig, and these never touch the contig. Intersected against the cells the
+#' mini-reference already labels, the overlap is low - 12 of 67 at IS01, 2 of 20 at IS03 - so the two
+#' channels are close to independent captures of the same clone, which is what makes a
+#' capture-recapture clone size estimable at all.
+#'
+#' Two uses, with different evidence requirements, exactly as discovery and assignment differ:
+#'   discovery  - no prior site needed. The clip must match the terminus over >= min_genomic bases
+#'                AT its boundary, which on chr19's 5.34M soft-clipped reads returns hits at one
+#'                position and nothing else.
+#'   assignment - a shorter match, but the junction coordinate must already be a called site.
+#'
+#' `region` restricts the scan; NULL walks the whole BAM, which is ~17 minutes a tube.
+read_genomic_clips <- function(bam, tube, region = NULL, opt = IS_DEFAULTS, k = opt$min_genomic) {
+  what <- c("qname", "flag", "rname", "pos", "mapq", "cigar", "seq")
+  tags <- c("CB", "UB")
+  p <- if (is.null(region)) {
+    Rsamtools::ScanBamParam(what = what, tag = tags)
+  } else {
+    Rsamtools::ScanBamParam(what = what, tag = tags, which = region)
+  }
+  # Whole-BAM scan: stream it. These BAMs hold ~765M alignments and their SEQ alone would be over
+  # 100 GB in memory, so with no `which` the file is read in yields and each yield reduced to the
+  # handful of junction reads it contains before the next is fetched. The recursion is one level
+  # deep - each call below passes a materialised chunk, never NULL - and keeps the matching logic in
+  # exactly one place rather than duplicating it for the two access patterns.
+  if (is.null(region)) {
+    # 5e5 rather than 1e6: eight of these run forked in parallel, one per tube, and each yield holds
+    # that many 150-base SEQs plus R's overhead on them.
+    bf <- Rsamtools::BamFile(bam, yieldSize = 5e5L)
+    open(bf); on.exit(close(bf), add = TRUE)
+    acc <- list()
+    repeat {
+      got <- Rsamtools::scanBam(bf, param = p)[[1]]
+      if (!length(got$cigar)) break
+      acc[[length(acc) + 1L]] <- read_genomic_clips_chunk(got, tube, opt, k)
+    }
+    return(dplyr::bind_rows(acc))
+  }
+
+  chunks <- Rsamtools::scanBam(Rsamtools::BamFile(bam), param = p)
+  dplyr::bind_rows(lapply(chunks, read_genomic_clips_chunk, tube = tube, opt = opt, k = k))
+}
+
+#' The matching itself, over one scanBam chunk. Shared by the windowed and whole-BAM paths.
+#'
+#' Flattening scanBam's chunks is where this went wrong twice, so nothing is flattened here: the
+#' conversion happens inside the chunk. unlist() on `rname` returns the FACTOR CODES rather than the
+#' chromosome names, so every coordinate lands on a chromosome called "19"; and
+#' do.call(c, lapply(...)) hands the DNAStringSet to c() as a NAMED argument - the name being the
+#' range - which returns a list that as.character() then deparses into one 80,000-character string.
+#' Both failures produce an object of plausible class and length, so neither errors and the function
+#' simply returns nothing.
+read_genomic_clips_chunk <- function(x, tube, opt = IS_DEFAULTS, k = opt$min_genomic) {
+  if (!length(x$cigar)) return(empty_genomic_table(tube))
+  b <- dplyr::tibble(chrom = as.character(x$rname), pos = as.integer(x$pos),
+                     mapq = as.integer(x$mapq), cigar = x$cigar,
+                     seq = as.character(x$seq),
+                     barcode = if (is.null(x$tag$CB)) NA_character_ else x$tag$CB,
+                     umi     = if (is.null(x$tag$UB)) NA_character_ else x$tag$UB)
+  if (!nrow(b)) return(empty_genomic_table(tube))
+
+  # Cheap prefilter before any per-base work: a junction read must carry the terminus somewhere and
+  # must have a soft clip to carry it in. This is what makes a 765M-alignment scan affordable.
+  term0  <- substring(opt$terminus, nchar(opt$terminus) - k + 1L)
+  rterm0 <- as.character(Biostrings::reverseComplement(Biostrings::DNAString(term0)))
+  pre <- grepl("S", b$cigar, fixed = TRUE) &
+    (grepl(term0, b$seq, fixed = TRUE) | grepl(rterm0, b$seq, fixed = TRUE))
+  if (!any(pre)) return(empty_genomic_table(tube))
+  b <- b[pre, , drop = FALSE]
+
+  cig <- b$cigar
+  # suppressWarnings because as.integer() is evaluated for every element, including the CIGARs with
+  # no clip on that side, where sub() returns the CIGAR unchanged and coercion gives NA. ifelse()
+  # discards those, but the warning is noise that would otherwise fire on every call.
+  lead  <- suppressWarnings(
+    ifelse(grepl("^[0-9]+S", cig), as.integer(sub("^([0-9]+)S.*", "\\1", cig)), 0L))
+  trail <- suppressWarnings(
+    ifelse(grepl("[0-9]+S$", cig), as.integer(sub(".*[^0-9]([0-9]+)S$", "\\1", cig)), 0L))
+  seqs <- b$seq
+  nseq <- nchar(seqs)
+
+  # The terminus as it appears at the clip boundary. A plus-strand provirus puts host AFTER it, so
+  # the read is [vector][host]: the clip leads and ends with the terminus. A minus-strand provirus
+  # is stored reverse-complemented, so the clip trails and STARTS with the complement. Searching only
+  # the forward form is why the first probe of this channel returned zero at every minus-strand site
+  # while working at the plus-strand ones - a failure that looks like absence, not like a bug.
+  term  <- substring(opt$terminus, nchar(opt$terminus) - k + 1L)
+  rterm <- as.character(Biostrings::reverseComplement(Biostrings::DNAString(term)))
+
+  # ABSORPTION. The provirus's terminal base is absorbed into the host alignment whenever it matches
+  # the host's first base, so the terminus overhangs the clip boundary by 0 to absorb_window bases.
+  # Without this the test returns zero hits at a site known to be there. `absorbed` is also the
+  # correction the junction coordinate needs, so it is carried out of here rather than recomputed.
+  w <- opt$absorb_window
+  hit <- rep(FALSE, length(cig)); absorbed <- rep(NA_integer_, length(cig)); side <- rep("", length(cig))
+  for (a in 0:w) {
+    # leading clip: the terminus ends `a` bases past the clip's end
+    e  <- lead + a
+    ok <- !hit & lead >= k & e <= nseq & (e - k + 1L) >= 1L &
+      substr(seqs, e - k + 1L, e) == term
+    hit[ok] <- TRUE; absorbed[ok] <- a; side[ok] <- "lead"
+    # trailing clip: the complement starts `a` bases before the clip's start
+    s  <- nseq - trail + 1L - a
+    ok <- !hit & trail >= k & s >= 1L & (s + k - 1L) <= nseq &
+      substr(seqs, s, s + k - 1L) == rterm
+    hit[ok] <- TRUE; absorbed[ok] <- a; side[ok] <- "trail"
+  }
+  if (!any(hit)) return(empty_genomic_table(tube))
+
+  i <- which(hit)
+  span <- ref_span(cig[i])
+  # The junction base is the host base abutting the provirus, which is the NEAR end of the mapped
+  # segment - the end the clip is on - not the far one. A leading clip puts the vector before the
+  # host, so the junction is the segment's START; a trailing clip puts it after, so the junction is
+  # the segment's END. Taking the far end instead lands a whole host-length away, which presents as
+  # junctions scattered 100-136 bp downstream of the real site rather than as an obvious error.
+  #
+  # Absorption then moves it back toward the vector, because the absorbed bases were counted as host
+  # by the aligner but belong to the provirus: a leading clip's start is pushed left, so add; a
+  # trailing clip's end is pushed right, so subtract. Both forms are checked against the hand
+  # measurement - IS02 (lead) 53,079,914 + 2 = 53,079,916 and IS01 (trail) 83,681,312 - 1 =
+  # 83,681,311, each the called site exactly.
+  junction <- ifelse(side[i] == "lead",
+                     b$pos[i] + absorbed[i],
+                     b$pos[i] + span - 1L - absorbed[i])
+
+  dplyr::tibble(
+    chrom     = b$chrom[i],
+    pos       = as.integer(junction),
+    strand    = ifelse(side[i] == "lead", "+", "-"),
+    mapq      = b$mapq[i],
+    tube      = tube,
+    barcode   = b$barcode[i],
+    umi       = b$umi[i],
+    clip_len  = ifelse(side[i] == "lead", lead[i], trail[i]) + absorbed[i],
+    host_len  = as.integer(span),
+    absorbed  = absorbed[i]
+  ) |>
+    dplyr::filter(!is.na(chrom), !is.na(barcode), !is.na(umi))
+}
+
+empty_genomic_table <- function(tube) {
+  dplyr::tibble(chrom = character(), pos = integer(), strand = character(), mapq = integer(),
+                tube = character(), barcode = character(), umi = character(),
+                clip_len = integer(), host_len = integer(), absorbed = integer())
+}
+
 #' Label each clip with the one reason it is kept or dropped.
 #'
 #' The order is deliberate and the labels are exclusive, so the waterfall adds up and every discard
@@ -319,7 +514,10 @@ read_bwa_hits <- function(sam, opt = IS_DEFAULTS, channel = c("three_prime", "fi
     tube     = provenance[, 1],
     barcode  = provenance[, 2],
     umi      = provenance[, 3],
-    clip_len = nchar(field(10)[keep])
+    clip_len = nchar(field(10)[keep]),
+    # The clip's own bases. Carried so tsd_check() can test the duplicated span against OBSERVED
+    # sequence rather than only against the reference, which cannot falsify a coordinate convention.
+    seq      = field(10)[keep]
   )
 }
 
@@ -334,7 +532,8 @@ ref_span <- function(cigar) {
 
 empty_hit_table <- function() {
   dplyr::tibble(chrom = character(), pos = integer(), strand = character(), mapq = integer(),
-                tube = character(), barcode = character(), umi = character(), clip_len = integer())
+                tube = character(), barcode = character(), umi = character(), clip_len = integer(),
+                seq = character())
 }
 
 #' Group hits into sites, adding a site_id column.
@@ -383,88 +582,208 @@ write_site_flanks <- function(sites, genome_fa, path, opt = IS_DEFAULTS) {
     seqs  <- seqs[!drop]
     sites <- sites[!drop, , drop = FALSE]
   }
+
+  # The inclusion gate. Assignment recruits cells to a flank, so a flank for a site that is not
+  # really there manufactures a clone - which is how JH584304.1 reached 14 cells from 3, every one of
+  # them in a mCherry-negative tube.
+  #
+  # Gating on the TSD alone was considered and rejected: only four of nine sites have any 5' reads at
+  # all, so it would delete IS02 with its 145 cells. Gating on the bare floor is what already failed.
+  # The gate is therefore TSD-verified OR comfortably clear of the floor, with sites sitting at
+  # EXACTLY the floor admitted only if the 5' channel vouches for them. Certainty can come from
+  # weight of evidence as well as from a second channel.
+  if (!is.null(sites$tsd_pass) && nrow(sites)) {
+    at_floor <- sites$cells <= opt$min_cells
+    gated    <- at_floor & !isTRUE_vec(sites$tsd_pass)
+    if (any(gated)) {
+      message("    held out of the mini-reference (at the cell floor, no 5' confirmation): ",
+              paste(sites$site_id[gated], collapse = ", "))
+      seqs  <- seqs[!gated]
+      sites <- sites[!gated, , drop = FALSE]
+    }
+  }
   if (length(seqs) == 0L) stop("every called site's flank is low-complexity; nothing to assign to")
-  # name carries where the junction sits inside the flank, so read_mini_hits() need not recompute it
+  # name carries where the junction sits inside the flank, so assignment need not recompute it
   names(seqs) <- sprintf("%s|%s|%d", sites$site_id, sites$strand,
                          sites$pos - pmax(sites$pos - opt$flank, 1L) + 1L)
+
+  decoys <- draw_decoy_flanks(sites, fa, opt)
+  if (length(decoys)) {
+    message("    plus ", length(decoys), " decoy flanks, to measure the assignment error rate")
+    seqs <- c(seqs, decoys)
+  }
   Biostrings::writeXStringSet(seqs, path)
   invisible(length(seqs))
 }
+
+#' Flanks from random positions with no provirus, named so they pass through the identical test.
+#'
+#' Matched to the real flanks on the three things that decide whether a clip can land: the same
+#' chromosomes (sampled in proportion to length, so the scaffolds a real site sits on are in play),
+#' the same width, and the same low-complexity filter. That is mappability matching by proxy rather
+#' than from a mappability track - enough for the hit rate to be interpretable, and the one
+#' approximation in this measurement worth stating out loud.
+#'
+#' The junction offset in the name is the centre, exactly as for a real flank, so the positional test
+#' in assign_clips_exact() treats a decoy and a site identically. A decoy has no junction, so any hit
+#' that survives is either chance matching at the real rate or a bug in the anchoring.
+draw_decoy_flanks <- function(sites, fa, opt = IS_DEFAULTS) {
+  if (opt$n_decoy <= 0L) return(Biostrings::DNAStringSet())
+  idx  <- Rsamtools::scanFaIndex(fa)
+  keep <- as.character(GenomicRanges::seqnames(idx)) %in% unique(sites$chrom)
+  idx  <- idx[keep]
+  if (!length(idx)) return(Biostrings::DNAStringSet())
+
+  width <- 2L * opt$flank + 1L
+  set.seed(opt$decoy_seed)                       # reproducible: the rate must not move between runs
+  # Oversample, then filter. Random draws land in N-runs and homopolymers often enough that a single
+  # pass would return fewer than asked for, and silently.
+  want <- opt$n_decoy
+  out  <- Biostrings::DNAStringSet()
+  for (attempt in seq_len(10L)) {
+    if (length(out) >= want) break
+    n   <- 3L * (want - length(out))
+    chr <- sample(seq_along(idx), n, replace = TRUE,
+                  prob = as.numeric(GenomicRanges::width(idx)))
+    len <- as.numeric(GenomicRanges::width(idx))[chr]
+    ok  <- len > width + 1L
+    if (!any(ok)) next
+    chr <- chr[ok]; len <- len[ok]
+    pos <- floor(stats::runif(length(chr), opt$flank + 1L, len - opt$flank))
+    gr  <- GenomicRanges::GRanges(
+      as.character(GenomicRanges::seqnames(idx))[chr],
+      IRanges::IRanges(pos - opt$flank, pos + opt$flank))
+    s   <- Rsamtools::scanFa(fa, gr)
+    txt <- as.character(s)
+    good <- !grepl("N", txt, fixed = TRUE) & max_homopolymer(txt) <= opt$max_homopolymer
+    s <- s[good]
+    if (length(s)) {
+      names(s) <- sprintf("%s%03d|+|%d", opt$decoy_prefix,
+                          length(out) + seq_along(s), opt$flank + 1L)
+      out <- c(out, s)
+    }
+  }
+  if (length(out) > want) out <- out[seq_len(want)]
+  out
+}
+
+#' Split assignment hits into real and decoy, and turn the decoy rate into epsilon.
+#'
+#' Under the null a decoy flank is exchangeable with a real one, so the per-flank decoy hit rate is
+#' the per-flank chance-matching rate. Scaled to the number of real flanks it is the expected number
+#' of spurious assignments in the reported table. Reported per clip-length band because that is the
+#' parameter the floor controls: if epsilon is flat across bands the floor is not the binding
+#' constraint, and if it climbs at the short end the band where it climbs is where to stop.
+decoy_error_rate <- function(mini, n_real, opt = IS_DEFAULTS) {
+  if (nrow(mini) == 0L) return(dplyr::tibble())
+  is_decoy <- startsWith(mini$site_id, opt$decoy_prefix)
+  band <- function(x) cut(x, breaks = c(0, 9, 12, 15, 20, 30, Inf),
+                          labels = c("<=9", "10-12", "13-15", "16-20", "21-30", ">30"),
+                          right = TRUE)
+  # Built by summarise() rather than pivot_wider(): when there are no decoy hits at all - the
+  # outcome this measurement hopes for - the wide form has no TRUE column and every downstream
+  # reference to it errors. The table must be able to report zero.
+  dplyr::tibble(clip_band = band(mini$clip_len), is_decoy = is_decoy) |>
+    dplyr::group_by(clip_band) |>
+    dplyr::summarise(real = sum(!is_decoy), decoy = sum(is_decoy), .groups = "drop") |>
+    dplyr::mutate(
+      per_decoy_flank = decoy / opt$n_decoy,
+      expected_spurious = round(per_decoy_flank * n_real, 2),
+      epsilon = ifelse(real > 0L, round(expected_spurious / real, 4), NA_real_))
+}
+
+#' Assign clips to called flanks by exact positional matching, with no aligner.
+#'
+#' Replaces the bwa pass against the mini-reference, and unifies the two assignment paths that had
+#' grown apart: the genomic channel already tests the clip boundary by exact comparison with a +/-2
+#' absorption tolerance, while this tier asked bwa for a best hit and then threw the ranking away and
+#' tested position anyway. Only one of those was measured.
+#'
+#' The aligner was never doing useful work here. MAPQ against a handful of short flanks is
+#' near-meaningless, so it was already ignored; `-a` had to be passed to stop the ranking discarding
+#' true hits; and `-T 12` silently voided the 8 bp floor the thresholds advertised - clips of 8-11 bp
+#' had a placement rate of exactly 0.00, 169 reads written to assign.fa and dropped with no error,
+#' the same failure as `-T 30` against the 25 bp discovery floor one tier up.
+#'
+#' What is left once the aligner goes is the test that was doing the work all along: does the clip
+#' match the flank at the junction base, forward or reverse-complemented, within the mismatch budget.
+#' Exhaustive, deterministic, and the floor is now whatever min_assign says it is.
+assign_clips_exact <- function(clip_fa, flank_fa, opt = IS_DEFAULTS) {
+  if (!file.exists(clip_fa) || !file.exists(flank_fa)) return(empty_hit_table())
+  clips  <- Biostrings::readDNAStringSet(clip_fa)
+  flanks <- Biostrings::readDNAStringSet(flank_fa)
+  if (!length(clips) || !length(flanks)) return(empty_hit_table())
+
+  prov <- do.call(rbind, strsplit(names(clips), "|", fixed = TRUE))
+  len  <- Biostrings::width(clips)
+  txt  <- as.character(clips)
+  use  <- len >= opt$min_assign
+  if (!any(use)) return(empty_hit_table())
+  prov <- prov[use, , drop = FALSE]; len <- len[use]; txt <- txt[use]
+
+  fref <- do.call(rbind, strsplit(names(flanks), "|", fixed = TRUE))
+  fseq <- as.character(flanks)
+  fjun <- as.integer(fref[, 3])
+
+  # Mismatch count between two equal-length character vectors, elementwise.
+  nmis <- function(a, b) {
+    am <- do.call(rbind, strsplit(a, "", fixed = TRUE))
+    bm <- do.call(rbind, strsplit(b, "", fixed = TRUE))
+    rowSums(am != bm)
+  }
+  revcomp <- function(x) as.character(Biostrings::reverseComplement(Biostrings::DNAStringSet(x)))
+
+  out <- list()
+  for (s in seq_along(fseq)) {
+    j <- fjun[s]; fl <- fseq[s]; n <- nchar(fl)
+    for (L in sort(unique(len))) {
+      k <- which(len == L)
+      budget <- max(1L, L %/% 10L)          # the same tolerance the bwa path applied via NM
+      # Forward: the clip's first base IS the junction base, so it starts at j and runs right.
+      if (j + L - 1L <= n) {
+        win <- substr(fl, j, j + L - 1L)
+        d   <- nmis(txt[k], rep(win, length(k)))
+        hit <- k[d <= budget]
+        if (length(hit)) out[[length(out) + 1L]] <- dplyr::tibble(
+          row = hit, site = s, strand_hit = "+", nm = d[d <= budget],
+          flank_pos = j, span = L)
+      }
+      # Reverse: the clip is the reverse complement, so it ENDS at j and runs left.
+      if (j - L + 1L >= 1L) {
+        win <- revcomp(substr(fl, j - L + 1L, j))
+        d   <- nmis(txt[k], rep(win, length(k)))
+        hit <- k[d <= budget]
+        if (length(hit)) out[[length(out) + 1L]] <- dplyr::tibble(
+          row = hit, site = s, strand_hit = "-", nm = d[d <= budget],
+          flank_pos = j - L + 1L, span = L)
+      }
+    }
+  }
+  if (!length(out)) return(empty_hit_table())
+  h <- dplyr::bind_rows(out)
+
+  dplyr::tibble(
+    site_id   = fref[h$site, 1],
+    pos       = fjun[h$site],
+    strand    = fref[h$site, 2],
+    mapq      = NA_integer_,          # no aligner, so no aligner's opinion to record
+    tube      = prov[h$row, 1],
+    barcode   = prov[h$row, 2],
+    umi       = prov[h$row, 3],
+    clip_len  = len[h$row],
+    flank_pos = h$flank_pos,
+    span      = h$span,
+    junction  = fjun[h$site]
+  )
+}
+
+#' isTRUE() elementwise, treating NA as FALSE: a site with no 5' reads has not been confirmed.
+isTRUE_vec <- function(x) !is.na(x) & x
 
 #' Longest run of a single base in each sequence.
 max_homopolymer <- function(x) {
   vapply(regmatches(x, gregexpr("(.)\\1*", x)),
          function(runs) max(nchar(runs)), numeric(1))
-}
-
-#' Assign clips to sites by alignment against the mini-reference.
-#'
-#' The discriminator is POSITION, not alignment score. A clip belongs to a site only if its
-#' junction-adjacent base lands on that site's junction base inside the flank - offset `j` in the
-#' sequence name. The clip's first base is the junction one (the 3' channel), so a forward alignment
-#' must START at j and a reverse one must END there. That single constraint is what makes an 8 bp
-#' clip safe: it has 400 places to land in each flank and only one is accepted, and in practice both
-#' wild-type tubes return zero cells under it.
-#'
-#' Alignment quality is then only a sanity filter: end-to-end, few mismatches.
-read_mini_hits <- function(sam, opt = IS_DEFAULTS) {
-  if (!file.exists(sam) || file.size(sam) == 0L) return(empty_hit_table())
-  lines <- readLines(sam, warn = FALSE)
-  lines <- lines[!startsWith(lines, "@")]
-  if (length(lines) == 0L) return(empty_hit_table())
-
-  f     <- strsplit(lines, "\t", fixed = TRUE)
-  field <- function(i) vapply(f, function(x) if (length(x) >= i) x[[i]] else NA_character_, "")
-  flag  <- as.integer(field(2))
-  rname <- field(3)
-
-  keep <- bitwAnd(flag, 0x100) == 0L & bitwAnd(flag, 0x800) == 0L & rname != "*"
-  if (!any(keep)) return(empty_hit_table())
-
-  f <- f[keep]; flag <- flag[keep]
-  field <- function(i) vapply(f, function(x) if (length(x) >= i) x[[i]] else NA_character_, "")
-  cigar <- field(6)
-  pos   <- as.integer(field(4))
-  rev   <- bitwAnd(flag, 0x10) != 0L
-  ref   <- do.call(rbind, strsplit(rname[keep], "|", fixed = TRUE))
-  junc  <- as.integer(ref[, 3])
-
-  # NM:i: and the total soft-clipped length, from the optional fields
-  tags <- vapply(f, function(x) paste(x[-(1:11)], collapse = "\t"), "")
-  nm   <- suppressWarnings(as.integer(sub(".*NM:i:([0-9]+).*", "\\1", tags)))
-  nm[is.na(nm)] <- 99L
-  soft <- vapply(regmatches(cigar, gregexpr("[0-9]+S", cigar)),
-                 function(x) sum(as.integer(sub("S$", "", x))), numeric(1))
-
-  prov <- do.call(rbind, strsplit(field(1), "|", fixed = TRUE))
-  clip_len <- as.integer(prov[, 5])
-  span     <- ref_span(cigar)
-
-  at_junction <- ifelse(rev, pos + span - 1L == junc, pos == junc)
-  good <- at_junction & soft <= opt$max_softclip & nm <= pmax(1L, clip_len %/% 10L)
-  if (!any(good)) return(empty_hit_table())
-
-  # Captured before the tibble() call: inside it, `pos` would resolve to the column being defined on
-  # the line below rather than to this local vector, silently producing NAs.
-  flank_pos_v <- pos[good]
-  span_v      <- as.integer(span[good])
-
-  dplyr::tibble(
-    chrom     = ref[good, 1],         # the site_id; the genomic coordinate comes from the site table
-    pos       = junc[good],
-    strand    = ref[good, 2],
-    mapq      = as.integer(field(5))[good],
-    tube      = prov[good, 1],
-    barcode   = prov[good, 2],
-    umi       = prov[good, 3],
-    clip_len  = clip_len[good],
-    # where the clip actually sits inside the flank, so junction_coverage() can draw the pile-up
-    # from exactly the alignments that passed the positional test and no others
-    flank_pos = flank_pos_v,
-    span      = span_v,
-    junction  = junc[good]
-  ) |>
-    dplyr::rename(site_id = chrom)
 }
 
 # ── Annotation and output ─────────────────────────────────────────────────────────────────────────
@@ -509,25 +828,125 @@ annotate_positions <- function(chrom, pos, gtf) {
   out
 }
 
-#' Replace the clustering's internal ids with stable IS01.. labels, largest site first.
+#' Replace the clustering's internal ids with IS01.. labels, pinned to loci by a registry.
 #'
 #' Done once, before either summary, so the site table and the per-cell table cannot disagree about
 #' which site is which.
-label_sites <- function(hits) {
+#'
+#' The ordering is by size, which makes the tables readable and the labels UNSTABLE, and an earlier
+#' version of this function learned that the hard way twice. First three sites tied at 3 cells and
+#' reshuffled between runs; ordering by locus within a tie fixed that. Then the genome-mapped channel
+#' joined discovery, chr9:53,079,916 overtook chr13:83,681,311 on cell count, and IS01 through IS04
+#' all moved - silently repointing every ID in the report at a different locus. A rank is not an
+#' identity. Nothing that depends on which rows exist, or on how many cells they have, can be one.
+#'
+#' So the labels are pinned instead. `registry` is a tracked CSV of site_id, chrom, pos: a locus
+#' already in it keeps its number for good, a new locus takes the lowest number not yet spent, and
+#' the file is rewritten with the union. It lives under metadata/ rather than output/ because
+#' output/ is ignored by git - a registry that a clean checkout does not have is not a registry.
+#' Matching is by position within one cluster window, so a junction call that moves by a base or two
+#' between runs is still the same site.
+#'
+#' With no registry the old behaviour returns: numbered by rank, stable only as long as the ranks
+#' are. That path exists for one-off probes, not for anything whose output gets written down.
+label_sites <- function(hits, registry = NULL, opt = IS_DEFAULTS) {
   if (nrow(hits) == 0L) return(hits)
-  # Ties are broken by locus, not left to grouping order. Three sites sat at 3 cells and the labels
-  # reshuffled between runs, silently repointing IS07-IS09 at different loci and invalidating every
-  # document that named them.
+  # Ties are broken by locus, not left to grouping order.
   order <- hits |>
     dplyr::group_by(site_id) |>
     dplyr::summarise(cells = dplyr::n_distinct(paste(tube, barcode)),
                      chrom = dplyr::first(chrom), pos = min(pos), .groups = "drop") |>
-    dplyr::arrange(dplyr::desc(cells), chrom, pos) |>
-    dplyr::mutate(label = sprintf("IS%02d", dplyr::row_number()))
+    dplyr::arrange(dplyr::desc(cells), chrom, pos)
+
+  if (is.null(registry)) {
+    order$label <- sprintf("IS%02d", seq_len(nrow(order)))
+  } else {
+    reg <- if (file.exists(registry)) {
+      readr::read_csv(registry, show_col_types = FALSE, progress = FALSE)
+    } else {
+      dplyr::tibble(site_id = character(), chrom = character(), pos = integer())
+    }
+    lab <- rep(NA_character_, nrow(order))
+    for (i in seq_len(nrow(order))) {
+      near <- which(reg$chrom == order$chrom[i] &
+                      abs(as.integer(reg$pos) - order$pos[i]) <= opt$cluster_window)
+      if (length(near)) lab[i] <- reg$site_id[near[which.min(abs(reg$pos[near] - order$pos[i]))]]
+    }
+    # Lowest number not already spent, so a retired site's number is never reused.
+    spent <- unique(c(reg$site_id, lab[!is.na(lab)]))
+    free  <- setdiff(sprintf("IS%02d", seq_len(nrow(order) + length(spent))), spent)
+    lab[is.na(lab)] <- utils::head(free, sum(is.na(lab)))
+    order$label <- lab
+
+    new_rows <- dplyr::tibble(site_id = order$label, chrom = order$chrom, pos = order$pos) |>
+      dplyr::filter(!site_id %in% reg$site_id)
+    if (nrow(new_rows)) {
+      dir.create(dirname(registry), recursive = TRUE, showWarnings = FALSE)
+      readr::write_csv(dplyr::arrange(dplyr::bind_rows(reg, new_rows), site_id), registry)
+      message("    registry: ", nrow(new_rows), " new site(s) pinned -> ",
+              paste(new_rows$site_id, collapse = ", "))
+    }
+  }
+
   hits |>
     dplyr::left_join(dplyr::select(order, site_id, label), by = "site_id") |>
     dplyr::mutate(site_id = label) |>
     dplyr::select(-label)
+}
+
+#' Promote 5' junctions that have no called 3' site, by looking for the 3' partner at q -/+ 4.
+#'
+#' The mini-reference logic run backwards. A 5' junction at q predicts its 3' partner at exactly one
+#' position, so searching there is a single-position test rather than a scan, and that is what makes
+#' a 2-read cluster admissible evidence. chrX:100,691,117 was found this way: three 3' clips at
+#' MAPQ 60 in two cells at 100,691,113, signed delta +4 matching the strand - a real site the pooled
+#' `>= min_cells` floor had dropped at 2 cells in the 3' channel.
+#'
+#' Reports its own denominator, without which one match is unfalsifiable: `candidates` is how many
+#' orphan 5' junctions were tested and `rescued` how many found a partner. Forty tested and one
+#' rescued is compelling; forty and eight is a coincidence rate.
+rescue_orphan_junctions <- function(five_hits, discovery_hits, sites, opt = IS_DEFAULTS,
+                                    expect = 4L, tol = 2L) {
+  if (nrow(five_hits) == 0L) return(dplyr::tibble())
+  five <- cluster_hits(five_hits, opt) |>
+    dplyr::group_by(site_id) |>
+    dplyr::summarise(chrom = dplyr::first(chrom), pos_5p = min(pos),
+                     strand_5p = dplyr::first(strand),
+                     reads_5p = dplyr::n(),
+                     cells_5p = dplyr::n_distinct(paste(tube, barcode)), .groups = "drop") |>
+    dplyr::select(-site_id)
+
+  # Orphans only: a 5' junction already within a TSD's reach of a called site is not a candidate.
+  orphan <- vapply(seq_len(nrow(five)), function(i) {
+    if (nrow(sites) == 0L) return(TRUE)
+    !any(sites$chrom == five$chrom[i] & abs(sites$pos - five$pos_5p[i]) <= 50L)
+  }, logical(1))
+  cand <- five[orphan, , drop = FALSE]
+  if (!nrow(cand)) return(dplyr::tibble())
+
+  rows <- lapply(seq_len(nrow(cand)), function(i) {
+    # The partner sits at q - 4 or q + 4 depending on orientation; both are tested, and which one
+    # hits also tells you the strand. Tolerance is only for the absorbed-base case.
+    want <- c(cand$pos_5p[i] - expect, cand$pos_5p[i] + expect)
+    hit  <- discovery_hits[discovery_hits$chrom == cand$chrom[i] &
+                             vapply(discovery_hits$pos, function(p)
+                               any(abs(p - want) <= tol), logical(1)), , drop = FALSE]
+    dplyr::tibble(
+      chrom = cand$chrom[i], pos_5p = cand$pos_5p[i],
+      reads_5p = cand$reads_5p[i], cells_5p = cand$cells_5p[i],
+      pos_3p = if (nrow(hit)) as.integer(stats::median(hit$pos)) else NA_integer_,
+      reads_3p = nrow(hit),
+      cells_3p = if (nrow(hit)) dplyr::n_distinct(paste(hit$tube, hit$barcode)) else 0L,
+      umis_3p  = if (nrow(hit)) dplyr::n_distinct(paste(hit$tube, hit$barcode, hit$umi)) else 0L,
+      max_mapq = if (nrow(hit)) max(hit$mapq) else NA_integer_,
+      delta    = if (nrow(hit)) as.integer(cand$pos_5p[i] - stats::median(hit$pos)) else NA_integer_)
+  })
+  out <- dplyr::bind_rows(rows)
+  out$rescued <- !is.na(out$pos_3p) & abs(out$delta) == expect
+  # The denominator travels with the result, as an attribute so it survives a write_csv of the rows.
+  attr(out, "candidates") <- nrow(cand)
+  attr(out, "rescued")    <- sum(out$rescued)
+  out |> dplyr::arrange(dplyr::desc(rescued), dplyr::desc(cells_5p + cells_3p))
 }
 
 #' One row per site: position, host gene, and cell counts overall and per tube.
@@ -589,6 +1008,116 @@ update_site_counts <- function(site_table, mini, tubes) {
     dplyr::arrange(dplyr::desc(cells), chrom, pos)
 }
 
+#' Attach the genome-mapped channel's reads to the called sites, as cell evidence.
+#'
+#' The genomic channel already earned its place in DISCOVERY - it calls sites on its own. Until this
+#' function existed it then dropped out: the cell table and the site counts were rebuilt from the
+#' mini-reference assignments alone, so a site's clone size counted only the cells that happened to
+#' carry a soft-clipped tail read against the vector contig and discarded every cell whose evidence
+#' was a host-mapped read. The two are the same observation seen from opposite ends, and for IS01
+#' the omission halved the count (308 cells at discovery, 154 after assignment).
+#'
+#' Matching is by position, to the nearest called site within one cluster window - the same window
+#' call_sites() used to merge these reads into those sites in the first place, so this reproduces the
+#' calling assignment rather than inventing a second one. Reads further than that from every site are
+#' dropped: they are the positions that did not reach the cell floor, and they are not evidence for
+#' any site that did.
+#'
+#' clip_len carries the HOST alignment length for these rows, not the vector clip. In this channel
+#' the host is the anchor - 120-140 bases of it at MAPQ 255 - so host_len is the quantity that plays
+#' the part clip_len plays in the 3' channel, and max_clip_len in the cell table stays interpretable
+#' as "the longest host anchor behind this cell's call".
+genomic_site_hits <- function(gen, site_table, opt = IS_DEFAULTS) {
+  if (nrow(gen) == 0L || nrow(site_table) == 0L) {
+    return(dplyr::tibble(site_id = character(), tube = character(), barcode = character(),
+                         umi = character(), clip_len = integer(), channel = character(),
+                         tier = character()))
+  }
+  n   <- nrow(gen)
+  sid <- rep(NA_character_, n)
+  for (i in seq_len(n)) {
+    near <- which(site_table$chrom == gen$chrom[i] &
+                    abs(site_table$pos - gen$pos[i]) <= opt$cluster_window)
+    if (!length(near)) next
+    sid[i] <- site_table$site_id[near[which.min(abs(site_table$pos[near] - gen$pos[i]))]]
+  }
+  dplyr::tibble(
+    site_id  = sid,
+    tube     = gen$tube,
+    barcode  = gen$barcode,
+    umi      = gen$umi,
+    clip_len = as.integer(gen$host_len),
+    channel  = "genomic",
+    tier     = "genomic"
+  ) |>
+    dplyr::filter(!is.na(site_id), !is.na(barcode), !is.na(umi))
+}
+
+#' Per-site capture-recapture between the two channels - and the test that invalidates it.
+#'
+#' The tempting argument: the two channels read the same junctions through different reads, so a cell
+#' carrying a clone can be captured by either, the overlap between them estimates the capture
+#' probability, and Chapman's (n1+1)(n2+1)/(m+1) - 1 turns that into the number of cells carrying the
+#' clone INCLUDING those neither channel saw. Run on this data it returns 650-950 cells for the large
+#' sites against 130-342 detected, i.e. it claims the assay sees a third to a half of each clone.
+#'
+#' The columns after it are there to stop that being reported as a fact. Lincoln-Petersen needs the
+#' two captures to be independent given the cell. Here they are not even close: which channel a
+#' junction read falls in is decided by where its fragment straddles the junction - more vector than
+#' host and it is read against the contig, more host than vector and it is read against the genome -
+#' and every read of one UMI is a duplicate of one fragment. So the draw happens once per MOLECULE,
+#' and a cell can appear in both channels only if it carries at least two junction molecules. Between
+#' 73% and 100% of cells carry exactly one. m is therefore small for a reason that has nothing to do
+#' with undetected cells, and a small m is exactly what inflates N_hat.
+#'
+#' m_exp_molecule is that model's prediction with NO hidden population at all: for a cell with k
+#' molecules and a per-molecule probability p of landing in the 3' channel, P(both) = 1 - p^k -
+#' (1-p)^k, summed over the cells actually observed. Across the eleven sites with at least ten cells
+#' it predicts 110 overlapping cells against 150 observed - the same calculation done on reads
+#' instead of molecules predicts 430, which is the whole reason this is counted in molecules.
+#'
+#' So the mechanism is real and it is large, but it does not close the question, and it would be
+#' dishonest to present it as though it did. The 40-cell excess over the molecule model is consistent
+#' across every site and z = 6 overall, so something beyond molecule count makes the two channels
+#' agree more often than independence within a cell would - residual heterogeneity in capture, or
+#' molecules collapsed together by a shared UMI. That residual is POSITIVE correlation, which biases
+#' N_hat down, while the one-molecule mechanism biases it up. Two demonstrable biases in opposite
+#' directions, neither pinned down well enough to net out.
+#'
+#' Hence: chapman is written to the table because the argument for it should be inspectable, not
+#' because it is a clone size. Report detected, as a lower bound. The co-occurrence analysis in the
+#' report reaches the same place by a different route and lands within a factor of three or four of
+#' these numbers, which is worth knowing and is not the same thing as either being right.
+#'
+#' n1, n2 and m are counted in MOLECULES for the reason above. 73 of 1434 molecules do appear in both
+#' channels, so a molecule's channel is not strictly fixed - fragmentation happens after
+#' amplification - which makes umis_three + umis_genomic a slight over-count of k, and so pushes
+#' m_exp_molecule up rather than down: the shortfall against the observed overlap is not an artefact
+#' of that.
+channel_capture_recapture <- function(cell_table) {
+  if (nrow(cell_table) == 0L) return(dplyr::tibble())
+  cell_table |>
+    dplyr::group_by(site_id) |>
+    dplyr::group_modify(function(d, key) {
+      k <- d$umis_three + d$umis_genomic
+      p <- if (sum(k) > 0L) sum(d$umis_three) / sum(k) else NA_real_
+      n1 <- sum(d$umis_three > 0L)
+      n2 <- sum(d$umis_genomic > 0L)
+      m  <- sum(d$umis_three > 0L & d$umis_genomic > 0L)
+      dplyr::tibble(
+        detected = nrow(d), umis_per_cell = mean(k), frac_one_umi = mean(k == 1L),
+        n_three = n1, n_genomic = n2, m_both = m,
+        lincoln_petersen = if (m > 0L) n1 * n2 / m else NA_real_,
+        chapman = (n1 + 1) * (n2 + 1) / (m + 1) - 1,
+        # Chapman's variance, Seber 1970.
+        chapman_se = sqrt((n1 + 1) * (n2 + 1) * (n1 - m) * (n2 - m) / ((m + 1)^2 * (m + 2))),
+        m_exp_molecule = if (is.na(p)) NA_real_ else sum(1 - p^k - (1 - p)^k),
+        m_ratio = ifelse(m_exp_molecule > 0, m / m_exp_molecule, NA_real_))
+    }) |>
+    dplyr::ungroup() |>
+    dplyr::arrange(dplyr::desc(detected))
+}
+
 #' Per-base coverage of the host flanks either side of each junction, by channel.
 #'
 #' The two channels approach a provirus from opposite ends: 3' clips are the host sequence that
@@ -599,7 +1128,7 @@ update_site_counts <- function(site_table, mini, tubes) {
 #' Offsets are signed distances from the 3' junction in genomic coordinates, so 0 is the junction
 #' base itself. Mini-reference hits are converted out of flank coordinates using the junction offset
 #' carried in the reference name; 5' hits are already genomic.
-junction_coverage <- function(mini_sam, five_sam, sites, opt = IS_DEFAULTS, window = 120L) {
+junction_coverage <- function(mini_hits, five_sam, sites, opt = IS_DEFAULTS, window = 120L) {
   span_of <- function(cigar) ref_span(cigar)
 
   read_sam <- function(path) {
@@ -626,10 +1155,10 @@ junction_coverage <- function(mini_sam, five_sam, sites, opt = IS_DEFAULTS, wind
 
   out <- list()
 
-  # Take the 3' pile-up from read_mini_hits(), not from the raw SAM: only alignments that landed on
-  # the junction base count, and plotting the unfiltered set spreads coverage far beyond any clip's
-  # length (IS01 ran -49 to +119, wider than a 125 bp read can reach).
-  m <- read_mini_hits(mini_sam, opt)
+  # Takes the already-filtered hit table rather than a SAM path: only matches that passed the
+  # positional test count, and drawing the unfiltered set spread IS01 over -49..+119, wider than a
+  # 125 bp read can reach. Decoy flanks are not sites, so they are dropped here too.
+  m <- mini_hits[mini_hits$site_id %in% sites$site_id, , drop = FALSE]
   if (nrow(m)) {
     out$three <- expand(m$site_id, m$flank_pos - m$junction, m$span) |>
       dplyr::mutate(channel = "3' junction (host after the provirus)")
@@ -670,7 +1199,14 @@ junction_coverage <- function(mini_sam, five_sam, sites, opt = IS_DEFAULTS, wind
 #'
 #' A 5' junction with no site within `search` is reported with site_id NA: it may be a real site the
 #' 3' channel missed, so it is surfaced rather than dropped.
-tsd_check <- function(sites, five_hits, opt = IS_DEFAULTS, search = 2000L, expect = 4L) {
+#' `genome_fa`, when given, turns the coordinate test into a sequence test. Signed delta is reported
+#' rather than absolute, because its SIGN is a free check on the strand call: a plus-strand provirus
+#' puts its 5' junction above its 3' junction and a minus-strand one below, so sign(delta) must equal
+#' the strand. All four sites with both channels already agree, and a disagreement would mean either
+#' the strand call or one junction is wrong without saying which - which is why the sequence test
+#' exists alongside it.
+tsd_check <- function(sites, five_hits, opt = IS_DEFAULTS, search = 2000L, expect = 4L,
+                      genome_fa = NULL) {
   if (nrow(five_hits) == 0L || nrow(sites) == 0L) return(dplyr::tibble())
   five <- cluster_hits(five_hits, opt) |>
     dplyr::group_by(site_id) |>
@@ -686,45 +1222,109 @@ tsd_check <- function(sites, five_hits, opt = IS_DEFAULTS, search = 2000L, expec
   site_id <- rep(NA_character_, n)
   pos_3p  <- rep(NA_integer_,   n)
   delta   <- rep(NA_integer_,   n)
+  strand  <- rep(NA_character_, n)
   for (i in seq_len(n)) {
     near <- which(sites$chrom == five$chrom[i] & abs(sites$pos - five$pos_5p[i]) <= search)
     if (!length(near)) next
     k <- near[which.min(abs(sites$pos[near] - five$pos_5p[i]))]
     site_id[i] <- sites$site_id[k]
     pos_3p[i]  <- as.integer(sites$pos[k])
-    delta[i]   <- as.integer(abs(sites$pos[k] - five$pos_5p[i]))
+    strand[i]  <- as.character(sites$strand[k])
+    # SIGNED, not absolute. The sign is the strand check; taking the modulus throws it away.
+    delta[i]   <- as.integer(five$pos_5p[i] - sites$pos[k])
   }
 
-  five |>
-    dplyr::mutate(site_id = site_id, pos_3p = pos_3p, delta = delta) |>
+  out <- five |>
+    dplyr::mutate(site_id = site_id, pos_3p = pos_3p, delta = delta, strand = strand) |>
     # A TSD is 4 bp, so only a junction within a few bases of a site is a claim about that site.
     # Anything further is a distinct feature that merely happens to be nearby, and must not be
     # labelled FAIL against a site that passed on its own junction - chr19:38,932,385 sits 1.4 kb
-    # from IS03 and would otherwise read as IS03 failing.
+    # from IS03 and would otherwise read as IS03 failing. That one is now explained: it is an
+    # annotated Hells exon 3' end with a canonical GT after it, so those reads are a spliced
+    # host-exon-to-provirus fusion rather than a second integration.
     dplyr::mutate(tsd = dplyr::case_when(
-      is.na(delta)         ~ "no 3' site nearby",
-      delta == expect      ~ "PASS",
-      delta <= expect + 2L ~ "near",
-      delta <= 50L         ~ "FAIL",
-      TRUE                 ~ "distinct locus"
+      is.na(delta)              ~ "no 3' site nearby",
+      abs(delta) == expect      ~ "PASS",
+      abs(delta) <= expect + 2L ~ "near",
+      abs(delta) <= 50L         ~ "FAIL",
+      TRUE                      ~ "distinct locus"
     )) |>
-    dplyr::mutate(site_id = ifelse(tsd == "distinct locus", NA_character_, site_id)) |>
+    # Free consistency check, reported rather than merely assumed: a plus-strand provirus has its 5'
+    # junction above its 3' junction and a minus-strand one below.
+    dplyr::mutate(strand_ok = dplyr::case_when(
+      is.na(delta) | tsd == "distinct locus" ~ NA,
+      TRUE ~ (delta > 0L) == (strand == "+")
+    )) |>
+    dplyr::mutate(site_id = ifelse(tsd == "distinct locus", NA_character_, site_id))
+
+  # THE SEQUENCE TEST. A coordinate difference of 4 can be produced by an off-by-one in either
+  # channel, by a 0- versus 1-based slip, or by taking the wrong end of an alignment - this analysis
+  # has had all three. The duplicated bases themselves cannot: the two junctions must share one
+  # 5-base span of reference, so deriving that span from pos_3p and from pos_5p independently and
+  # requiring the two to be the same string is immune to the whole class. abs(delta) == 4 is kept as
+  # the cross-check, and a disagreement between the two localises which convention is wrong.
+  out$tsd_seq  <- NA_character_
+  out$tsd_obs  <- NA_real_
+  if (!is.null(genome_fa) && file.exists(genome_fa) && any(out$tsd %in% c("PASS", "near"))) {
+    fa <- Rsamtools::FaFile(genome_fa)
+    i  <- which(out$tsd %in% c("PASS", "near"))
+    lo <- pmin(out$pos_3p[i], out$pos_5p[i])
+    hi <- pmax(out$pos_3p[i], out$pos_5p[i])
+    span <- as.character(Rsamtools::scanFa(
+      fa, GenomicRanges::GRanges(out$chrom[i], IRanges::IRanges(lo, hi))))
+    out$tsd_seq[i] <- span
+
+    # The non-circular half. Deriving the span twice from the reference proves nothing - addressed
+    # from either junction it is the same interval, so the comparison is a tautology (an earlier
+    # version of this function made exactly that mistake and reported a pass). The reference is one
+    # witness; the OBSERVED clip sequence is a second, independent one. A real TSD means the
+    # duplicated bases are physically present in the 5' reads, so the span must appear in their
+    # sequence - in either orientation, since SEQ is stored reference-forward.
+    if (!is.null(five_hits$seq)) {
+      out$tsd_obs[i] <- vapply(seq_along(i), function(j) {
+        rs <- five_hits$seq[five_hits$chrom == out$chrom[i][j] &
+                              abs(five_hits$pos - out$pos_5p[i][j]) <= opt$cluster_window]
+        if (!length(rs)) return(NA_real_)
+        rc <- as.character(Biostrings::reverseComplement(Biostrings::DNAString(span[j])))
+        mean(grepl(span[j], rs, fixed = TRUE) | grepl(rc, rs, fixed = TRUE))
+      }, numeric(1))
+    }
+  }
+
+  out |>
     dplyr::arrange(dplyr::desc(reads_5p)) |>
-    dplyr::select(site_id, chrom, pos_3p, pos_5p, delta, tsd, reads_5p, cells_5p)
+    dplyr::select(site_id, chrom, pos_3p, pos_5p, delta, tsd, tsd_seq, tsd_obs, strand, strand_ok,
+                  reads_5p, cells_5p)
 }
 
 #' One row per cell per site: the table that joins onto the Seurat metadata.
 #'
 #' A cell at more than one site is flagged, not resolved: a genuine multi-copy integrant and a
 #' doublet are indistinguishable here, so the choice belongs downstream.
+#' `channel` and `tier` are carried through per cell, not collapsed. The capture-recapture argument
+#' needs, per site, the 3' cell set, the genomic cell set and their overlap, and a single label per
+#' cell destroys that irrecoverably - cheap to keep now, a re-run to recover later.
 summarise_cells <- function(hits) {
   if (nrow(hits) == 0L) return(dplyr::tibble())
+  # names(), not hits$channel: a tibble warns on an unknown column rather than returning NULL.
+  if (!"channel" %in% names(hits)) hits$channel <- "three_prime"
   hits |>
     dplyr::group_by(site_id, tube, barcode) |>
     dplyr::summarise(reads = dplyr::n(),
                      umis = dplyr::n_distinct(umi),
                      max_clip_len = max(clip_len),
                      tiers = paste(sort(unique(tier)), collapse = "+"),
+                     channels = paste(sort(unique(channel)), collapse = "+"),
+                     reads_three = sum(channel == "three_prime"),
+                     reads_genomic = sum(channel == "genomic"),
+                     # Per-channel MOLECULE counts, not just read counts. The channel a read falls
+                     # in is decided by where its fragment straddles the junction, and every read of
+                     # one UMI is a duplicate of one fragment - so the lottery is drawn once per
+                     # molecule, not once per read. Any question about how the two channels overlap
+                     # has to be asked of these, and asking it of reads gives an answer that is
+                     # wrong by a factor of three.
+                     umis_three = dplyr::n_distinct(umi[channel == "three_prime"]),
+                     umis_genomic = dplyr::n_distinct(umi[channel == "genomic"]),
                      .groups = "drop") |>
     dplyr::group_by(tube, barcode) |>
     dplyr::mutate(n_sites_in_cell = dplyr::n_distinct(site_id),

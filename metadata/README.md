@@ -30,3 +30,18 @@ files are added; files no longer in `data/` are kept and marked `missing`. Descr
 | `samples.csv` | the sample sheet: `Tube`, `sample_name_short`, `sample_name_long` (copied from the data hub by `scripts/sh/link-references.sh`) |
 | `cellranger/libraries.csv` | per tube: its feature reference, and the GEX and CITE libraries (FASTQ id, and the library's folder below `$FASTQ_ROOT`) |
 | `cellranger/featureref_GFP.csv`, `featureref_MPL.csv` | the TotalSeq-B hashtags (0301–0304) for the WT (GFP) and Het (MPL) tubes |
+
+## `integration_site_registry.csv`
+
+Pins each integration-site label to its locus. `site_id`, `chrom`, `pos`.
+
+Site labels used to be ranks: `IS01` was whichever site had the most cells. That made them move. When
+the genome-mapped channel joined discovery, `chr9:53,079,916` overtook `chr13:83,681,311` on cell
+count and `IS01` through `IS04` all pointed somewhere new, which silently invalidated every sentence
+in the report that named a site. This file is the fix: a locus in it keeps its number permanently, a
+newly discovered locus takes the lowest number never yet used, and `label_sites()` rewrites the file
+with the union. The first nine rows are the numbering the report was written against, seeded by hand
+from the run of 2026-11-16 so that nothing already written had to be renumbered.
+
+It is tracked, unlike everything under `output/`, because a registry a clean checkout does not have
+pins nothing. Do not renumber it. Do not reuse a retired number.
