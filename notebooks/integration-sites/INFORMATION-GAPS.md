@@ -22,26 +22,43 @@ at contig **2734** retains the `AC` that integrase removes, so it cannot come fr
 provirus — it is unintegrated linear vector or plasmid. The ratio of 2734 to 2736 anchors is a direct
 estimate of how much unintegrated material is left. Cheap, and worth running before asking.
 
-## 2. Intended MOI, or measured vector copy number — **open, but less urgent**
+## 2. Intended MOI, or measured vector copy number — **answered from the data; useful only as confirmation**
 
-**Partly answered from the data, 2026-11-16.** The co-occurrence test says multi-copy founders are
-absent: every informative pair of sites co-occurs *below* chance (IS01+IS02: 6 observed vs 26
-expected in Rx_4, 2 vs 24 in Rx_6). Sites behave as labels on disjoint clones, and the ~2% of cells
-carrying two read as doublets. MOI would still be useful as outside confirmation, and to say whether
-that was by design, but the analysis no longer waits on it.
+**Answered from the data, 2026-11-18 — and in the opposite direction to the first attempt.** This
+entry said on 2026-11-16 that multi-copy founders are *absent*, on the grounds that every informative
+pair of sites co-occurs below chance. That was wrong, and the reason it was wrong is instructive: the
+expectation it compared against assumed complete detection, so "below chance" was guaranteed and
+carried no information.
+
+The hashtag demultiplex supplies the control that does carry information. Every site is
+mono-replicate, so **two sites in different mice cannot share a cell** and any co-occurrence between
+them is a doublet or an ambient pick-up. Across Rx_4 and Rx_6: cross-mouse pairs give 1 observed
+co-occurrence against 263.5 expected under independence; same-mouse pairs give 26 against 202.1. A
+doublet process cannot tell the two classes apart, so applying the same-mouse rate to the cross-mouse
+pairs predicts 33.9 and one was seen (*p* ≈ 7 × 10⁻¹⁴). **Doublets and ambient are excluded as the
+dominant mechanism, and multi-copy founders in B0303 are now the favoured explanation.** All 26
+co-occurrences are in that one mouse, among IS01, IS02, IS06 and IS08.
+
+MOI is therefore no longer the prior the co-occurrence test needs — the test now stands on its own
+control. It would still be useful as outside confirmation, to say whether this was by design, and to
+settle the part that remains open: the implied clone size is not consistent across pairs (2,312 from
+IS01+IS02 against 365 from IS01+IS06), so correlated detection within a cell is mixed in with real
+sharing and co-occurrence alone cannot separate them.
 
 **Why it mattered.** It set the prior for the site co-occurrence test. At low MOI almost every
 transduced cell carries one provirus and co-occurrence should be rare; at high MOI multi-copy
-founders are expected, and two sites in one cell is then a clone rather than a doublet. The data has
-now answered the question the prior was for.
+founders are expected, and two sites in one cell is then a clone rather than a doublet. The data now
+answers that question directly, so the prior is no longer load-bearing.
 
 **What changes.** How to read the `ambiguous` flag in `cell_site_assignments.csv`. The pipeline
 deliberately refuses to decide — it flags cells at more than one site and leaves the call downstream,
 because a multi-copy clone and a doublet are indistinguishable from the data alone. MOI is the
 outside information that breaks the tie.
 
-Also bears on replicate B0303 carrying six of the nine sites: that is either a more heavily
-transduced animal or one with more clonal expansion, and MOI distinguishes them.
+Also bears on replicate B0303 carrying seven of the fifteen sites and 819 of the 1,186 labelled
+cells: that is either a more heavily transduced animal or one with more clonal expansion, and MOI
+distinguishes them. The co-occurrence result above says the two are not mutually exclusive — the
+sharing between IS01, IS02, IS06 and IS08 is in that same animal.
 
 ## 3. Is genomic DNA available from these animals? — **open**
 

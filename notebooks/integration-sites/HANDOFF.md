@@ -4,8 +4,15 @@ Written for an agent or analyst picking this up without the conversation that pr
 why the analysis exists, what was tried and rejected, what is assumed, and where the traps are. The
 code explains *what* it does; this explains *why*, and what already went wrong.
 
-Status as of 2026-11-16: pipeline runs end to end, 9 sites called, report renders. Nothing is
-committed to git — the project has a standing rule that commits happen only when asked.
+Status as of 2026-11-18: pipeline runs end to end on the cluster (job 35742986, 1 h 49 m), **15
+sites** called, 1,213 cell-site assignments over 1,186 cells. Nothing is committed to git — the
+project has a standing rule that commits happen only when asked.
+
+What changed on 2026-11-18, since it changes most of the numbers below: the genome-mapped channel
+was already calling sites, but its reads were being discarded afterwards, so clone sizes were built
+from the 3′ channel alone. They now carry both channels. The site count went 9 → 15 and the labelled
+cell count 552 → 1,186. Site labels are now pinned to loci by `metadata/integration_site_registry.csv`
+rather than assigned by rank — see §7.
 
 ---
 
@@ -92,7 +99,7 @@ Filter chain, in order (each clip counted once, under the first reason it meets)
 | not polyA | <80% A | |
 | has corrected CB and UB | | |
 | discovery tier | clip ≥25 bp | long enough to place alone genome-wide; **defines** the site list |
-| assignment tier | clip ≥8 bp | placed against the mini-reference only; **adds cells**, see §4b |
+| assignment tier | clip ≥10 bp | matched against the mini-reference only, by exact position, no aligner; **adds cells**, see §4b. The floor was 8 until the decoy flanks measured where they stop returning hits |
 | MAPQ | ≥30 | on the realigned clip, discovery only |
 | cluster | single-linkage, 20 bp | junctions scatter a few bases because clips start wherever the read began |
 | site floor | ≥3 cells and ≥3 UMIs | the one genuinely arbitrary parameter |
@@ -131,12 +138,19 @@ one of the flanks already called?". Treating those as one question, with one cli
 throws away most of the data.
 
 `write_site_flanks()` cuts ±200 bp around each **discovery-tier** site — seeding it from anything the
-assignment step produced would make the method confirm itself — and `read_mini_hits()` places clips
-against it. The discriminator is **position, not score**: a clip belongs to a site only if its
-junction-adjacent base lands on that site's junction base, at the offset carried in the sequence
-name. One accepted landing site out of ~400 per flank is what makes an 8 bp clip decisive.
+assignment step produced would make the method confirm itself — and `assign_clips_exact()` places
+clips against it, with no aligner. The discriminator is **position, not score**: a clip belongs to a
+site only if its junction-adjacent base lands on that site's junction base, at the offset carried in
+the sequence name. One accepted landing site out of ~400 per flank is what makes a 10 bp clip
+decisive. (bwa used to do this placement, via a `read_mini_hits()` that no longer exists: its `-T 12`
+silently enforced a 12 bp floor while `min_assign` advertised 8, so 169 reads were written and
+dropped with no error. The floor is now whatever `min_assign` says, and `min_assign` is 10 because
+that is where the decoy flanks stop returning hits.)
 
-Result: cells labelled rise from 339 to **552**. Both wild-type tubes stay at **zero**.
+Result: cells labelled rise from 339 to **552** on the 3′ channel alone, and to **1,186** once the
+genome-mapped channel's cells are folded in as well. The wild-type tubes stayed at zero through all
+of that except for two cells — one in Rx_1 and one in Rx_5, both at IS04 — which is the measured
+cross-tube rate, 0.16% of labelled cells.
 
 **Two traps, both hit:**
 
@@ -219,23 +233,32 @@ it was a question about what the library contains, now answered.
 
 ## 7. Results, and the validations
 
-9 sites called, 8 usable, **552 distinct cells labelled**.
+15 sites called, 12 in the mini-reference, **1,186 distinct cells labelled**. `mouse` is the
+dominant hashtag class, which is 96–100% of each site's cells.
 
-| id | locus | gene | cells | note |
-|---|---|---|---|---|
-| IS01 | chr13:83,681,311 | *Mef2c* | 202 | |
-| IS02 | chr9:53,079,916 | *Ddx10* | 145 | |
-| IS03 | chr19:38,933,742 | *Hells* | 80 | |
-| IS04 | chr7:83,792,638 | *Abhd17c* | 74 | |
-| IS05 | chr9:64,711,166 | *Gm36459* | 44 | **Rx_4 (HSC) only** |
-| IS06 | chr1:67,556,980 | intergenic | 7 | |
-| IS08 | chr18:17,071,116 | intergenic | 6 | |
-| IS09 | chr2:31,009,148 | *Fnbp1* | 6 | |
-| IS07 | JH584304.1:35,417 | intergenic | **0** | **artefact, gated out.** Unplaced scaffold, 23-base homopolymer in its flank, zero cells in both high-signal tubes, no 5' junction. Excluded from the mini-reference by `max_homopolymer`; reported from discovery only. |
+| id | locus | gene | cells | mouse | note |
+|---|---|---|---|---|---|
+| IS02 | chr9:53,079,916 | *Ddx10* | 342 | B0303 | |
+| IS01 | chr13:83,681,311 | *Mef2c* | 318 | B0303 | |
+| IS04 | chr7:83,792,638 | *Abhd17c* | 178 | B0301 | |
+| IS03 | chr19:38,933,742 | *Hells* | 130 | B0303 | also the spliced-exon channel, §7.3 |
+| IS10 | chr13:5,676,485 | *Gm35330* | 99 | B0304 | **invisible to the 3′ channel** — its clips are MAPQ 0 |
+| IS05 | chr9:64,711,166 | *Gm36459* | 57 | B0304 | **Rx_4 (HSC) only**; 2.6 UMIs a cell, the highest of any site |
+| IS11 | chr1:16,580,387 | *Stau2* | 25 | B0304 | new from the genomic channel |
+| IS09 | chr2:31,009,148 | *Fnbp1* | 19 | B0301 | |
+| IS12 | chr11:111,656,449 | intergenic | 12 | B0304 | new from the genomic channel |
+| IS06 | chr1:67,556,980 | intergenic | 10 | B0303 | |
+| IS08 | chr18:17,071,116 | intergenic | 10 | B0303 | |
+| IS13 | chr2:126,704,897 | *Trpm7* | 6 | B0303 | all six cells in mCherry⁻ tubes |
+| IS07 | JH584304.1:35,417 | intergenic | 3 | B0303 | **artefact.** Unplaced scaffold, 23-base homopolymer in its flank, no 5′ junction, and all three cells in mCherry⁻ tubes. Held out of the mini-reference by `max_homopolymer`; its cells come from the genomic channel, which does not consult the flank |
+| IS14 | chr10:19,804,209 | intergenic | 2 | B0304 | at the cell floor, no 5′ confirmation; held out of the mini-reference |
+| IS15 | chr9:82,806,975 | *Phip* | 2 | B0304 | as IS14 |
 
-**Site IDs are stable but not rank-ordered.** They are assigned from discovery-tier counts with ties
-broken by locus, so IS07 sits between IS06 and IS08 despite having no assigned cells. Do not infer
-importance from the number.
+**Site IDs are pinned to loci, not to ranks.** `metadata/integration_site_registry.csv` holds the
+mapping; a locus in it keeps its number for good and a new locus takes the lowest number never used.
+This replaced rank ordering after the genomic channel changed the ranking and silently repointed IS01
+through IS04 at different loci. Do not infer importance from the number, and do not renumber the
+registry.
 
 Three checks the pipeline never used as input, so they are genuinely independent:
 
