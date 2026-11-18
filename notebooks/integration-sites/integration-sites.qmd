@@ -216,8 +216,12 @@ assign$site_id <- factor(assign$site_id, levels = sites$site_id)
 # (closest pair under deuteranopia ~9 dE). Okabe-Ito and Tol muted do better there (~17) but are far
 # worse for normal vision (~26 and ~23), and their low chroma washes out at this point size. If a
 # reader needs CVD-safe output, swap this one line.
-site_palette <- stats::setNames(as.character(pals::glasbey(nlevels(assign$site_id) + 1))[-1],
-                                levels(assign$site_id))
+# Keyed on the site LABEL, not on its position in the table. The labels are pinned to loci by the
+# registry, but the table is sorted by size, so keying the palette on position would move every
+# clone's colour the moment one changed rank - the same failure the registry fixed for the labels,
+# and harder to notice in a figure. Sorted ids mean IS01 keeps its colour and a new site appends.
+pal_ids      <- sort(levels(assign$site_id))
+site_palette <- stats::setNames(as.character(pals::glasbey(length(pal_ids) + 1))[-1], pal_ids)
 
 # Taken from the pipeline rather than restated, so the figures cannot drift from the run.
 JUNCTION <- IS_DEFAULTS$junction
