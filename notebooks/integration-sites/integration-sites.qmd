@@ -161,6 +161,9 @@ OS release, so on a Rocky 9 node it finds no library and the first `library()` c
 | `orphan_rescue.csv` | 4 | orphan 5′ junction tested at the one position its partner must occupy, with the denominator |
 | `junction_coverage.csv` | — | site × channel × offset: the pile-up figure |
 | `genomic_decoy_rate.csv` | 8 | tube: real against decoy hits for the genome-mapped channel, from the scrambled-terminus run. Region-tagged when restricted to one chromosome, so a narrow probe cannot overwrite a genome-wide measurement |
+| `detection_model.csv` | 15 | site: per-cell detection rate from a zero-truncated Poisson on molecule counts, the detection-corrected clone size with a bootstrap interval, and the observed-against-fitted check. `NA` where the truncated mean is too close to 1 to fit — that is the estimator declining, not a gap |
+| `clip_table.csv.gz` | ~1,800 | **molecule**: one row per tube + barcode + UMI with **no floor**, its longest clip, and how many called sites and decoy flanks that clip matches. The table every floor and detection question is answered from |
+| `clip_matches.csv.gz` | ~9,000 | clip × flank × orientation with the mismatch count, for anything the molecule view collapses away |
 | `channel_capture_recapture.csv` | 15 | site: cells seen by each channel, their overlap, Chapman's estimator — **and the molecule-model expectation that stops it being read as a clone size** |
 
 ## Re-running it
@@ -398,6 +401,67 @@ assignments are added, against the 2 of 1,213 already there.
 **The floor is left at 10 here.** Changing it moves every downstream number, the gain is four per
 cent of cells, and it would have to arrive with the mismatch budget changed underneath it. The
 measurement is recorded so the decision is costed rather than argued.
+
+#### The other instrument, and why it does not decide this
+
+There is a second way to measure assignment error, and it is tempting because it runs on real reads
+rather than decoys: every site belongs to exactly one mouse and every cell's hashtag names its mouse,
+so **a clip assigned to a site in the wrong mouse is a detectable error**. Run over the current
+assignments:
+
+| clip length | molecules | cross-mouse | rate |
+|---|---|---|---|
+| 10–11 | 71 | 3 | 4.23% |
+| 12–14 | 104 | 0 | 0% |
+| 15–19 | 128 | 0 | 0% |
+| 20–29 | 290 | 3 | 1.03% |
+| 30+ | 538 | 1 | 0.19% |
+| **pooled** | **1,131** | **7** | **0.62%** (0.71% inflated per cell) |
+
+It passes at the current floor — under 1% — and it is reported for that. **It cannot set the floor**,
+for two reasons that are structural rather than fixable by more data.
+
+It measures chance matching *plus* hashtag misassignment *plus* doublets. Four of the seven
+cross-mouse landings sit at 23, 27 and 45 bases, where an exact positional match to the wrong flank
+is not a coincidence, so the confound floor is **0.48%** against a 1% tolerance. And the resulting
+power at the band that matters — 94 molecules at 6–9 bp — is not close to sufficient:
+
+| if the true clip error were | power to detect it |
+|---|---|
+| 1% | **8%** |
+| 2% | 20% |
+| 5% | 62% |
+| 10% | 93% |
+
+So it can exclude an error rate above ~5% and cannot certify one below 1%, which is the only decision
+a floor needs. The decoy flanks measure chance matching alone, and 100 of them can be cut against 94
+real molecules, so they have the sample size this lacks. **Set the floor from decoys; read this curve
+as a sanity check that happens to agree.** One detail worth recording either way: all seven
+cross-mouse landings are on IS01 or IS02, the two largest clones, which is the prior-inflation
+signature — ambiguous evidence drifting onto the biggest hypothesis — showing up even at the current
+floor.
+
+#### How much ambiguity there is to resolve, which bounds everything above
+
+One number sizes the whole question. Across the entire dataset, **25 molecules match more than one
+called site exactly** — and every one of them has a clip of 1 or 2 bases. At 6 bp and above, every
+molecule that matches a site matches exactly one. There is no ambiguity above 2 bp for any
+tie-breaking rule to work on.
+
+That bounds the most attractive idea for breaking the ties, too. Because every site belongs to one
+mouse and each cell's hashtag names its mouse, the candidate sites for a cell can be restricted from
+all fifteen to the 2–7 in its own mouse (B0301 holds 2, B0304 6, B0303 7). Applied to those 25
+molecules it resolves **8** of them to a single site, leaves 13 still ambiguous, and finds no hashtag
+call for 4. So it works, it is free, and it operates on eight molecules at clip lengths that should
+not be used anyway. Worth knowing before building anything on it.
+
+Its companion instrument, the labelled validation set, is thinner still: 573 cells carry a ≥20 bp
+clip and 151 carry a sub-floor clip, but only **27 carry both**. That is enough to catch a gross
+disagreement and nothing finer, because sub-floor molecules come one to a cell — all 151 of them, in
+151 different cells. **No cell in this data carries two sub-floor molecules**, which also retires the
+idea of aggregating several short clips within a cell into one confident call: it has no instances
+here. At λ ≈ 0.3–0.7 you do not get two attempts at the same cell. The exception is instructive:
+IS05, at 2.63 molecules a cell, is the one site where within-cell replication exists at all.
 
 ```{r clip-length}
 junction_clips <- anchor_ends %>%
@@ -1604,37 +1668,92 @@ with zero are exactly the ones missing from the table, and the mean of the **zer
 distribution — `λ / (1 − e^−λ)` — identifies λ from the cells in hand. Then `1 − e^−λ` is a per-cell
 detection rate and `detected / (1 − e^−λ)` a clone size. No second sample is required.
 
-| site | detected | molecules/cell | λ | detection | clone size | Chapman, for contrast |
-|---|---|---|---|---|---|---|
-| IS05 | 57 | 2.65 | 2.41 | **91%** | **63** | 61 |
-| IS02 | 342 | 1.35 | 0.64 | 47% | 728 | 648 |
-| IS11 | 25 | 1.24 | 0.45 | 36% | 69 | 53 |
-| IS08 | 10 | 1.20 | 0.38 | 31% | 32 | 15 |
-| IS01 | 318 | 1.13 | 0.24 | 22% | 1,480 | 948 |
-| IS10 | 99 | 1.12 | 0.23 | 21% | 476 | 244 |
-| IS03, IS04, IS09, … | | ≤ 1.08 | — | — | — | |
+```{r detection-model}
+readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FALSE) |>
+  dplyr::transmute(site = site_id, detected = cells,
+                   `molecules/cell` = round(mean_molecules, 2), λ = round(lambda, 2),
+                   detection = round(detection, 3), `clone size` = clone_size,
+                   `95% CI` = ifelse(is.na(clone_lo), NA_character_,
+                                     sprintf("%d – %d", clone_lo, clone_hi)),
+                   `obs 1 mol` = obs_1, `exp 1 mol` = round(exp_1),
+                   `obs 2 mol` = obs_2, `exp 2 mol` = round(exp_2)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 15, scrollX = TRUE))
+```
 
-**Read the top row and the bottom row together.** IS05 averages 2.65 molecules a cell and the
-estimator returns 63 against 57 detected — a 91% detection rate, tightly determined, and the one
-case in this data where the method can see what it is doing. Everything below it averages 1.1–1.4
-molecules a cell, where the fit is driven almost entirely by how far the mean sits above 1 and swings
-wildly for small changes in it. At a mean of exactly 1.00 the fit is degenerate — λ → 0, clone size
-→ ∞ — so the pipeline returns `NA` rather than a number for the nine sites at or below 1.08,
-including IS03 and IS04. **These are not nine missing values to be filled in later; they are the
-estimator correctly declining.**
+| site | detected | molecules/cell | detection | clone size (95% CI) |
+|---|---|---|---|---|
+| IS05 | 57 | 2.63 | **91%** | **63** (60 – 67) |
+| IS02 | 342 | 1.41 | 52% | **660** (593 – 753) |
+| IS01 | 318 | 1.17 | 28% | **1,154** (942 – 1,480) |
+| IS11 | 25 | 1.16 | 26% | 95 (52 – 121) |
+| IS06 | 10 | 1.80 | 73% | 14 (11 – 32) |
+| IS08 | 10 | 1.40 | 51% | 20 (13 – 32) |
+| IS03, IS04, IS09, IS10, IS12–IS15 | 451 | ≤ 1.09 | — | — |
 
-So: **`detected` is the floor and should be what gets quoted.** Where the molecule count supports it,
-detection runs at 21–47% for the large clones and 91% for IS05, which puts the large clones at order
-10³ cells — the same order the co-occurrence inversion reaches from the other direction (2,312 for
-IS01 + IS02). `chapman` stays in the CSV as an audit trail, greyed out, because an argument that
-tempting should be inspectable rather than deleted.
+**Read the top row and the bottom row together.** IS05 averages 2.63 molecules a cell and the
+estimator returns 63 against 57 detected — 91% detection, tightly bounded, and the one case where
+the method can see what it is doing. The nine sites at or below 1.09 molecules a cell get `NA`: at
+exactly 1.00 the fit is degenerate, λ → 0 and the clone size goes to infinity, so the pipeline
+declines rather than printing a number. **Those are not nine gaps to fill later** — for a 2-cell site
+the correction would be meaningless against its own uncertainty.
 
-Three routes now bear on the size of the two large B0303 clones, and they are independent of each
-other in what they assume: the zero-truncated Poisson gives 728 and 1,480 from molecule counts alone,
-the co-occurrence inversion gives 2,312 from the assumption that IS01 and IS02 share a founder, and
-Chapman gives 648 and 948 from a design that cannot support it. They disagree by a factor of three.
-They agree that the answer is **order 10³ against 318 and 342 detected**, and that is the most that
-should be claimed.
+**The Poisson fits, which was not expected.** 240 IS02 cells hold one molecule against 232 predicted
+and 76 hold two against 85; IS01 gives 273 against 269 and 37 against 43. The plan anticipated
+overdispersion and a negative-binomial refit, on the strength of 150 both-channel cells against a
+predicted 110 — and that excess turned out to be the same molecule counted twice. With the counting
+fixed there is nothing left to refit. (Do not read the fit from the variance-to-mean ratio: a
+zero-truncated Poisson with small λ is underdispersed by construction, 0.41 at IS02 and 0.17 at IS01,
+so comparing it to 1 suggests a problem that is not there.)
+
+### Repertoire completeness: what fraction of the transduced population these sites account for
+
+Detection-corrected clone sizes make a question answerable that has sat open for several rounds, and
+the denominator needed for it is already in hand — the mCherry⁺ cells sequenced, not the FACS record.
+
+- mCherry⁺ cells sequenced (Rx_4 + Rx_6): **43,332**
+- labelled: **1,131**, which is **2.6%** — an assumption-free floor on completeness
+- detection-corrected cells across all fifteen sites: **≈ 2,900**, using the median detection of the
+  estimable sites for the nine without one
+- **so the fifteen sites account for roughly 7% of the sorted mCherry⁺ population**
+
+The floor needs no model: even at perfect detection the sites would cover 2.6%. The ~7% leans on λ
+and on treating mCherry⁺ as implying a provirus, so it carries the same factor-two uncertainty as the
+clone sizes. The direction does not: **these fifteen sites are a small minority of the transduced
+population**, and any statement about the clonal repertoire should say so.
+
+#### Where the rest of the junctions are, since they are visible
+
+That conclusion invites the obvious objection — if ~93% of mCherry⁺ cells belong to no called site,
+why are there no junction reads from them? There are, and the clip table says what happens to them.
+Of 1,422 junction-bearing cells, **236 carry a molecule attributable to no called site**:
+
+| | molecules |
+|---|---|
+| below the assignment floor (< 10 bp) | 100 |
+| 10–24 bp | 64 |
+| **≥ 25 bp, long enough to place, matching nothing** | **76** |
+
+Following that last group through `bwa`: **67 place at MAPQ < 30** — repetitive flank, the blind spot
+— 15 do not place at all, and 29 place cleanly at MAPQ ≥ 30. Those 29 sit at exactly **seven uncalled
+positions**, each with 1–2 cells and 1–3 molecules, every one below the `min_cells = 3` and
+`min_umis = 3` floor. One of them is `chrX:100,691,113`, the orphan the target-site-duplication
+rescue identified and that was never promoted to a site.
+
+So the repertoire missing *within this data* is seven micro-loci below the calling floor plus a
+repetitive-flank blind spot — **not** a large population of undetected clones leaving no trace. The
+two findings are consistent: the undetected 93% are cells of clones whose proviruses never yielded a
+captured junction molecule at all, which is what a per-cell detection rate of 26–52% implies, and
+they are invisible here by construction rather than by oversight. That is also why this estimate does
+not need step 4's posteriors to reach it.
+
+Three routes now bear on the size of the two large B0303 clones, and they differ in what they
+assume: the zero-truncated Poisson gives **660 and 1,154** from molecule counts alone, with bootstrap
+intervals of 593–753 and 942–1,480; the co-occurrence inversion gives **2,312** on the assumption
+that IS01 and IS02 share a founder; and Chapman gives 648 and 948 from a design that cannot support
+it. The first is the one to quote — it has a referent, an interval, and a fit check that passes.
+All three agree the answer is **order 10³ against 318 and 342 detected**, and the co-occurrence
+figure being the highest is consistent with its own assumption: if the two sites are one clone, its
+size is the sum of what each sees, not either alone.
 
 # Limitations
 

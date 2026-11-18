@@ -349,6 +349,49 @@ three further truncations and halted instead of leaving plausible-looking corrup
 artefacts are gzipped (18× smaller) for the same reason. **Do not remove either guard** — the
 filesystem is shared and the condition will recur.
 
+**The detection model (step 3), added 2026-11-18 — this is where the factor of three is.**
+`detection_model.csv`: per-site λ from a zero-truncated Poisson on per-cell molecule counts, the
+detection-corrected clone size with a bootstrap interval, and an observed-against-fitted check.
+
+| site | detected | molecules/cell | detection | clone size (95% CI) |
+|---|---|---|---|---|
+| IS05 | 57 | 2.63 | **91%** | 63 (60–67) |
+| IS02 | 342 | 1.41 | 52% | 660 (593–753) |
+| IS01 | 318 | 1.17 | 28% | 1,154 (942–1,480) |
+| IS11 / IS06 / IS08 | 25 / 10 / 10 | 1.16 / 1.80 / 1.40 | 26 / 73 / 51% | 95 / 14 / 20 |
+| nine others | 451 | ≤ 1.09 | — | — |
+
+Three things not to get wrong with it. **The molecule count must come from the clip table**, not from
+summing `umis_three + umis_genomic` over the cell table — that double-counts the 83 molecules in both
+channels *and* drops every sub-floor molecule, and the two errors cancel badly enough that the wrong
+answer looks reasonable (mean 1.271 against the correct 1.236). **`NA` is the estimator declining**,
+not a gap: at a truncated mean of 1.00 the fit is degenerate and the clone size goes to infinity.
+**Read the fit from obs against exp, never from `var_mean_ratio`** — a truncated Poisson with small λ
+is underdispersed by construction (0.41, 0.17), so comparing it to 1 invents a problem. The Poisson
+fits: 240 IS02 cells at one molecule against 232 expected, 76 at two against 85. The overdispersion
+the plan expected came from the shared-UMI artefact and disappeared with it.
+
+**Repertoire completeness, answered without the FACS record.** The denominator needed is the mCherry⁺
+cells *sequenced*, which is in hand: 43,332 across Rx_4 and Rx_6, of which 1,131 are labelled — a
+**2.6% assumption-free floor** — and ~2,900 after detection correction, so the fifteen sites account
+for roughly **7% of the sorted mCherry⁺ population**. The missing 93% leave a trace that is
+accounted for rather than mysterious: of 1,422 junction-bearing cells, 236 carry a molecule matching
+no called site, and of the 76 long enough to place, 67 land at MAPQ < 30 (repetitive flank), 15 do
+not place, and 29 sit at seven uncalled positions with 1–2 cells each — all below `min_cells = 3`.
+So the missing repertoire visible here is seven micro-loci plus the blind spot, not a hidden
+population. Step 4's posteriors are not needed for this.
+
+**Step 4 (posteriors over K+1 hypotheses) is not built, and here is the number that decided it.**
+Across the whole dataset **25 molecules match more than one called site exactly**, all with clips of
+1–2 bases; above 2 bp every matching molecule matches exactly one site. The mouse-restricted prior —
+the plan's "largest free gain", cutting K from 15 to the 2–7 sites in the cell's own mouse — resolves
+**8** of those 25. So the posterior framework would operate on eight molecules at lengths the plan
+itself says not to chase. Its remaining value is supplying weights and a detection covariate to
+Phase 6, which does not exist yet; build it when that consumer does, and keep the plan's EM warning
+verbatim when you do (priors from clone sizes and clone sizes from posteriors is a loop whose fixed
+point pulls ambiguous mass onto the largest clone — the inflation already visible in all seven
+cross-mouse landings sitting on IS01 and IS02).
+
 Three checks the pipeline never used as input, so they are genuinely independent:
 
 1. **Integration-site preference — underpowered, do not cite as a validation.** 6 of 8 usable sites

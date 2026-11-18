@@ -311,6 +311,19 @@ if (stage == "extract") {
       stop("clip table does not reproduce the pipeline output; see the gate table above")
     }
     message("=== clip table gate: PASS")
+
+    # Per-cell detection and detection-corrected clone size. Uses the clip table's molecule counts,
+    # which is the only place they are both de-duplicated across channels and free of the floor.
+    det <- detection_model(cell_table, clip_tbl)
+    write_csv_checked(det, file.path(out, "detection_model.csv"))
+    if (nrow(det)) {
+      message("=== detection model (NA where the truncated mean is too close to 1 to fit)")
+      print(as.data.frame(det |> dplyr::transmute(
+        site_id, cells, mean_molecules = round(mean_molecules, 2), lambda = round(lambda, 3),
+        detection = round(detection, 3), clone_size, clone_lo, clone_hi,
+        obs_1, exp_1 = round(exp_1), obs_2, exp_2 = round(exp_2),
+        var_mean = round(var_mean_ratio, 2))), row.names = FALSE)
+    }
   }
 
   # The counts in the site table must come from the same place the cell table does.

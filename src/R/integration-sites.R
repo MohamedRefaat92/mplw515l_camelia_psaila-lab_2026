@@ -1352,6 +1352,102 @@ clip_table_gate <- function(matches, site_table, cell_table, gen_site_hits = NUL
     dplyr::mutate(agrees = pipeline == clip_table)
 }
 
+#' Junction molecules per cell, counted once each, with no floor.
+#'
+#' The quantity the detection model needs, and neither of the obvious ways of getting it is right.
+#' Summing umis_three + umis_genomic over a cell's rows in the cell table double-counts the 83
+#' molecules that appear in both channels, and it also drops every molecule too short to assign - but
+#' a clip too short to name a site still proves a junction molecule was captured in that cell, which
+#' is exactly what lambda is estimated from. Counting distinct UMIs in the clip table fixes both at
+#' once, and the two errors happen to point in opposite directions: the mean goes from 1.271 to
+#' 1.236, so the inflated one was closer to the truth by accident.
+#'
+#' `unattributed` is the molecules that match no called site. They are real captures at an uncalled
+#' or unplaceable position, and they belong in the capture depth even though they name no clone.
+cell_junction_molecules <- function(clip_tbl) {
+  clip_tbl |>
+    dplyr::group_by(tube, barcode) |>
+    dplyr::summarise(molecules = dplyr::n_distinct(umi),
+                     unattributed = dplyr::n_distinct(umi[n_match == 0L]),
+                     .groups = "drop")
+}
+
+#' Per-cell detection rate and detection-corrected clone size, by zero-truncated Poisson.
+#'
+#' The estimate the clone-size section needs. If the cells of a clone each yield Poisson(lambda)
+#' DETECTED junction molecules, the cells with zero are exactly the ones missing from the table, and
+#' the mean of the zero-truncated distribution, lambda / (1 - exp(-lambda)), identifies lambda from
+#' the cells in hand. Detection is then 1 - exp(-lambda) and the clone size detected / detection. No
+#' second sample is needed, which is what makes this usable where the channel overlap is not: the two
+#' channels are a partition of one capture rather than two draws, so n1*n2/m has no referent.
+#'
+#' Fitted PER SITE, because a global lambda would push the measured seven-fold span in per-clone
+#' vector expression into the clone sizes as bias.
+#'
+#' It is sharp only where the truncated mean sits clearly above 1. At exactly 1.00 the fit is
+#' degenerate - lambda -> 0, clone size -> infinity - so sites at or below `min_mean` return NA
+#' rather than a number. That is the estimator declining, not a gap to be filled: for a 2-cell site
+#' the correction would be meaningless against its own uncertainty anyway. The bootstrap interval is
+#' over cells and is wide by construction at these depths; report it, because a point estimate here
+#' invites more confidence than the data supports.
+#'
+#' `obs_1`/`exp_1` and friends are the fit check: if the observed molecules-per-cell distribution is
+#' overdispersed relative to the fitted Poisson, the Poisson understates the zero class and the clone
+#' size is an underestimate. It fits well here - IS02 gives 240 cells at one molecule against 232
+#' expected and 76 at two against 85, IS01 273 against 269 and 37 against 43 - so there is no
+#' negative-binomial refit to report. That was not expected: the overdispersion the plan anticipated
+#' was inferred from 150 both-channel cells against a predicted 110, and that excess turned out to be
+#' the same molecule counted in two channels.
+#'
+#' Read the fit from obs against exp and NOT from var_mean_ratio. A zero-truncated Poisson with small
+#' lambda is underdispersed by construction - the ratio is 0.41 at IS02 and 0.17 at IS01 - so
+#' comparing it to 1 as if these were untruncated counts suggests a problem that is not there. The
+#' column is kept because it is cheap and because its value is worth knowing; it is not the test.
+detection_model <- function(cell_table, clip_tbl, opt = IS_DEFAULTS, min_mean = 1.10,
+                            boots = 400L, seed = 20261118L) {
+  if (nrow(cell_table) == 0L || nrow(clip_tbl) == 0L) return(dplyr::tibble())
+  per <- cell_junction_molecules(clip_tbl)
+  d   <- cell_table |>
+    dplyr::distinct(site_id, tube, barcode) |>
+    dplyr::left_join(per, by = c("tube", "barcode")) |>
+    dplyr::filter(!is.na(molecules))
+
+  ztp <- function(k) {
+    if (length(k) < 5L || mean(k) <= min_mean) return(NA_real_)
+    tryCatch(stats::uniroot(function(l) l / (1 - exp(-l)) - mean(k), c(1e-6, 50))$root,
+             error = function(e) NA_real_)
+  }
+  set.seed(seed)
+  d |>
+    dplyr::group_by(site_id) |>
+    dplyr::group_modify(function(x, key) {
+      k <- x$molecules
+      lam <- ztp(k)
+      bs <- if (is.na(lam)) rep(NA_real_, boots) else
+        vapply(seq_len(boots), function(i) ztp(sample(k, replace = TRUE)), numeric(1))
+      det <- 1 - exp(-lam)
+      # observed against the fitted zero-truncated Poisson, for k = 1, 2, 3+
+      ex <- if (is.na(lam)) rep(NA_real_, 3) else {
+        p <- stats::dpois(1:2, lam) / (1 - exp(-lam))
+        c(p, 1 - sum(p)) * length(k)
+      }
+      dplyr::tibble(
+        cells = length(k), mean_molecules = mean(k), unattributed = sum(x$unattributed),
+        lambda = lam, detection = det, clone_size = round(length(k) / det),
+        lambda_lo = stats::quantile(bs, 0.025, na.rm = TRUE, names = FALSE),
+        lambda_hi = stats::quantile(bs, 0.975, na.rm = TRUE, names = FALSE),
+        clone_lo = round(length(k) / (1 - exp(-stats::quantile(bs, 0.975, na.rm = TRUE,
+                                                               names = FALSE)))),
+        clone_hi = round(length(k) / (1 - exp(-stats::quantile(bs, 0.025, na.rm = TRUE,
+                                                               names = FALSE)))),
+        obs_1 = sum(k == 1L), exp_1 = ex[1], obs_2 = sum(k == 2L), exp_2 = ex[2],
+        obs_3plus = sum(k >= 3L), exp_3plus = ex[3],
+        var_mean_ratio = if (length(k) > 1L) stats::var(k) / mean(k) else NA_real_)
+    }) |>
+    dplyr::ungroup() |>
+    dplyr::arrange(dplyr::desc(cells))
+}
+
 #' Per-site channel overlap: the detection rate it does support, and the clone size it does not.
 #'
 #' The tempting argument: the two channels read the same junctions through different reads, so a cell
