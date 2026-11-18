@@ -1324,6 +1324,37 @@ for (cmp in levels(factor(embedding$panel))) {
 
 :::
 
+The same clones, one tab each, with HSC and MNC side by side: where a clone sits in one
+compartment against where it sits in the other.
+
+::: {.panel-tabset}
+
+```{r umap-facet-by-clone, fig.height=5, fig.width=10, results="asis"}
+# Each compartment has its own embedding, so scales are free; the grey layer carries `panel`, so
+# each side gets its own compartment's cells. drop = FALSE keeps a compartment with no cells of the
+# clone as an empty map, which is itself the result.
+clone_ids <- levels(factor(labelled$site_id))
+bg_cells  <- dplyr::select(dplyr::filter(embedding, pass_cell), panel, UMAP_1, UMAP_2)
+for (clone in clone_ids) {
+  cells <- dplyr::filter(labelled, pass_cell, site_id == clone)
+  n_by  <- table(factor(cells$panel, levels = levels(factor(bg_cells$panel))))
+  cat("### ", clone, "\n\n", sep = "")
+  print(
+    ggplot(cells, aes(UMAP_1, UMAP_2)) +
+      geom_point(data = bg_cells, colour = "grey90", size = 0.15, stroke = 0) +
+      geom_point(colour = "firebrick", size = 1.3) +
+      facet_wrap(~ panel, nrow = 1, scales = "free", drop = FALSE,
+                 labeller = labeller(panel = function(p) sprintf("%s (%d cells)", p, n_by[p]))) +
+      labs(title = paste0("Clone ", clone, ": HSC and MNC"), x = NULL, y = NULL) +
+      theme(axis.text = element_blank(), axis.ticks = element_blank(),
+            panel.grid = element_blank(), aspect.ratio = 1)
+  )
+  cat("\n\n")
+}
+```
+
+:::
+
 A clone confined to one region of the embedding would suggest its cells share a state; one scattered
 across the map suggests the opposite. With these numbers, treat any apparent clustering cautiously —
 a handful of cells will look clustered by chance on a map of tens of thousands.
