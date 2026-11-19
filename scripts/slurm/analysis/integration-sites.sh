@@ -107,9 +107,16 @@ echo "=== 5/5 assign clips, cell table, TSD, decoy error rate ==="
 # short sequences is near-meaningless and was already ignored, -a was needed to stop its ranking
 # discarding true hits, and -T 12 silently voided the advertised 8 bp floor (placement rate 0.00 at
 # 8, 9, 10 and 11 bp, 169 reads written and dropped). assign_clips_exact() does the positional test
-# directly: exhaustive, deterministic, seconds, and the floor is now whatever min_assign says.
-# min_assign is 10, set by the decoy flanks: zero decoy hits at 10 bp and above, two below it.
-$rscript scripts/R/call-integration-sites.R assign "$out" "$CR_REF/fasta/genome.fa"
+# directly: exhaustive, deterministic, seconds, and the floor is now whatever assign_floor says.
+#
+# That floor is 6 bp with exact matching required below 15, held as one object in IS_DEFAULTS. The
+# note that used to sit here -- "min_assign is 10, zero decoy hits at 10 bp and above, two below it"
+# -- was the 100-decoy result, and a zero there carried p = 0.19: chance alone predicts only 1.67
+# hits across the 35 molecules at 6 bp, so it was an absence of evidence rather than a clean floor.
+# At 1,000 decoy flanks the rate is measured: 15 observed against 13.5 predicted at 6 bp.
+#
+# The gtf is passed so the stage can also say what each orphan 5' junction is (orphan_evidence.csv).
+$rscript scripts/R/call-integration-sites.R assign "$out" "$CR_REF/fasta/genome.fa" "$gtf"
 
 echo "=== done ==="
 ls -l "$out"/*.csv

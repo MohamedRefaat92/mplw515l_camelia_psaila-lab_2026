@@ -605,25 +605,103 @@ Read this before debugging anything. Several of these cost hours.
 
 ## 9. Open questions
 
-1. **MNC labelled barcodes survive QC at 58% vs 68% overall**, opposite to HSC. Unexplained.
-2. **IS05 is HSC-only with 44 cells, and its cells look spatially clustered** in the HSC UMAP. Not
-   tested for significance; 20 points on a 50,000-cell map can cluster by chance.
-3. **The `≥3 cells and ≥3 UMIs` floor is arbitrary.** A TSD-verified site arguably needs no floor at
-   all: IS09 passes on one 5' read, and chrX:100,691,117 passes while sitting below the floor in
-   both channels. The waterfall is printed so it can be revisited.
-4. **Clonality proper** — site counts per compartment as a diversity measure is the intended
+Figures here are read from the CSV named beside them. The four orphan 5' junctions were open
+questions until 2026-11-19; `orphan_evidence.csv` now carries the evidence and a verdict per
+junction, so they are listed under *Closed* with what each turned out to be.
+
+1. **IS05 is HSC-only with 53 cells, and its cells look spatially clustered** in the HSC UMAP. The
+   sub-clone test added for T5 (UMAP position plus within-cell molecule ratio) does not close this;
+   53 points on a 50,000-cell map can cluster by chance.
+2. **The floor's value is now measured; what remains open is one site.** See *Closed* below for the
+   grid — the short version is that `min_umis` is inert, `min_cells` does all the work, and the only
+   live decision is `min_cells` 3 against 2, worth exactly one cluster. That cluster
+   (chr11:69,817,658) looks like one integration observed repeatedly rather than a clone, so the
+   recommendation is to leave the floor alone; it is listed as open only because nobody has ruled on
+   it. chrX:100,691,117 is the separate and stronger case, also below.
+3. **Clonality proper** — site counts per compartment as a diversity measure is the intended
    destination and has not been attempted. Assumption 3 is the obstacle: clone sizes are samples.
-5. **chr19:38,932,385** — 25 reads, 1.4 kb from IS03, not explained by anchor absorption. Test
-   whether those clips share barcodes with IS03's (same clone, same provirus) and whether the host
-   side ends at a splice donor (a spliced vector-host fusion).
-6. **chrX:100,691,117 and chr14:62,948,717** — 5' junctions with no called 3' site. Real sites the
-   3' channel missed, or artefacts?
+   Note also that clone size is estimable for only **6 of 15** sites; the rest sit at a truncated
+   mean ≤ 1.09 where the zero-truncated Poisson is degenerate and `detection_model()` returns NA.
 
 ### Closed
 
+- **`chr19:38,932,385` is not an integration site — it is a spliced host-vector fusion.** Four
+  predictions, all of which held. The junction sits on the LAST BASE of a *Hells* exon
+  (`exon_end_dist = 0`), not near it. The intron after that base begins **GT**. The bases beyond the
+  junction are the same four in every read that has any — **ATTC** — and they are not the next
+  *Hells* exon, which begins ATGCTT. The vector contig contains exactly one `AG|ATTC`, an acceptor
+  at **position 875**. And IS03, at chr19:38,933,742, lies **inside that very intron**
+  (38,932,386–38,933,834), 92 bp before its acceptor. The independent instrument agrees: 13 of 13
+  non-multiplet cells are replicate **B0303**, IS03's own mouse, *p* = 3.6 × 10⁻⁶. So these reads
+  are a transcript from a provirus already called, not a second integration.
+  *A side result worth more than the question:* only **1** of those 14 cells is assigned to IS03, so
+  the splice junction detects cells IS03's own channels missed — independent evidence that IS03's
+  per-cell detection is low, consistent with its clone size being inestimable.
+  `chr19:38,932,221` (1 read, 1 cell) carries the same ATTC and is the same fusion, sub-threshold.
+- **`chrX:100,691,117` is the floor's one real casualty, and it is NOT settled.** Pooled across
+  channels it is **3 cells and 3 UMIs — it meets the `≥3 and ≥3` floor** — with a 3' partner at
+  100,691,113, signed delta **+4** (the TSD) at MAPQ 60 on both sides, found by a single-position
+  test rather than a scan. It is not called because the floor is applied *within* a discovery
+  channel and the 5' channel never contributes to calling. That is the same situation as IS14 and
+  IS15, which *are* called as `pooled_only` and which have no 5' junction at all. **But its
+  clonality is not established:** all 3 cells are B0301 singlets, spanning HSC and MNC, and with
+  B0301 at 46% of called cells in those tubes that gives *p* = 0.10. Three cells cannot establish a
+  clone. `orphan_evidence.csv` records the verdict as "candidate site, clonality untested", and
+  promoting it to IS16 is a human decision the pipeline deliberately does not make.
+- **`chr14:62,948,717` is unsupported.** Four reads, intergenic, no soft clip at all (32M and 26M,
+  both ending exactly at the junction), no 3' partner, and its 3 non-multiplet cells split across
+  mice (2 of 3 in B0304, *p* = 0.49) — which a single clone cannot do.
+- **The `≥3 cells and ≥3 UMIs` floor is really a one-part floor, and the second part is inert.**
+  `cluster_support.csv` is every discovery cluster with its support and the floor NOT applied;
+  `site_floor_curve.csv` is the site count over a 6×6 grid. Sites admitted, rows `min_cells`,
+  columns `min_umis`:
+
+  | | 1 | 2 | 3 | 4 | 5 | 6 |
+  |---|---|---|---|---|---|---|
+  | **1** | 28 | 21 | 16 | 14 | 14 | 14 |
+  | **2** | 20 | 20 | 16 | 14 | 14 | 14 |
+  | **3** | 15 | 15 | **15** | 13 | 13 | 13 |
+  | **4** | 13 | 13 | 13 | 13 | 13 | 13 |
+
+  Three things fall straight out. **`min_umis = 3` rejects nothing** that `min_cells = 3` has not
+  already rejected — 1, 2 and 3 all give 15 — so the advertised two-part floor is one part plus
+  decoration. **`min_cells` is the load-bearing axis**, running 28 / 20 / 15 / 13 / 13 / 13 as it
+  goes 1 to 6, and the count is still falling at 3 and flat from 4. And **the floor costs almost no
+  cells**: coverage goes 1,040 → 1,022 from (1,1) to (3,3), so the threshold is not about how many
+  cells get labelled but about how many thinly-supported positions get a name.
+
+  That reduces the whole question to `min_cells` 3 against 2, which is worth exactly one cluster:
+  **chr11:69,817,658** — 11 reads, **10 UMIs**, 2 cells, 1 tube, both channels at MAPQ 255. More
+  molecular evidence than most called sites, and rejected. But 8 of those 10 UMIs sit in a single
+  cell, a stroma-panel barcode, so it is one integration observed repeatedly rather than a clone -
+  and UMIs within one cell are not independent evidence that an integration is present in the
+  population, which is the job `min_cells` exists to do. **Leave the floor at 3.** The case for
+  simplifying it to `min_cells` alone is cosmetic and would change no result.
+- **The MNC/HSC QC asymmetry is a depth bias meeting two different QC windows.** Labelled barcodes
+  survive at **81.3% in HSC and 58.8% in MNC**, while overall survival is near-identical (69.2% and
+  67.6%) — enriched among survivors in one compartment, depleted in the other, which cannot be a
+  property of the clones. It is a property of what it takes to *detect* one: a junction read needs
+  depth, so labelled cells are systematically deeper (HSC median 4,725 genes against 3,728; MNC
+  3,494 against 2,104). Per-criterion failure rates, labelled against unlabelled, say the rest:
+
+  | criterion | HSC labelled / all | MNC labelled / all |
+  |---|---|---|
+  | below `nFeature_min` | **3.4% / 23.5%** | 1.0% / 10.2% |
+  | above `nFeature_max` | 10.8% / 3.0% | 9.1% / 3.0% |
+  | outside the ribosomal window | 1.3% / 7.6% | **18.3% / 10.6%** |
+  | multiplet | 7.7% / 6.5% | 17.9% / 14.5% |
+
+  HSC sets `nFeature_min` at 2,500, so nearly a quarter of all cells fail it and labelled cells
+  almost never do: that one term is worth ~20 points and swamps everything else. MNC sets it at
+  1,200, where the same advantage is worth only ~9, while labelled cells pay ~8 on the ribosomal
+  window (1–20%), ~6 on the upper gene bound and ~3 on multiplets. The sign of the net flips. So
+  **nothing is wrong with the clones or the labelling** — the two compartments' QC windows simply
+  interact differently with a depth-biased subset. Whether MNC's ribosomal window should be revisited
+  is a QC question, not an integration-site one.
 - **ψ artefact origin** — packaged vector genomic RNA (§6). Priming, 2-LTR circles and plasmid all
   refuted; the backbone scan was decisive.
-- **IS07 / JH584304.1** — artefact, now gated out by flank complexity (§7).
+- **IS07 / JH584304.1** — called, but excluded from quantification: its flank fails the complexity
+  gate (`flank_gated`), so it is one of the three sites outside the defensible 12 (§7).
 - **Multi-copy founders** — no. Every informative pair of sites co-occurs *below* chance (IS01+IS02:
   6 observed vs 26 expected in Rx_4; 2 vs 24 in Rx_6), which is the signature of disjoint clones
   rather than independent integrations. The ~2% of cells at more than one site read as doublets.

@@ -11,7 +11,8 @@
 #   genomic <out> <bam_dir> <tube>...            the host-mapped channel, one streaming pass per BAM
 #   genomic-decoy <out> <bam_dir> [chrom] [fa]   its error bound: the same scan, terminus shuffled
 #   sites   <out> <genes.gtf.gz> <genome.fa>     call the sites, write the mini-reference
-#   assign  <out> <genome.fa>                    cell assignments, TSD check, summary
+#   assign  <out> <genome.fa> [genes.gtf.gz]     cell assignments, TSD check, summary, and - given
+#                                                the gtf - what each orphan 5' junction is
 #
 # Splitting sites from assign is not bookkeeping: the mini-reference is built from the called sites,
 # so the clips can only be assigned once those exist. Discovery searches the genome; assignment
@@ -214,6 +215,11 @@ if (stage == "extract") {
   }
   if (!"channel" %in% names(discovery)) discovery$channel <- "three_prime"
 
+  # What the floor admits and what it turns away, written BEFORE the floor is applied - otherwise the
+  # outputs cannot be used to question it, since call_sites() returns only what passed.
+  write_csv_checked(cluster_support(discovery), file.path(out, "cluster_support.csv"))
+  write_csv_checked(site_floor_curve(discovery), file.path(out, "site_floor_curve.csv"))
+
   # metadata/, not output/: output/ is gitignored, and a label registry that does not survive a
   # clean checkout cannot pin anything. See label_sites().
   sites      <- label_sites(dplyr::mutate(call_sites(discovery), tier = "discovery"),
@@ -414,6 +420,9 @@ if (stage == "extract") {
 
   five      <- read_bwa_hits(file.path(work, "five_prime.sam"), channel = "five_prime")
   genome_fa <- if (length(args) >= 3L) args[3] else NULL
+  # Optional 4th argument: the gtf, for the orphan-junction verdicts below. Optional rather than
+  # required so an existing invocation of this stage keeps working - it only costs those verdicts.
+  gtf_path  <- if (length(args) >= 4L) args[4] else NA_character_
 
   tsd <- tsd_check(site_table, five, genome_fa = genome_fa)
   write_csv_checked(tsd, file.path(out, "tsd_check.csv"))
@@ -438,6 +447,32 @@ if (stage == "extract") {
     message("=== orphan 5' junctions tested: ", attr(resc, "candidates"),
             "   rescued at delta = 4: ", attr(resc, "rescued"))
     print(as.data.frame(resc), row.names = FALSE)
+  }
+
+  # What each orphan actually IS. "No 3' partner" is the absence of a finding rather than one, and
+  # these turned out to be answerable from evidence already on disk: one is a spliced host-vector
+  # fusion from a provirus already called, one reaches the cell and UMI floor once the two channels
+  # are pooled, and the rest are too thin to separate. The gtf and the hashtag calls are optional, so
+  # the stage still runs where they are absent - with the clonality column left NA and said so.
+  if (!is.na(gtf_path) && file.exists(gtf_path) && nrow(resc)) {
+    ht_path <- file.path(work, "hashtag_calls.csv.gz")
+    cb_path <- file.path(work, "called_barcodes.csv.gz")
+    ht <- if (file.exists(ht_path)) {
+      dplyr::mutate(readr::read_csv(ht_path, show_col_types = FALSE),
+                    barcode = sub("^.*_([ACGT]+-1)$", "\\1", cell))
+    } else NULL
+    cb <- if (file.exists(cb_path)) readr::read_csv(cb_path, show_col_types = FALSE) else NULL
+    if (is.null(ht)) {
+      message("!!! no hashtag calls: orphan clonality left untested ",
+              "(run scripts/R/export-hashtag-calls.R)")
+    }
+    oev <- orphan_junction_evidence(five, discovery, site_table, gtf_path, genome_fa,
+                                    hashtag_calls = ht, called_barcodes = cb)
+    write_csv_checked(oev, file.path(out, "orphan_evidence.csv"))
+    message("=== orphan verdicts")
+    print(as.data.frame(oev[, c("chrom", "pos_5p", "pooled_cells", "pooled_umis", "meets_floor",
+                                "exon_end_dist", "donor", "clip_beyond", "vector_acceptor",
+                                "replicate", "replicate_p", "verdict")]), row.names = FALSE)
   }
 
   # Per-base pile-up either side of each junction, for the report's browser-style figure.

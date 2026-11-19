@@ -274,7 +274,10 @@ OS release, so on a Rocky 9 node it finds no library and the first `library()` c
 | `site_calling_summary.csv` | 7 | what each tier contributed |
 | `decoy_error_rate.csv` | 5 | clip-length band × the decoy hit rate, and ε scaled to the real flanks |
 | `tsd_check.csv` | 8 | 5′ cluster: signed Δ, the duplicated span, whether reads contain it, strand agreement |
-| `orphan_rescue.csv` | 4 | orphan 5′ junction tested at the one position its partner must occupy, with the denominator |
+| `orphan_rescue.csv` | 4 | orphan 5′ junction tested at the one position its partner must occupy, with the denominator — now as columns, since attributes do not survive a `write_csv` |
+| `orphan_evidence.csv` | 4 | the same junctions with what decides each one: pooled cell and UMI counts, the nearest exon boundary and its donor dinucleotide, the bases beyond the junction, the vector acceptor they match, hashtag confinement with a binomial *p*, and a `verdict` derived from those columns |
+| `cluster_support.csv` | ~30 | **every discovery cluster with the floor NOT applied**: cells, UMIs, tubes, channels, MAPQ. Without it the floor cannot be questioned from the outputs, because `call_sites()` returns only what passed |
+| `site_floor_curve.csv` | 36 | sites admitted across a 6×6 grid of cell and UMI floors, with the current setting flagged. **The measurement that justifies `min_cells` — and shows `min_umis` to be inert at it** |
 | `junction_coverage.csv` | — | site × channel × offset: the pile-up figure |
 | `genomic_decoy_rate.csv` | 8 | tube: real against decoy hits for the genome-mapped channel, from the scrambled-terminus run. Region-tagged when restricted to one chromosome, so a narrow probe cannot overwrite a genome-wide measurement |
 | `clip_floor_curve.csv` | ~50 | clip length: what a clip of that length matches, real sites and decoy flanks, under both the exact and budgeted rules. **The measurement that sets `min_assign` and `exact_below`** |
@@ -867,6 +870,96 @@ ggplot(cells_long, aes(reorder(label, cells, sum), cells, fill = tube)) +
   labs(x = NULL, y = "cells carrying the junction", fill = "tube",
        title = "Integration sites by the number of cells supporting them")
 ```
+
+### What the floor admits, and what it turns away
+
+The floor is `≥3 cells and ≥3 UMIs`, and calling it arbitrary was fair for as long as the outputs
+only contained what passed it. `cluster_support.csv` is now every discovery cluster with the floor
+*not* applied, and `site_floor_curve.csv` is the site count across a grid of thresholds, so the
+value can be argued about from rows.
+
+```{r floor-grid, fig.height=3.6, fig.width=7}
+fgrid <- readr::read_csv(file.path(sites_dir, "site_floor_curve.csv"), show_col_types = FALSE)
+csup  <- readr::read_csv(file.path(sites_dir, "cluster_support.csv"), show_col_types = FALSE)
+
+# Sequential, one hue light to dark: this is a magnitude, and the number itself is on every tile, so
+# the fill is an aid to scanning rather than the encoding. The current floor is outlined, not
+# recoloured, so it reads as "you are here" without competing with the magnitude.
+ggplot(fgrid, aes(factor(min_umis), factor(min_cells))) +
+  geom_tile(aes(fill = n_sites), colour = "white", linewidth = 1) +
+  geom_tile(data = dplyr::filter(fgrid, is_current),
+            fill = NA, colour = "firebrick", linewidth = 1.1) +
+  geom_text(aes(label = n_sites), size = 3.2, colour = "grey15") +
+  scale_fill_gradient(low = "#eef3f8", high = "#9ecae1", guide = "none") +
+  labs(x = "minimum UMIs", y = "minimum cells",
+       title = "Sites called, by floor",
+       subtitle = "red outline = the floor in use; min_umis changes nothing at min_cells = 3") +
+  theme(panel.grid = element_blank(), aspect.ratio = 1)
+```
+
+Three things read off it. **The second half of the floor is inert**: at `min_cells = 3` the site
+count is the same for a UMI floor of 1, 2 or 3, so `min_umis = 3` rejects nothing `min_cells` has
+not already rejected. **`min_cells` is the load-bearing axis**, and the count is still falling at 3
+and flat from 4 on. And the floor **barely touches cell coverage** — `r scales::comma(max(fgrid$cells_covered))`
+cells at the most permissive setting against `r scales::comma(fgrid$cells_covered[fgrid$is_current])`
+at the one in use — so this threshold decides how many thinly-supported positions get a *name*, not
+how many cells get labelled.
+
+That leaves one real decision, `min_cells` 3 against 2, worth exactly one cluster:
+
+```{r floor-boundary}
+csup %>%
+  dplyr::filter(!called, cells >= 2 | umis >= 3) %>%
+  dplyr::arrange(dplyr::desc(umis), dplyr::desc(cells)) %>%
+  dplyr::select(chrom, pos, reads, cells, umis, tubes, channels, max_mapq) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10))
+```
+
+`chr11:69,817,658` carries more molecular evidence than most called sites — 10 UMIs, both channels,
+MAPQ 255 — and is rejected for having only 2 cells. Eight of those ten UMIs are in one barcode, a
+stroma-panel cell, so it is a single integration observed repeatedly rather than a clone, and UMIs
+within one cell are not independent evidence that an integration is present in the population. That
+is precisely the job `min_cells` does, so the floor stays at 3.
+
+### What each orphan 5′ junction turned out to be
+
+A 5′ junction with no called 3′ partner is not a finding, and "real site or artefact?" stood open on
+four of them. `orphan_evidence.csv` decides each from evidence already on disk — the exon
+annotation, the bases beyond the junction, the vector's acceptors, and hashtag identity as an
+instrument independent of every junction.
+
+```{r orphan-evidence}
+readr::read_csv(file.path(sites_dir, "orphan_evidence.csv"), show_col_types = FALSE) %>%
+  dplyr::mutate(replicate_p = signif(replicate_p, 2)) %>%
+  dplyr::select(chrom, pos_5p, pooled_cells, pooled_umis, meets_floor, delta,
+                exon_gene, exon_end_dist, donor, clip_beyond, vector_acceptor,
+                site_in_same_gene, replicate, replicate_p, verdict) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", scrollX = TRUE))
+```
+
+**`chr19:38,932,385` is not an integration site.** Every prediction of the splicing hypothesis holds:
+the junction is on a *Hells* exon's **last base** rather than near it, the intron after it opens
+`GT`, the bases beyond the junction are the same four in every read that has any — `ATTC`, which is
+not the next *Hells* exon — and the vector contig holds exactly one `AG|ATTC`, an acceptor at
+position 875. IS03 sits **inside that intron**. Hashtag identity settles it: 13 of 13 non-multiplet
+cells are IS03's own mouse, *p* = 3.6 × 10⁻⁶. These reads are a fusion transcript from a provirus
+already called. Only one of those cells is assigned to IS03, so this junction sees cells IS03's own
+channels missed — independent evidence that its per-cell detection is low, which is consistent with
+its clone size being inestimable.
+
+**`chrX:100,691,117` is the floor's one real casualty, and it is not settled.** Pooled across
+channels it is 3 cells and 3 UMIs, so it *meets* the floor, with a 3′ partner at 100,691,113 at
+signed Δ = +4 — the target-site duplication — at MAPQ 60 on both sides, found by testing the single
+position the partner must occupy rather than by scanning. It is uncalled only because the floor is
+applied *within* a discovery channel and the 5′ channel never contributes to calling: the same
+situation as IS14 and IS15, which are called, and which have no 5′ junction at all. But three cells
+cannot establish a clone — all three are B0301 singlets, and against B0301's 46% share of called
+cells in those tubes that is *p* = 0.10. The verdict column says "clonality untested" for that
+reason, and promoting it to a sixteenth site is left as a decision rather than taken.
+
+**`chr14:62,948,717` is unsupported** — four reads, intergenic, no soft clip at all, no 3′ partner,
+and its cells split across mice, which one clone cannot do. **`chr19:38,932,221`** carries the same
+`ATTC` and is the same fusion, below threshold.
 
 ## What the gene context tells us
 

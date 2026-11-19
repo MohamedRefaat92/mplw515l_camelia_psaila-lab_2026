@@ -54,12 +54,18 @@ IS_DEFAULTS <- list(
   #
   # Set to 6 by the decoy measurement, one base at a time, and only in company with exact_below.
   # The clip table carries every clip against every flank at every mismatch count with no floor, so
-  # the 100 decoy flanks answer this directly: a decoy has no junction, so a decoy match at a given
-  # length IS the chance rate. Under exact matching they are clean from 6 bp up - 28 molecules at
-  # 6 bp, all matching exactly one real site, none matching any of the 100 decoys - and dirty below:
-  # 1 of 11 molecules hits a decoy at 5 bp, 10 of 17 at 4 bp, and at 1-2 bp a clip matches most of
-  # the decoy set. Worth 73 assignments over 47 cells that had none, 4% on 1186, with no wild-type
-  # tube assignment added.
+  # the decoy flanks answer this directly: a decoy has no junction, so a decoy match at a given
+  # length IS the chance rate.
+  #
+  # AT 1,000 DECOY FLANKS, because at 100 the test had no power and read as if it did. "Clean from
+  # 6 bp up - zero decoy hits" was the 100-flank result, and chance alone predicts only 1.67 hits
+  # across the 35 molecules at 6 bp, so that zero carried p = 0.19. It was an absence of evidence
+  # described as a clean floor. At 1,000 flanks the rate exists and agrees with theory: 15 observed
+  # against 13.5 predicted at 6 bp, obs/exp = 1.11, which validates the matcher against the analytic
+  # 4^-L rate rather than merely failing to contradict it.
+  #
+  # What the floor costs is reported as an absolute count, not a percentage: 0.31 expected spurious
+  # assignments across the 931 accepted molecules, against 1,222 real, 0.02 per site.
   #
   # The history, because this number has been wrong twice in opposite directions. 8 came from the
   # wild-type tubes being empty, which bounds cross-tube hopping rather than within-tube chance
@@ -509,6 +515,7 @@ read_bwa_hits <- function(sam, opt = IS_DEFAULTS, channel = c("three_prime", "fi
   lines <- readLines(sam, warn = FALSE)
   lines <- lines[!startsWith(lines, "@")]
   if (length(lines) == 0L) return(empty_hit_table())
+  assert_sam_matches_fasta(sam)
 
   f     <- strsplit(lines, "\t", fixed = TRUE)
   field <- function(i) vapply(f, function(x) if (length(x) >= i) x[[i]] else NA_character_, "")
@@ -554,8 +561,42 @@ read_bwa_hits <- function(sam, opt = IS_DEFAULTS, channel = c("three_prime", "fi
     clip_len = nchar(field(10)[keep]),
     # The clip's own bases. Carried so tsd_check() can test the duplicated span against OBSERVED
     # sequence rather than only against the reference, which cannot falsify a coordinate convention.
-    seq      = field(10)[keep]
+    seq      = field(10)[keep],
+    # Carried for the same reason: the CIGAR is what says which part of the clip did NOT align, and
+    # the bases beyond the junction are the evidence that separates a spliced host-vector fusion
+    # from an integration site. Without it the question cannot be asked from the saved tables.
+    cigar    = field(6)[keep]
   )
+}
+
+#' Stop if a SAM does not contain the reads of the FASTA beside it.
+#'
+#' bwa runs between stages, outside R, so nothing in the pipeline guarantees that a .sam was built
+#' from the .fa now sitting next to it. Re-running `extract` without re-running bwa leaves a SAM from
+#' the previous clip set, and every stage downstream then reports confident numbers for the wrong
+#' reads. This is not hypothetical: work/ held an assign.sam two days older than its assign.fa, with
+#' 1,719 of 1,730 read names absent from it.
+#'
+#' Compares read NAMES, not timestamps. An older SAM whose names match its FASTA is correct - bwa was
+#' simply not re-run because its input had not changed, which is the normal case and must not warn.
+#' A SAM may legitimately hold MORE names than the FASTA would suggest rows (supplementary
+#' alignments), so the test is one-directional: every FASTA read must appear.
+assert_sam_matches_fasta <- function(sam, fa = sub("\\.sam$", ".fa", sam)) {
+  if (!file.exists(fa)) return(invisible(TRUE))
+  fa_names <- sub("^>", "", grep("^>", readLines(fa, warn = FALSE), value = TRUE))
+  sam_names <- unique(vapply(strsplit(grep("^@", readLines(sam, warn = FALSE), value = TRUE,
+                                           invert = TRUE), "\t", fixed = TRUE),
+                             function(x) x[[1]], ""))
+  missing <- setdiff(fa_names, sam_names)
+  if (length(missing)) {
+    stop(sprintf(paste0("%s is stale: %d of %d reads in %s are not in it (e.g. %s).\n",
+                        "  bwa has not been re-run since those clips were written. Re-run the ",
+                        "align step of scripts/slurm/analysis/integration-sites.sh before trusting ",
+                        "anything downstream."),
+                 basename(sam), length(missing), length(fa_names), basename(fa), missing[[1]]),
+         call. = FALSE)
+  }
+  invisible(TRUE)
 }
 
 #' Bases of the reference an alignment spans, from its CIGAR.
@@ -570,7 +611,7 @@ ref_span <- function(cigar) {
 empty_hit_table <- function() {
   dplyr::tibble(chrom = character(), pos = integer(), strand = character(), mapq = integer(),
                 tube = character(), barcode = character(), umi = character(), clip_len = integer(),
-                seq = character())
+                seq = character(), cigar = character())
 }
 
 #' Group hits into sites, adding a site_id column.
@@ -593,6 +634,58 @@ call_sites <- function(discovery_hits, opt = IS_DEFAULTS) {
     dplyr::filter(dplyr::n_distinct(paste(tube, barcode)) >= opt$min_cells,
                   dplyr::n_distinct(paste(tube, barcode, umi)) >= opt$min_umis) |>
     dplyr::ungroup()
+}
+
+#' Every discovery cluster with the support behind it, called or not.
+#'
+#' `call_sites()` applies the floor and returns only what passed, which makes the floor impossible to
+#' argue with from the outputs: a reader cannot see what sat just beneath it. This is the same
+#' clustering with no floor applied, so "`>= 3` cells and `>= 3` UMIs is arbitrary" becomes a
+#' question about rows rather than a matter of opinion.
+#'
+#' `channels` matters for reading it: a cluster supported by both the 3' and the genome-mapped
+#' channel is a different proposition from one seen by a single channel at the same depth.
+cluster_support <- function(discovery_hits, opt = IS_DEFAULTS) {
+  if (!nrow(discovery_hits)) return(dplyr::tibble())
+  chan <- if ("channel" %in% names(discovery_hits)) discovery_hits$channel else "three_prime"
+  cluster_hits(dplyr::mutate(discovery_hits, channel = chan), opt) |>
+    dplyr::group_by(site_id) |>
+    dplyr::summarise(
+      chrom    = dplyr::first(chrom),
+      pos      = as.integer(stats::median(pos)),
+      strand   = dplyr::first(strand),
+      reads    = dplyr::n(),
+      cells    = dplyr::n_distinct(paste(tube, barcode)),
+      umis     = dplyr::n_distinct(paste(tube, barcode, umi)),
+      tubes    = dplyr::n_distinct(tube),
+      channels = paste(sort(unique(channel)), collapse = "+"),
+      max_mapq = max(mapq),
+      .groups  = "drop") |>
+    dplyr::mutate(called = cells >= opt$min_cells & umis >= opt$min_umis) |>
+    dplyr::arrange(dplyr::desc(cells), dplyr::desc(umis))
+}
+
+#' The site count as a function of the cell and UMI floor - the cost of the threshold, as a grid.
+#'
+#' Read down the diagonal: if the count falls off a cliff at the current floor the threshold is
+#' doing work, and if it plateaus the floor is in a flat region and the exact value does not matter
+#' much. `n_both_channels` separates the two readings, because single-channel clusters at low depth
+#' are where artefacts live.
+site_floor_curve <- function(discovery_hits, opt = IS_DEFAULTS, max_cells = 6L, max_umis = 6L) {
+  sup <- cluster_support(discovery_hits, opt)
+  if (!nrow(sup)) return(dplyr::tibble())
+  grid <- expand.grid(min_cells = seq_len(max_cells), min_umis = seq_len(max_umis))
+  rows <- lapply(seq_len(nrow(grid)), function(i) {
+    keep <- sup[sup$cells >= grid$min_cells[i] & sup$umis >= grid$min_umis[i], , drop = FALSE]
+    dplyr::tibble(
+      min_cells = grid$min_cells[i], min_umis = grid$min_umis[i],
+      n_sites = nrow(keep),
+      n_both_channels = sum(grepl("\\+", keep$channels)),
+      n_single_tube   = sum(keep$tubes == 1L),
+      cells_covered   = sum(keep$cells),
+      is_current      = grid$min_cells[i] == opt$min_cells & grid$min_umis[i] == opt$min_umis)
+  })
+  dplyr::bind_rows(rows)
 }
 
 #' Write the mini-reference: the flanks of the called sites, from the genome FASTA.
@@ -994,6 +1087,127 @@ label_sites <- function(hits, registry = NULL, opt = IS_DEFAULTS) {
     dplyr::select(-label)
 }
 
+#' The bases of a clip that lie BEYOND the junction, in genome orientation.
+#'
+#' For the 5' channel the host precedes the provirus, so the junction is the alignment's far end on
+#' the plus strand and its POS on the minus strand - the same asymmetry read_bwa_hits() documents at
+#' length for the coordinate itself. The unaligned bases past the junction therefore sit at the
+#' query's tail when the clip aligned forward and at its head, reverse-complemented, when it aligned
+#' reverse. Taking the trailing soft clip regardless would return the wrong end of the read for every
+#' minus-strand junction, and would do it silently.
+#'
+#' Returns "" where the alignment is clean to the end of the query, which is itself informative: a
+#' junction with nothing beyond it is not a fusion transcript.
+clip_beyond_junction <- function(seq, cigar, strand) {
+  # Extracted with regexpr rather than sub(): a sub() whose pattern fails returns the SUBJECT
+  # unchanged, so as.integer() of it is a silent NA. That is how the first version of this broke -
+  # and it broke on every clean CIGAR, because even the "0S" fallback failed to match.
+  soft_clip <- function(cig, pattern) {
+    at  <- regexpr(pattern, cig)
+    out <- integer(length(cig))
+    hit <- at > 0L
+    out[hit] <- as.integer(sub("S", "", regmatches(cig, at)))
+    out
+  }
+  head_s <- soft_clip(cigar, "^[0-9]+S")
+  tail_s <- soft_clip(cigar, "[0-9]+S$")
+  out <- character(length(seq))
+  plus <- strand == "+"
+  out[plus] <- ifelse(tail_s[plus] > 0L,
+                      substring(seq[plus], nchar(seq[plus]) - tail_s[plus] + 1L), "")
+  if (any(!plus)) {
+    piece <- ifelse(head_s[!plus] > 0L, substring(seq[!plus], 1L, head_s[!plus]), "")
+    rc <- rep("", length(piece))
+    ok <- nzchar(piece)
+    if (any(ok)) {
+      rc[ok] <- as.character(Biostrings::reverseComplement(Biostrings::DNAStringSet(piece[ok])))
+    }
+    out[!plus] <- rc
+  }
+  out
+}
+
+#' Does a junction sit on an annotated exon boundary, and is the intron canonical there?
+#'
+#' A 5' junction at an exon's last base is the signature of a SPLICED read, not of an integration:
+#' bwa does not split alignments, so a read crossing a splice junction aligns to the exon and soft-
+#' clips whatever follows. The test is exact - the exon's end, not a window around it - because an
+#' approximate match to an exon boundary is not evidence of anything in a 2.7 Gb genome.
+#'
+#' `donor` is the two intronic bases immediately after the exon end. GT is canonical; anything else
+#' weakens the reading considerably.
+exon_boundary_context <- function(chrom, pos, gtf, genome_fa) {
+  ex <- rtracklayer::import(gtf, format = "gtf", feature.type = "exon")
+  out <- dplyr::tibble(exon_gene = NA_character_, exon_end = NA_integer_,
+                       exon_end_dist = NA_integer_, donor = NA_character_, .rows = length(pos))
+  for (i in seq_along(pos)) {
+    near <- ex[as.character(GenomicRanges::seqnames(ex)) == chrom[i] &
+                 abs(GenomicRanges::end(ex) - pos[i]) <= 5L]
+    if (!length(near)) next
+    d <- GenomicRanges::end(near) - pos[i]
+    k <- which.min(abs(d))
+    out$exon_gene[i]     <- near$gene_name[k]
+    out$exon_end[i]      <- GenomicRanges::end(near)[k]
+    out$exon_end_dist[i] <- d[k]
+    out$donor[i] <- as.character(Rsamtools::scanFa(
+      genome_fa, GenomicRanges::GRanges(chrom[i],
+        IRanges::IRanges(GenomicRanges::end(near)[k] + 1L, width = 2L))))
+  }
+  out
+}
+
+#' Where, if anywhere, a fusion's downstream bases join the vector - an AG acceptor plus those bases.
+#'
+#' The point of searching the vector rather than the host's next exon is that the two hypotheses make
+#' different predictions, and only one of them is about an integration. A read that splices from a
+#' host exon into the PROVIRUS continues with vector sequence; one that splices to the next host exon
+#' continues with that exon. Reporting the position makes the claim checkable by hand.
+vector_splice_acceptor <- function(tail, genome_fa, contig = IS_DEFAULTS$contig) {
+  if (!nzchar(tail) || is.na(tail)) return(dplyr::tibble(acceptor_pos = NA_integer_, acceptor_seq = NA_character_))
+  v <- as.character(Rsamtools::scanFa(genome_fa, GenomicRanges::GRanges(
+    contig, IRanges::IRanges(1L, Rsamtools::seqinfo(Rsamtools::FaFile(genome_fa))@seqlengths[
+      match(contig, Rsamtools::seqinfo(Rsamtools::FaFile(genome_fa))@seqnames)]))))
+  hit <- gregexpr(paste0("AG", tail), v, fixed = TRUE)[[1]]
+  if (hit[1] == -1L) return(dplyr::tibble(acceptor_pos = NA_integer_, acceptor_seq = NA_character_))
+  dplyr::tibble(acceptor_pos = as.integer(hit[1]) + 1L,          # the AG's second base
+                acceptor_seq = paste0("AG|", tail))
+}
+
+#' Is a set of junction-bearing cells confined to one mouse, as a clone must be?
+#'
+#' The independent instrument this analysis keeps coming back to: sites are mono-replicate by
+#' construction, so hashtag identity tests clonality without using any junction evidence. The
+#' denominator is that replicate's share of CALLED CELLS IN THE SAME TUBES, not its share of
+#' everything - the tubes a candidate appears in are not a random sample of tubes.
+#'
+#' Multiplets are excluded from the numerator: a multiplet is consistent with every hypothesis.
+replicate_confinement <- function(hits, hashtag_calls, called_barcodes) {
+  if (!nrow(hits) || is.null(hashtag_calls)) {
+    return(dplyr::tibble(replicate = NA_character_, n_in_replicate = NA_integer_,
+                         n_cells = NA_integer_, replicate_share = NA_real_, replicate_p = NA_real_))
+  }
+  cells <- dplyr::distinct(hits, tube, barcode)
+  m <- dplyr::inner_join(cells, dplyr::select(hashtag_calls, tube, barcode, replicate),
+                         by = c("tube", "barcode"))
+  m <- m[m$replicate != "multiplet", , drop = FALSE]
+  if (!nrow(m)) {
+    return(dplyr::tibble(replicate = NA_character_, n_in_replicate = NA_integer_,
+                         n_cells = nrow(cells), replicate_share = NA_real_, replicate_p = NA_real_))
+  }
+  top <- sort(table(m$replicate), decreasing = TRUE)
+  base <- dplyr::inner_join(
+    dplyr::filter(called_barcodes, tube %in% unique(hits$tube)),
+    dplyr::select(hashtag_calls, tube, barcode, replicate), by = c("tube", "barcode"))
+  base <- base[base$replicate != "multiplet", , drop = FALSE]
+  share <- sum(base$replicate == names(top)[1]) / nrow(base)
+  dplyr::tibble(
+    replicate       = names(top)[1],
+    n_in_replicate  = as.integer(top[[1]]),
+    n_cells         = nrow(m),
+    replicate_share = share,
+    replicate_p     = stats::pbinom(as.integer(top[[1]]) - 1L, nrow(m), share, lower.tail = FALSE))
+}
+
 #' Promote 5' junctions that have no called 3' site, by looking for the 3' partner at q -/+ 4.
 #'
 #' The mini-reference logic run backwards. A 5' junction at q predicts its 3' partner at exactly one
@@ -1043,10 +1257,90 @@ rescue_orphan_junctions <- function(five_hits, discovery_hits, sites, opt = IS_D
   })
   out <- dplyr::bind_rows(rows)
   out$rescued <- !is.na(out$pos_3p) & abs(out$delta) == expect
-  # The denominator travels with the result, as an attribute so it survives a write_csv of the rows.
-  attr(out, "candidates") <- nrow(cand)
+  # The denominator travels AS COLUMNS. It used to be set as attributes, with a comment claiming they
+  # survive a write_csv of the rows - they do not: readr writes the data, not the attributes, so the
+  # one number without which a single match is unfalsifiable was reaching the CSV as nothing at all.
+  # It survived only in a message() in the driver's log.
+  out$candidates_tested <- nrow(cand)
+  out$n_rescued         <- sum(out$rescued)
+  attr(out, "candidates") <- nrow(cand)   # kept: the driver's message reads these
   attr(out, "rescued")    <- sum(out$rescued)
   out |> dplyr::arrange(dplyr::desc(rescued), dplyr::desc(cells_5p + cells_3p))
+}
+
+#' Each orphan 5' junction with the evidence that decides what it is, and a verdict.
+#'
+#' Three hypotheses, and they are separable because they predict different things:
+#'
+#'   - A SPLICED HOST-VECTOR FUSION. The junction sits exactly on an exon's last base, the intron
+#'     after it begins GT, and the bases beyond the junction are vector sequence following an AG
+#'     acceptor. Its cells are the cells of whichever called site sits in that same intron, so it is
+#'     not a new integration at all - it is a transcript from one already called.
+#'   - AN INTEGRATION SITE THE FLOOR MISSED. A 3' partner exists at exactly q -/+ 4 (the TSD), the
+#'     cells are confined to one mouse, and the pooled cell and UMI counts reach the floor even
+#'     though neither channel reaches it alone.
+#'   - UNSUPPORTED. Too few reads to separate the above, or cells spread across mice, which a clone
+#'     cannot be.
+#'
+#' The verdict is derived from the columns beside it, so a reader can disagree with the rule without
+#' re-deriving the evidence. Nothing here promotes a site: that stays a human decision, and the
+#' reason is in the report.
+orphan_junction_evidence <- function(five_hits, discovery_hits, sites, gtf, genome_fa,
+                                     hashtag_calls = NULL, called_barcodes = NULL,
+                                     opt = IS_DEFAULTS, expect = 4L) {
+  resc <- rescue_orphan_junctions(five_hits, discovery_hits, sites, opt, expect = expect)
+  if (!nrow(resc)) return(dplyr::tibble())
+
+  ctx <- exon_boundary_context(resc$chrom, resc$pos_5p, gtf, genome_fa)
+  rows <- lapply(seq_len(nrow(resc)), function(i) {
+    # Every read at this junction, from both channels, so the pooled floor test uses one set of cells.
+    near5 <- five_hits[five_hits$chrom == resc$chrom[i] &
+                         abs(five_hits$pos - resc$pos_5p[i]) <= opt$cluster_window, , drop = FALSE]
+    near3 <- if (is.na(resc$pos_3p[i])) discovery_hits[0, , drop = FALSE] else
+      discovery_hits[discovery_hits$chrom == resc$chrom[i] &
+                       abs(discovery_hits$pos - resc$pos_3p[i]) <= opt$cluster_window, , drop = FALSE]
+    both  <- dplyr::bind_rows(near5, near3)
+
+    tails <- clip_beyond_junction(near5$seq, near5$cigar, near5$strand)
+    tails <- tails[nzchar(tails)]
+    modal <- if (length(tails)) names(sort(table(tails), decreasing = TRUE))[1] else ""
+    acc   <- vector_splice_acceptor(modal, genome_fa, opt$contig)
+    conf  <- replicate_confinement(both, hashtag_calls, called_barcodes)
+
+    # The called site sharing this intron, if any - what a fusion transcript would have come from.
+    host <- if (is.na(ctx$exon_gene[i]) || !nrow(sites)) NA_character_ else {
+      s <- sites[sites$chrom == resc$chrom[i] & !is.na(sites$gene) &
+                   sites$gene == ctx$exon_gene[i], , drop = FALSE]
+      if (nrow(s)) paste0(s$site_id[1], " at ", s$pos[1]) else NA_character_
+    }
+
+    dplyr::tibble(
+      chrom = resc$chrom[i], pos_5p = resc$pos_5p[i],
+      reads_5p = resc$reads_5p[i], cells_5p = resc$cells_5p[i],
+      pos_3p = resc$pos_3p[i], reads_3p = resc$reads_3p[i], cells_3p = resc$cells_3p[i],
+      delta = resc$delta[i], max_mapq = resc$max_mapq[i], rescued = resc$rescued[i],
+      pooled_cells = dplyr::n_distinct(paste(both$tube, both$barcode)),
+      pooled_umis  = dplyr::n_distinct(paste(both$tube, both$barcode, both$umi)),
+      meets_floor  = dplyr::n_distinct(paste(both$tube, both$barcode)) >= opt$min_cells &
+                     dplyr::n_distinct(paste(both$tube, both$barcode, both$umi)) >= opt$min_umis,
+      exon_gene = ctx$exon_gene[i], exon_end = ctx$exon_end[i],
+      exon_end_dist = ctx$exon_end_dist[i], donor = ctx$donor[i],
+      clip_beyond = modal, clip_beyond_n = length(tails),
+      vector_acceptor = acc$acceptor_pos, vector_acceptor_seq = acc$acceptor_seq,
+      site_in_same_gene = host,
+      replicate = conf$replicate, n_in_replicate = conf$n_in_replicate, n_cells = conf$n_cells,
+      replicate_share = conf$replicate_share, replicate_p = conf$replicate_p,
+      candidates_tested = resc$candidates_tested[i])
+  })
+  out <- dplyr::bind_rows(rows)
+  out$verdict <- ifelse(
+    !is.na(out$exon_end_dist) & out$exon_end_dist == 0L & !is.na(out$vector_acceptor),
+    "spliced host-vector fusion",
+    ifelse(out$rescued & out$meets_floor & !is.na(out$replicate_p) & out$replicate_p < 0.05,
+           "integration site below the per-channel floor",
+           ifelse(out$rescued & out$meets_floor, "candidate site, clonality untested",
+                  "unsupported")))
+  dplyr::arrange(out, dplyr::desc(pooled_cells))
 }
 
 #' One row per site: position, host gene, and cell counts overall and per tube.
