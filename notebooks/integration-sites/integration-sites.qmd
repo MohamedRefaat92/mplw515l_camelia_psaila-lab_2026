@@ -128,9 +128,20 @@ dplyr::tibble(
                   collapse = ", "),
             sum(ev$defensible),
             paste(sprintf("%s: %s", weak$site_id,
-                          dplyr::case_when(weak$tsd_rescued ~ "TSD-rescued, clonality untested",
-                                           weak$pooled_only ~ "pooled reads only",
-                                           TRUE ~ "flank cannot support quantification")),
+                          # ORDER MATTERS, and getting it wrong is how this line printed "flank
+                          # cannot support quantification" for IS16, whose flank is fine and which
+                          # is excluded for failing the clonality test. Clonality is checked first
+                          # because it is the newest disqualification and the one a site can fail
+                          # while passing everything else; the flank clause is the fallback and so
+                          # silently absorbs anything the earlier clauses miss.
+                          dplyr::case_when(
+                            !tidyr::replace_na(weak$clonal, TRUE) ~
+                              sprintf("clonality untested (p = %.2f)", weak$replicate_p),
+                            weak$tsd_rescued  ~ "TSD-rescued, clonality untested",
+                            weak$pooled_only  ~ "pooled reads only",
+                            tidyr::replace_na(weak$flank_gated, FALSE) ~
+                              "flank cannot support quantification",
+                            TRUE ~ "excluded; see site_evidence.csv")),
                   collapse = "; ")),
     sprintf("**%s** across %d sites", scales::comma(sum(ev$cells)), nrow(ev)),
     sprintf("**%s** and **%s** cells, against %d and %d detected",
@@ -2317,9 +2328,23 @@ rm(srt_hsc); invisible(gc(verbose = FALSE))
 # Subtract a site's junction UMIs from its own host gene's counts, at two strengths. `umis_genomic`
 # is the channel whose reads carry 120-140 bases of host and so are the ones Cell Ranger would count
 # to the gene; `molecules` is every junction UMI at that cell and site, which over-corrects.
-strip_junctions <- function(m, column) {
+#
+# AND ONLY AT SAME-SENSE SITES, which the first version of this got wrong in a way that manufactured
+# the result below. A read-through transcript is counted as host-gene expression only when it runs
+# in the gene's own direction; at an antisense site it is not counted there at all. Subtracting
+# regardless therefore deletes real expression from exactly the cells being tested, and it shows: at
+# IS02 the "correction" drove Ddx10 from -0.27 to -0.74 to -1.22 as more was taken away, monotone in
+# how much was subtracted. That is the signature of over-correction, not of a stronger effect, and it
+# was about to be written up as the headline finding.
+#
+# So the correct value for a site is the fully subtracted one if it is same-sense and the unadjusted
+# one if it is antisense. `orientation_corrected()` below picks per site rather than leaving a reader
+# to notice which column to read.
+strip_junctions <- function(m, column, same_sense_only = TRUE) {
   removed <- 0L
+  same <- sites$site_id[isTRUE_vec(sites$cis_confound)]
   for (r in seq_len(nrow(assign))) {
+    if (same_sense_only && !assign$site_id[r] %in% same) next
     hg <- sites$gene[match(assign$site_id[r], sites$site_id)]
     if (is.na(hg) || !(hg %in% rownames(m))) next
     j <- match(paste0(assign$tube[r], "_", assign$barcode[r]), cells_h)
@@ -2349,6 +2374,17 @@ cis_tbl <- dplyr::bind_rows(
   host_scan(cnt_h,  "none"),
   host_scan(cnt_gen, "genome channel"),
   host_scan(cnt_all, "all junction UMIs"))
+
+# The value to read per site: fully subtracted where subtraction is valid, unadjusted where it is
+# not. Nothing else in this report should quote a single "corrected" column across all six sites.
+orientation_corrected <- function() {
+  same <- sites$site_id[isTRUE_vec(sites$cis_confound)]
+  dplyr::bind_rows(
+    cis_tbl |> dplyr::filter(adjustment == "all junction UMIs", site_id %in% same) |>
+      dplyr::mutate(basis = "junction UMIs subtracted"),
+    cis_tbl |> dplyr::filter(adjustment == "none", !site_id %in% same) |>
+      dplyr::mutate(basis = "unadjusted (subtraction invalid)"))
+}
 
 cis_tbl |>
   dplyr::transmute(site_id, `host gene` = gene, adjustment,
@@ -2382,16 +2418,17 @@ orient <- sites |>
                    orientation = ifelse(strand == gene_strand, "same sense", "**antisense**"),
                    cis_confound) |>
   dplyr::left_join(
-    cis_tbl |> dplyr::filter(adjustment == "all junction UMIs") |>
-      dplyr::transmute(site_id, log2fc, p_value), by = "site_id") |>
+    orientation_corrected() |> dplyr::transmute(site_id, log2fc, p_value, basis),
+    by = "site_id") |>
   dplyr::arrange(dplyr::desc(log2fc))
 
 orient |>
-  dplyr::transmute(site_id, `host gene` = gene, `site strand` = site, `gene strand` = host,
-                   orientation, `cis_confound` = cis_confound,
-                   `log2 FC (fully corrected)` = sprintf("%+.2f", log2fc),
-                   p = sprintf("%.1g", p_value)) |>
-  knitr::kable(align = "lllllrr")
+  dplyr::transmute(site_id, `host gene` = gene, orientation,
+                   `cis_confound` = cis_confound,
+                   `log2 FC` = sprintf("%+.2f", log2fc),
+                   p = sprintf("%.1g", p_value),
+                   `corrected how` = basis) |>
+  knitr::kable(align = "lllrrrl")
 ```
 
 ```{r cis-orientation-test}
@@ -2402,7 +2439,8 @@ n_anti <- sum(grepl("antisense", orient$orientation))
 ```
 
 **Every same-sense site goes up and every antisense site goes down — `r nrow(orient)` of
-`r nrow(orient)`.** With `r nrow(orient) - n_anti` same-sense and `r n_anti` antisense sites, the
+`r nrow(orient)`, and the split holds on the unadjusted counts too** (+2.20, +2.40, +1.27, +1.00
+against −0.27, −0.18), which matters because it means the pattern is not produced by the correction. With `r nrow(orient) - n_anti` same-sense and `r n_anti` antisense sites, the
 chance of the negatives falling exactly on the antisense pair is
 1/`r choose(nrow(orient), n_anti)` = `r sprintf("%.3f", ft$p.value)`. **Suggestive, not significant**,
 and on six sites it cannot be more than that — but the direction is what a mechanism predicts rather
@@ -2423,10 +2461,31 @@ perfectly — a provirus can perturb a neighbouring gene whichever way it points
 correction is now the better-supported reading, and the three "surviving" elevations should not be
 quoted as *cis* effects.
 
-**The antisense decrease is the one that could be real.** Antisense insertion into a gene body
-reducing its expression is an ordinary mechanism, and these two measurements are free of the
-artefact by construction. They are also small (−0.28, −0.37), and both sites are B0303's two largest
-clones, so a shared state effect is not excluded by anything here.
+**The antisense decrease is much weaker than the uncorrected columns suggest, and that is a
+correction this report had to make to itself.** Subtracting junction UMIs at an antisense site
+deletes expression that was never added, so the "fully corrected" value there is over-corrected. The
+three-level table above shows the damage directly: at IS02 the subtraction drove *Ddx10* from
+**−0.27** to −0.74 to −0.92 as more was taken away — monotone in how much was removed, which is the
+signature of over-correction rather than of a stronger effect.
+
+```{r antisense-readout}
+#| echo: false
+# Computed in a chunk, not inline. The first version of this was a single inline `r {...}` holding
+# an assignment, a paste() and three subsets - and it was missing its closing brace, which no chunk
+# checker caught because inline expressions are not chunks. It cost a 25-minute render. Inline code
+# in this report should reference a value, not build one.
+anti <- orientation_corrected() |>
+  dplyr::filter(basis != "junction UMIs subtracted")
+anti_txt <- paste(sprintf("*%s* %+.2f (*p* = %.2g)", anti$gene, anti$log2fc, anti$p_value),
+                  collapse = " and ")
+```
+
+Read on the basis that is valid for each site, the antisense pair is `r anti_txt`.
+
+So **one small decrease and one that is not significant**, not two clean effects. Antisense insertion
+reducing a gene's expression is an ordinary mechanism and these are the only two measurements here
+the artefact cannot inflate — but two sites, one of them null, is not a result, and both are B0303's
+largest clones so a shared state effect is not excluded either.
 
 **And it is only partly removable.** Subtracting the genome channel's junction UMIs
 (`r attr(cnt_gen, "removed")` of them) shrinks every effect; subtracting *all* junction UMIs

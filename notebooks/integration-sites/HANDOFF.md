@@ -656,11 +656,13 @@ junction, so they are listed under *Closed* with what each turned out to be.
    three as cis effects. Settling it properly still needs an orthogonal measurement — host-gene
    expression in unlabelled cells of the same clone — which needs a clone membership this assay
    cannot supply.
-5. **Is the antisense decrease real?** −0.28 at IS02's *Ddx10* and −0.37 at IS01's *Mef2c* are the
-   two measurements the artefact cannot touch, so they are candidates for a real effect — antisense
-   insertion into a gene body reducing its expression is an ordinary mechanism. Both are small, and
-   both sites are B0303's two largest clones, so a shared state effect is not excluded. Two sites is
-   not a result.
+5. **Is the antisense decrease real? One small effect and one null.** On the valid basis
+   (unadjusted, since subtraction is invalid for antisense) IS02's *Ddx10* is −0.27 at *p* = 0.008
+   and IS01's *Mef2c* is −0.18 at *p* = 0.9 — so one small decrease and one that is not significant,
+   not two clean effects. These are the only two measurements here the artefact cannot inflate, and
+   antisense insertion reducing a gene's expression is an ordinary mechanism, but two sites with one
+   null is not a result and both are B0303's largest clones, so a shared state effect is not
+   excluded either.
 6. **Clonality proper** — site counts per compartment as a diversity measure. Still not attempted,
    and the obstacle is now better characterised rather than removed: see the completeness entry
    below. Per-compartment comparison is additionally confounded with tube (IS05 is Rx_4 only,
@@ -672,14 +674,24 @@ junction, so they are listed under *Closed* with what each turned out to be.
   Four host genes are inflated in their site's own cells and two are *deflated*, which was logged as
   unexplained. Put the insertions' orientations beside them and the split is perfect:
 
-  | site | host gene | orientation | `cis_confound` | log2 FC, fully corrected |
-  |---|---|---|---|---|
-  | IS11 | *Stau2* | same sense | TRUE | **+2.42** |
-  | IS10 | *Gm35330* | same sense | TRUE | **+1.70** |
-  | IS04 | *Abhd17c* | same sense | TRUE | +0.55 (*p* = 0.9) |
-  | IS03 | *Hells* | same sense | TRUE | **+0.84** |
-  | IS02 | *Ddx10* | **antisense** | FALSE | **−0.28** |
-  | IS01 | *Mef2c* | **antisense** | FALSE | **−0.37** |
+  | site | host gene | orientation | `cis_confound` | log2 FC, unadjusted | corrected on the valid basis |
+  |---|---|---|---|---|---|
+  | IS11 | *Stau2* | same sense | TRUE | +2.40 | **+2.45** (subtracted) |
+  | IS10 | *Gm35330* | same sense | TRUE | +2.20 | **+1.69** (subtracted) |
+  | IS04 | *Abhd17c* | same sense | TRUE | +1.27 | +0.65, *p* = 0.7 (subtracted) |
+  | IS03 | *Hells* | same sense | TRUE | +1.00 | **+0.92** (subtracted) |
+  | IS02 | *Ddx10* | **antisense** | FALSE | **−0.27**, *p* = 0.008 | −0.27 (unadjusted; see below) |
+  | IS01 | *Mef2c* | **antisense** | FALSE | **−0.18**, *p* = 0.9 | −0.18 (unadjusted; see below) |
+
+  **THE SUBTRACTION IS ONLY VALID AT SAME-SENSE SITES, and applying it everywhere manufactured a
+  result.** The first version of this subtracted junction UMIs from the host gene at every site,
+  including antisense ones where those reads were never counted to that gene - so it deleted real
+  expression from exactly the cells under test. The damage is visible as a monotone drift: at IS02
+  the "correction" drove *Ddx10* from −0.27 to −0.74 to −0.92 as more was taken away, which is the
+  signature of over-correction and not of a stronger effect. It was about to be written up as the
+  headline. `strip_junctions()` now subtracts only where `cis_confound` is TRUE, and
+  `orientation_corrected()` picks the valid basis per site so nothing quotes one column across all
+  six.
 
   With 4 same-sense and 2 antisense, the chance of the negatives landing exactly on the antisense
   pair is 1/choose(6,2) = **0.067**. *Suggestive, not significant*, and on six sites it cannot be
@@ -812,10 +824,10 @@ junction, so they are listed under *Closed* with what each turned out to be.
 
   | site | host gene | no adjustment | genome-channel UMIs removed | all junction UMIs removed | in the PCA? |
   |---|---|---|---|---|---|
-  | IS10 | *Gm35330* | +2.53 | +2.28 | **+1.70** (1e-06) | no |
-  | IS11 | *Stau2* | +3.02 | +2.66 | **+2.42** (5e-07) | yes |
-  | IS04 | *Abhd17c* | +1.33 | +1.06 | **+0.55** (*p* = 0.9) | no |
-  | IS03 | *Hells* | +1.12 | +1.06 | **+0.84** (3e-07) | yes |
+  | IS10 | *Gm35330* | +2.20 | +2.08 | **+1.69** (5e-07) | no |
+  | IS11 | *Stau2* | +2.40 | +2.25 | **+2.45** (2e-06) | yes |
+  | IS04 | *Abhd17c* | +1.27 | +0.97 | **+0.65** (*p* = 0.7) | no |
+  | IS03 | *Hells* | +1.00 | +0.98 | **+0.92** (1e-08) | yes |
 
   **It cannot explain any clustering**, and the reason is one column: the PCA is built on 3,000
   variable features and the relevant host genes are not among them. Check membership before
