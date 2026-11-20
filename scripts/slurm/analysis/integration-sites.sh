@@ -2,8 +2,8 @@
 #SBATCH --job-name=integration_sites
 #SBATCH --partition=short
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=06:00:00
+#SBATCH --mem=48G
+#SBATCH --time=08:00:00
 #SBATCH --output=output/logs/integration-sites_%j.out
 #SBATCH --error=output/logs/integration-sites_%j.err
 #
@@ -16,107 +16,72 @@
 # a read aligns to the reporter contig as far as its last base and soft-clips the rest, and that
 # clipped tail is host sequence naming where the vector integrated.
 #
-# Three steps, because only the middle one needs bwa:
-#   1. extract  src/R/integration-sites.R reads each tube's BAM and writes the clipped tails
-#   2. align    bwa places those tails on the genome
-#   3. call     the same R code clusters the placements into sites and writes the tables
+# THE PIPELINE IS A PACKAGE. It used to be src/R/integration-sites.R plus a 629-line driver in this
+# repository; both are gone and both are now `scarab`, at /well/ludwig/users/nrs939/projects/scarab,
+# installed into this project's library like any other dependency.
 #
-# The reasoning behind each filter and threshold lives in src/R/integration-sites.R, next to the code
-# that applies it. Every threshold is in IS_DEFAULTS there; override one by editing it, so the job
-# file and the analysis cannot disagree.
+# ONE CALL, NOT FIVE. This script used to invoke each stage separately and shell out to bwa itself,
+# which meant the aligner flags lived in two places - and they are not cosmetic: `-T 20` against
+# bwa's default 30 is the difference between placing a 25 bp clip and silently discarding it, which
+# on this dataset was 244 clips, a quarter of discovery.fa. scarab_run() owns the ordering, the
+# flags, and the resume logic, so there is nothing here to drift out of step with the package.
+#
+# It also checks every input before starting - see scarab_inputs(). That matters at this cost: a
+# missing .bai or one tube's absent barcode list used to surface deep into a stage, and in the
+# barcode case not at all (the run completed having counted zero called cells in that tube).
+#
+# Reinstall after changing the package:
+#   env/bin/R CMD INSTALL -l renv/library/linux-rocky-8.10/R-4.5/x86_64-conda-linux-gnu \
+#     /well/ludwig/users/nrs939/projects/scarab
 #
 # Stays on short -- NOT the _el9 partitions. renv keys its library path on the OS release
 # (renv/library/linux-rocky-8.10/...), so on a Rocky 9 node it finds no library, bootstraps an empty
 # one and the first library() call fails. Anything here that uses ./env must stay on EL8 nodes.
-# short and long are the same 115 nodes and differ only in their limit (30 h vs 10 days), so short
-# is the whole pool for a job this size.
 #
 # EDIT THIS FILE BEFORE YOU SUBMIT IT, NOT AFTER. Slurm copies the batch script into its spool at
-# submit time, so a job already queued runs the version it was submitted with, while the R files it
-# calls are read at run time and so are the current ones. On 2026-11-17 this file gained the genome
-# FASTA argument on the assign line six minutes after the job was submitted: the job ran the old
-# line, tsd_check() got no reference to compare against, and the sequence half of the strongest check
-# in the analysis wrote NA with no error and no warning. Resubmit rather than edit in place.
+# submit time, so a job already queued runs the version it was submitted with. On 2026-11-17 this
+# file gained the genome FASTA argument on the assign line six minutes after the job was submitted:
+# the job ran the old line, tsd_check() got no reference, and the sequence half of the strongest
+# check in the analysis wrote NA with no error. Resubmit rather than edit in place.
 #
-# Measured: 1 h 49 m end to end for eight tubes (job 35742986), 13.7 GB peak.
+# Measured: 1 h 49 m end to end for eight tubes, 13.7 GB peak. The genome-mapped scan is ~105 min a
+# tube and is forked one worker per tube, so the wall clock is roughly one tube's scan.
 #
 # Needs the bwa index: sbatch scripts/slurm/setup/bwa-index.sh (once, ~50 min).
-# Reads data/cellranger_<tube>/sample_alignments.bam, so it is covered by the project's provenance.
-# Writes output/objects/integration-sites/, which notebooks/integration-sites/ reads.
+# Reads data/cellranger_<tube>/, so it is covered by the project's provenance.
 set -euo pipefail
 source scripts/slurm/env.sh
 source scripts/slurm/cellranger/env.sh
 
-bwa=$PROJ/env/bin/bwa
-rscript=$PROJ/env/bin/Rscript
-index=$CR_REF/bwa/genome
-gtf=$CR_REF/genes/genes.gtf.gz
-out=$PROJ/output/objects/integration-sites
-work=$out/work
-threads=${SLURM_CPUS_PER_TASK:-8}
-
-for f in "$index.bwt" "$gtf"; do
-  [[ -s $f ]] || { echo "ERROR: $f missing (run scripts/slurm/setup/bwa-index.sh first)" >&2; exit 1; }
-done
-
+out=${IS_OUT:-$PROJ/output/objects/integration-sites-scarab}
 tubes=$(tail -n +2 "$CR_LIBRARIES" | cut -d, -f1 | tr '\n' ' ')
 
-echo "=== 1/5 extract the clipped tails ==="
+echo "=== scarab $($PROJ/env/bin/Rscript -e 'cat(as.character(packageVersion("scarab")))')"
+echo "=== out   $out"
+echo "=== tubes $tubes"
+
 # shellcheck disable=SC2086  # tubes is a deliberate word-split list
-$rscript scripts/R/call-integration-sites.R extract "$out" "$PROJ/data" $tubes
+$PROJ/env/bin/Rscript -e '
+  a <- commandArgs(TRUE)
+  scarab::scarab_run(
+    out       = a[1],
+    bam_dir   = a[2],
+    tubes     = a[-(1:6)],
+    genome_fa = a[3],
+    gtf       = a[4],
+    bwa_index = a[5],
+    bwa       = a[6],
+    registry  = "metadata/integration_site_registry.csv",
+    # TRUE so a crash in a later stage does not redo the genome-mapped scan, which is the whole
+    # cost of the job. Delete the stage output to force one.
+    resume    = TRUE)
+' "$out" "$PROJ/data" "$CR_REF/fasta/genome.fa" "$CR_REF/genes/genes.gtf.gz" \
+  "$CR_REF/bwa/genome" "$PROJ/env/bin/bwa" $tubes
 
-echo "=== 2/5 place them on the genome ==="
-# bwa mem with a shortened seed: a 25-48 base query will not seed at the default 19.
-#
-# -T 20 is not cosmetic. The default is 30, and with -A 1 a perfect L-base clip scores L, so every
-# clip shorter than 30 fell below threshold and was dropped with no error and no record: placement
-# rate was exactly 0.00 at 25, 26, 27, 28 and 29 bp -- 244 clips, a quarter of discovery.fa --
-# while IS_DEFAULTS$min_discovery advertised 25. Set it explicitly and let MAPQ carry specificity,
-# which it does: 42 of the surviving hits already fall below MAPQ 30.
-$bwa mem -k 16 -T 20 -t "$threads" "$index" "$work/discovery.fa" > "$work/discovery.sam"
-
-# The 5' channel, same treatment as discovery: these clips are long enough to place on their own.
-if [[ -s $work/five_prime.fa ]]; then
-  $bwa mem -k 16 -T 20 -t "$threads" "$index" "$work/five_prime.fa" > "$work/five_prime.sam"
-fi
-
-echo "=== 3/5 the genome-mapped channel ==="
-# The only expensive stage: a streaming pass over every alignment in each BAM, ~104 min a tube, run
-# one core per tube. It needs no aligner afterwards -- these reads already carry their host
-# coordinate at MAPQ 255 -- and it is kept separate so it can be rerun without redoing the rest.
-# It is also the stage that finds the most sites: 13 of the 15 on its own, four of them invisible to
-# the 3' channel because their clips align at MAPQ 0.
-# shellcheck disable=SC2086  # tubes is a deliberate word-split list
-$rscript scripts/R/call-integration-sites.R genomic "$out" "$PROJ/data" $tubes
-
-# The genome-mapped channel's error bound. Commented out because it repeats the most expensive
-# stage in the pipeline -- the decoy pass costs what the real pass costs, so enabling it roughly
-# doubles the job -- and because a control must never be on the critical path of a run that someone
-# is waiting for. Uncomment, or run the stage on its own, when the bound needs tightening:
-#
-#   sbatch --time=12:00:00 --wrap "scripts/R/call-integration-sites.R genomic-decoy $out $PROJ/data"
-#
-# Measured so far: chr19 in Rx_4, 27.6M alignments containing a real 29-read site, zero decoy hits.
-# $rscript scripts/R/call-integration-sites.R genomic-decoy "$out" "$PROJ/data" chr19 "$CR_REF/fasta/genome.fa"
-
-echo "=== 4/5 call the sites, and build the flanks plus the decoys ==="
-$rscript scripts/R/call-integration-sites.R sites "$out" "$gtf" "$CR_REF/fasta/genome.fa"
-
-echo "=== 5/5 assign clips, cell table, TSD, decoy error rate ==="
-# bwa no longer runs against the flanks. It contributed nothing here -- MAPQ against a handful of
-# short sequences is near-meaningless and was already ignored, -a was needed to stop its ranking
-# discarding true hits, and -T 12 silently voided the advertised 8 bp floor (placement rate 0.00 at
-# 8, 9, 10 and 11 bp, 169 reads written and dropped). assign_clips_exact() does the positional test
-# directly: exhaustive, deterministic, seconds, and the floor is now whatever assign_floor says.
-#
-# That floor is 6 bp with exact matching required below 15, held as one object in IS_DEFAULTS. The
-# note that used to sit here -- "min_assign is 10, zero decoy hits at 10 bp and above, two below it"
-# -- was the 100-decoy result, and a zero there carried p = 0.19: chance alone predicts only 1.67
-# hits across the 35 molecules at 6 bp, so it was an absence of evidence rather than a clean floor.
-# At 1,000 decoy flanks the rate is measured: 15 observed against 13.5 predicted at 6 bp.
-#
-# The gtf is passed so the stage can also say what each orphan 5' junction is (orphan_evidence.csv).
-$rscript scripts/R/call-integration-sites.R assign "$out" "$CR_REF/fasta/genome.fa" "$gtf"
+echo "=== verify against the development snapshot ==="
+# Reads the quantities out of the output TABLES, not the log, and compares them to
+# inst/reproduce/expected.csv - which is generated by scarab_snapshot() rather than typed.
+$PROJ/env/bin/Rscript -e 'print(as.data.frame(scarab::scarab_verify(commandArgs(TRUE)[1])))' "$out"
 
 echo "=== done ==="
 ls -l "$out"/*.csv

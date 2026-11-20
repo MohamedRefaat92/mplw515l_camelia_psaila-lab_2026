@@ -1,0 +1,1591 @@
+---
+title: "scarab — detections, candidate sites and confidence"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+Every detection and every candidate integration site: where it is, how deeply it is covered, which channels saw it, and what tier of confidence that earns. Includes the assay's negative controls and measured error rates, and the limits of what it can see.
+
+Part of the scarab integration-site analysis, which is four reports:
+[method and parameters](../scarab-methods/scarab-methods.html) ·
+[detections and confidence](../scarab-qc/scarab-qc.html) ·
+[clones](../scarab-clones/scarab-clones.html) ·
+[exploration](../scarab-exploration/scarab-exploration.html).
+
+```{r setup}
+#| include: false
+# Shared across the four reports: the pipeline's output tables, the clone palette, the tube map and
+# the parameter object. One file, so four reports cannot disagree about what they read or how a
+# clone is coloured.
+source("notebooks/integration-sites/_setup.R")
+
+# The cell tables. The tar_read() is written out here, literally, rather than in _setup.R, because
+# tar_knitr_deps() scans the .qmd and not the file it sources: a tar_read() inside _setup.R would
+# leave the pipeline unaware that this report depends on the target at all.
+#
+# `is_cell_embedding` is a few megabytes - coordinates, cluster, replicate call and QC flag for all
+# four processed objects - where the objects themselves are 2 GB each and cost ten minutes to read.
+emb_all <- tar_read(is_cell_embedding)
+
+# `embedding`, `labelled`, `embedding_raw`, `labelled_raw`, `hashtag_calls`, with the
+# hashtag-file-against-object check that halts if one of them is stale.
+list2env(build_cell_tables(emb_all), environment())
+```
+
+# What this report found
+
+```{r headline}
+#| echo: false
+# `ev` comes from _setup.R: scarab-clones needs it too, and two reports reading the same table two
+# different ways is how they end up disagreeing about which sites are defensible.
+comp <- readr::read_csv(file.path(sites_dir, "repertoire_completeness.csv"),
+                        show_col_types = FALSE)
+dt   <- readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FALSE)
+vec  <- comp[comp$denominator == "cells carrying vector transcript", ]
+fcur <- readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = FALSE)
+big  <- dt[!is.na(dt$clone_size), ][order(-dt$cells[!is.na(dt$clone_size)]), ][1:2, ]
+# The sites the evidence table does not support, subset ONCE. Taking the subset inside ifelse() and
+# again from its result indexes the excluded values with every site's logical, and every reason renders as NA.
+weak <- ev[!ev$defensible, ]
+stopifnot(nrow(weak) > 0, !anyNA(weak$pooled_only))
+
+tiers <- table(ev$evidence_tier)
+
+dplyr::tibble(
+  what = c("Integration sites called",
+           "Cells carrying a clone label",
+           "Largest clones, detection-corrected",
+           "Share of the transduced population these clones account for",
+           "Assignment error, measured against the decoy flanks"),
+  value = c(
+    # The count states its own basis. It has been quoted as 15, 13 and 12 in this report's prose at
+    # once, each correct under a different unstated caveat; the tier is the caveat made explicit.
+    # The reason per excluded site is derived, not asserted: an earlier version said all three
+    # "clear the cell floor only on pooled reads", which is true of IS14 and IS15 and not of IS07.
+    sprintf("**%d across four evidence tiers** (%s), of which **%d are defensible** (%s)",
+            nrow(ev),
+            paste(sprintf("%s: %d", substr(names(tiers), 1, 1), as.integer(tiers)),
+                  collapse = ", "),
+            sum(ev$defensible),
+            paste(sprintf("%s: %s", weak$site_id,
+                          # ORDER MATTERS, and getting it wrong is how this line printed "flank
+                          # cannot support quantification" for IS16, whose flank is fine and which
+                          # is excluded for failing the clonality test. Clonality is checked first
+                          # because it is the newest disqualification and the one a site can fail
+                          # while passing everything else; the flank clause is the fallback and so
+                          # silently absorbs anything the earlier clauses miss.
+                          dplyr::case_when(
+                            !tidyr::replace_na(weak$clonal, TRUE) ~
+                              sprintf("clonality untested (p = %.2f)", weak$replicate_p),
+                            weak$tsd_rescued  ~ "TSD-rescued, clonality untested",
+                            weak$pooled_only  ~ "pooled reads only",
+                            tidyr::replace_na(weak$flank_gated, FALSE) ~
+                              "flank cannot support quantification",
+                            TRUE ~ "excluded; see site_evidence.csv")),
+                  collapse = "; ")),
+    sprintf("**%s** across %d sites", scales::comma(sum(ev$cells)), nrow(ev)),
+    sprintf("**%s** and **%s** cells, against %d and %d detected",
+            scales::comma(big$clone_size[1]), scales::comma(big$clone_size[2]),
+            big$cells[1], big$cells[2]),
+    # FLOOR ONLY. The ceiling this line used to carry came from imputing one median detection rate
+    # to the nine sites the ZTP cannot fit. Predicting them instead, from vector expression and with
+    # a prediction interval, puts the corrected count above the denominator - so the data bound
+    # completeness from below and not from above. `ceiling_uninformative` carries that as a column.
+    sprintf("**%.1f%% floor**; %s", 100 * vec$floor_share,
+            if (isTRUE(vec$ceiling_uninformative))
+              "no usable ceiling \u2014 the prediction interval exceeds the denominator"
+            else sprintf("**%.1f%% ceiling**", 100 * vec$corrected_share)),
+    sprintf("**%.2f expected spurious** assignments across all %s accepted molecules",
+            sum(fcur$expected_spurious[fcur$at_or_above_floor]),
+            scales::comma(sum(fcur$molecules[fcur$at_or_above_floor]))))
+) |>
+  knitr::kable(col.names = NULL)
+```
+
+**The judgement that is not a number.** The site count is not one claim. Evidence behind a site runs
+from two independent channels plus a sequence-verified target-site duplication (tier A) down to a
+cluster that exists only once three channels are summed (tier D), and collapsing that range to a
+single integer is why this report has at various times said 15, 13 and 12 and been right each time.
+`site_evidence.csv` carries `evidence_tier` and `defensible`, so **quote the tier with the count**
+rather than remembering which caveat applied.
+
+**The one open question.** Roughly 84% of vector-expressing mCherry⁺ cells belong to no called site.
+That is either a repertoire far larger than `r nrow(ev)` clones or residual gate impurity, and the junction
+data cannot separate them — a molecule census has no power over clones that produce no molecules. What
+it *can* say is which clones are invisible: at the detection rates measured here a clone of 3 is found
+6% of the time and one of 20 essentially always, so a large hidden repertoire of *small* clones is
+consistent with everything observed and is not distinguishable from a pure gate. The FACS mCherry⁺
+fraction per animal is the measurement that would separate them.
+
+
+# The coverage view
+
+This is the figure that decides whether the whole approach is viable: do enough reads actually reach
+the junction? Each soft-clipped read is placed at the position where its anchor stops matching the
+contig, and coloured by whether its clipped tail is adenine.
+
+```{r anchor-ends, fig.height=6}
+ends_by_tube <- anchor_ends %>%
+  dplyr::group_by(tube, anchor_end, polya) %>%
+  dplyr::summarise(reads = sum(reads), .groups = "drop")
+
+ggplot(ends_by_tube, aes(anchor_end, reads, fill = polya)) +
+  geom_col(width = 1) +
+  geom_vline(xintercept = CLEAVAGE, linetype = "dashed", colour = "grey40") +
+  geom_vline(xintercept = JUNCTION, linetype = "dashed", colour = "firebrick") +
+  facet_wrap(~ tube, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c(`TRUE` = "grey70", `FALSE` = "firebrick"),
+                    labels = c(`TRUE` = "polyA tail", `FALSE` = "non-polyA")) +
+  labs(x = "contig position where the anchor stops matching",
+       y = "reads", fill = NULL,
+       title = "Two populations of soft-clipped reads",
+       subtitle = sprintf("dashed grey = polyA cleavage site (%d); dashed red = integration junction (%d)",
+                          CLEAVAGE, JUNCTION))
+```
+
+Two piles, and they mean completely different things.
+
+The pile at the **cleavage site** is the transcript's own polyA tail: the read reaches the end of the
+mRNA and clips the A's. It says nothing about integration. The pile at the **junction** is the
+read-through population, and its clips are host sequence.
+
+```{r two-populations}
+ends_by_tube %>%
+  dplyr::mutate(pile = dplyr::case_when(
+    anchor_end >= CLEAVAGE - 8 & anchor_end <= CLEAVAGE ~ "cleavage site (3144–3152)",
+    anchor_end == JUNCTION                              ~ "junction (3236)",
+    TRUE                                                ~ "elsewhere")) %>%
+  dplyr::group_by(pile, polya) %>%
+  dplyr::summarise(reads = sum(reads), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = polya, values_from = reads, values_fill = 0,
+                     names_prefix = "polya_") %>%
+  dplyr::mutate(total = polya_TRUE + polya_FALSE,
+                pct_polya = sprintf("%.0f%%", 100 * polya_TRUE / total)) %>%
+  dplyr::select(pile, total, polya = polya_TRUE, non_polya = polya_FALSE, pct_polya) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+The separation is what makes the anchor-position filter worth so much. The non-polyA minority of the
+cleavage-site pile is the dangerous part: those reads have good MAPQ, real barcodes and real UMIs, so
+they would align somewhere in 2.7 Gb and be counted as sites. Nothing downstream would catch them —
+they look exactly like evidence. Requiring the anchor to end at 3236 removes them before the aligner
+ever sees them.
+
+
+# The filter waterfall
+
+```{r waterfall}
+# the order classify_clips() applies them in: each clip is counted once, under the first reason it
+# met, so the columns sum to every soft-clipped read in the scan window
+class_order <- c("anchor not at the junction", "vector (5' LTR to psi)", "polyA tail",
+                 "no cell barcode or UMI", "clip too short to place", "assign", "discovery")
+
+waterfall %>%
+  dplyr::mutate(class = factor(class, levels = class_order)) %>%
+  dplyr::arrange(class) %>%
+  tidyr::pivot_wider(names_from = tube, values_from = reads, values_fill = 0) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", scrollX = TRUE))
+```
+
+Three of those discards deserve comment.
+
+**Vector (5′ LTR → ψ).** The plasmid's two LTRs are byte-identical over all 181 bases, and the contig
+deliberately keeps only one copy so that reads landing in the LTR do not multi-map. The side effect is
+that a molecule spanning the **5′** LTR's junction with ψ presents a left arm matching the contig's 3′
+terminus perfectly — so it is placed at 3236, with MAPQ 255, and clips into vector sequence. It is
+structurally indistinguishable from a host junction. No MAPQ or coverage filter sees it, because the
+anchor genuinely *is* a unique alignment; only the sequence of the clip gives it away. This filter is
+load-bearing, not cosmetic.
+
+**polyA.** A small number of polyA clips occur at the junction too, from internal priming.
+
+**Clip too short to place.** Discussed next.
+
+
+# Clip length: how much host sequence is enough
+
+The clip is host genome, so its length is exactly how much flanking sequence the read delivered. Too
+short and it cannot be placed uniquely in a 2.7 Gb genome; the information-theoretic floor is about 16
+bases, and in practice mismatches and repeats push the usable threshold higher.
+
+### Four numbers, three tiers — which is which
+
+Three different length floors are live in this analysis and a fourth is historical. They are not
+alternatives and carrying one into another tier is the single most expensive mistake this pipeline
+has made, twice: `-T 30` voided a 25 bp floor and `-T 12` voided an 8 bp one, both silently. Each
+number belongs to a tier, and the tier is what sets it, because the prior odds differ by six orders
+of magnitude.
+
+| number | tier | what is being searched | why that number |
+|---|---|---|---|
+| **25 bp** `min_discovery` | 3′ discovery | **2.7 Gb** of genome, no prior | long enough for bwa to place uniquely; 86 of 974 clips still land at MAPQ 0 |
+| **13 bp** `min_genomic` | genome-mapped channel | **one position** in a read already placed at MAPQ 255 | an exact match to the provirus terminus, as a confirmation on a read the aligner has already located — not a placement |
+| **6 bp** `min_assign` | assignment | **~3.6 kb** of called flanks, and one accepted offset in each | measured per base against `r scales::comma(IS_DEFAULTS$n_decoy)` decoy flanks. Not "clean from 6 bp up" — that was the 100-flank result and an absence of evidence; at 1,000 the rate is measured and agrees with the analytic 4⁻ᴸ prediction |
+| **15 bp** `exact_below` | assignment | — | not a length floor but its companion: beneath it a clip must match **exactly**, because the `L %/% 10` budget allows one mismatch and that is what the decoys catch |
+| ~~8 bp~~, ~~10 bp~~ | — | — | superseded, each for a different reason. 8 came from the wild-type tubes being empty, which bounds cross-tube hopping and not within-tube chance matching — the wrong instrument. 10 came from the right instrument read at the wrong resolution: decoy hits in coarse bands with a mismatch allowed |
+
+**Do not carry 6 bp into discovery.** A 6 bp query matches somewhere in 2.7 Gb roughly every 4 kb. It
+is safe for assignment only because assignment is not a search: the flank set is ~3.6 kb, the clip
+must land on one exact offset, and the decoys measure what that costs. 13 bp is not a discovery floor
+either — it is a confirmation on a read whose coordinate came from 120–140 bases of host.
+
+### Where the assignment floor is, and how it was measured
+
+`min_assign` is **6**, with exact matching required beneath 15 bases. Both numbers come from one
+measurement, computed each run rather than quoted: `clip_table.csv.gz` carries every clip against
+every flank at every mismatch count with **no floor**, so the question can be asked one base at a
+time. The `r scales::comma(IS_DEFAULTS$n_decoy)` decoy flanks are the instrument — a decoy has no junction, so a decoy match at a given
+length *is* the chance rate at that length — and decoys can be cut at will, so there is no
+sample-size limit.
+
+```{r floor-curve}
+readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = FALSE) |>
+  dplyr::filter(clip_len <= 20) |>
+  dplyr::transmute(`clip length` = clip_len, molecules,
+                   `one site, exact` = unique_exact, `>1 site, exact` = ambiguous_exact,
+                   `hit a decoy, exact` = decoy_exact,
+                   `hit a decoy, with the budget` = decoy_budget,
+                   `floor` = ifelse(at_or_above_floor, "in", "out"),
+                   `exact required` = ifelse(exact_required, "yes", "no")) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 20, scrollX = TRUE)) |>
+  DT::formatStyle("hit a decoy, exact", target = "row",
+                  backgroundColor = DT::styleInterval(0, c("#e8f5e9", "#fde8e8")))
+```
+
+```{r floor-plot}
+#| fig-cap: "Why the floor is 6 bp. Left: with 1,000 decoy flanks, observed chance matching tracks
+#|   the 4^-L prediction - 15 hits against 13.5 at 6 bp - so the rate is measured rather than
+#|   assumed. Right: that same rate applied to the real flanks, which is what a spurious
+#|   assignment would have to match: 0.31 expected across every accepted length. Shaded is accepted."
+#| fig-width: 8
+#| fig-height: 3.8
+
+fc <- readr::read_csv(file.path(sites_dir, "clip_floor_curve.csv"), show_col_types = FALSE) |>
+  dplyr::filter(clip_len <= 12)
+
+# Okabe-Ito pair, checked rather than assumed: OKLab dE 31.2 normal, 28.1 deuteranopia,
+# 21.9 protanopia, against thresholds of 15 and 8.
+pal <- c(observed = "#D55E00", `expected by chance` = "#0072B2")
+
+floor_long <- dplyr::bind_rows(
+  dplyr::transmute(fc, clip_len, panel = paste0("chance matching, measured (", IS_DEFAULTS$n_decoy, " decoys)"),
+                   series = "observed", n = decoy_exact),
+  dplyr::transmute(fc, clip_len, panel = paste0("chance matching, measured (", IS_DEFAULTS$n_decoy, " decoys)"),
+                   series = "expected by chance", n = expected_decoy),
+  dplyr::transmute(fc, clip_len, panel = "expected spurious assignments (real flanks)",
+                   series = "expected by chance", n = expected_spurious))
+
+ggplot(floor_long, aes(clip_len, n, colour = series)) +
+  annotate("rect", xmin = IS_DEFAULTS$assign_floor$min_len - 0.5, xmax = 12.5, ymin = -Inf, ymax = Inf,
+           fill = "grey92", colour = NA) +
+  geom_vline(xintercept = IS_DEFAULTS$assign_floor$min_len - 0.5, colour = "grey55", linewidth = 0.4) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.2, stroke = 0) +
+  scale_colour_manual(values = pal, name = NULL) +
+  scale_x_continuous(breaks = seq(2, 12, 2)) +
+  facet_wrap(~ panel, scales = "free_y") +
+  labs(x = "clip length (bases)", y = "molecules",
+       title = paste0("The assignment floor at ", IS_DEFAULTS$assign_floor$min_len,
+                      " bp: chance matching is measured, and it costs 0.3 assignments")) +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+        legend.position = "bottom", plot.title = element_text(size = 11),
+        strip.text = element_text(size = 9))
+```
+
+**`n_decoy` is 1,000, and it had to be.** At 100 decoy flanks this curve showed **zero** hits at 6 bp
+and that looked like a clean result. It was an absence of evidence: with 100 flanks chance alone
+predicts only 1.67 hits across the 35 molecules at that length, so a zero carries *p* = 0.19 and
+resolves nothing. Raising the decoy set tenfold costs about a ninefold slower matching step — 14
+minutes rather than 2 for `sites` plus `assign` — and buys the measurement:
+
+| clip length | molecules | decoy hits | predicted by chance |
+|---|---|---|---|
+| 5 bp | 9 | 8 | 7.7 |
+| **6 bp** | **35** | **15** | **13.5** |
+| 7 bp | 29 | 1 | 3.3 |
+| 8 bp | 8 | 0 | 0.2 |
+
+**Chance matching at 6 bp is real, measured, and matches theory to 11%** — 15 observed against 13.5
+predicted. It was simply invisible at 100 flanks. That is the left panel, and it is a validation of
+the 4⁻ᴸ rate rather than an argument about the floor.
+
+**The floor rests on the right panel instead**, which applies that validated rate to the flank set
+that actually matters: the **15 real** flanks, not the 1,000 decoys. A clip only causes harm if it
+matches a *wrong real* site.
+
+| clip length | molecules | chance vs the real flanks | expected spurious |
+|---|---|---|---|
+| 4 bp | 17 | 11.1% | 1.89 |
+| 5 bp | 9 | 2.9% | 0.26 |
+| **6 bp** | **35** | **0.73%** | **0.26** |
+| 7 bp | 29 | 0.18% | 0.05 |
+| 8 bp + | 850 | ≤ 0.05% | 0.01 |
+
+**Read the total as a count, not a rate.** Across every accepted length — 931 molecules — **0.31
+spurious assignments are expected, against `r scales::comma(nrow(assign))` real ones.** Chance
+matching is uniform per flank, so those events distribute evenly across the
+`r nrow(sites)` sites: **`r sprintf("%.2f", sum(fcur$expected_spurious[fcur$at_or_above_floor]) / nrow(sites))` per site**. For IS01 at 318
+cells that is nothing; for IS06 or IS08 at 10 cells it is 0.2% of the clone. It changes no clone
+size, no interval, no figure and no conclusion in this report.
+
+Two percentages were tempting here and both invite overreading. "0.03% of accepted molecules" makes
+it sound safer than any measurement could establish; "1.0% of the 25 assignments the 6 bp band adds"
+makes it sound like a tolerance being brushed, when a rate on a denominator of 25 is not a tolerance
+test at all — it is 0.26 events. **The general rule, since this will recur: a marginal error rate is
+the right frame when the increment will be interpreted on its own, and an absolute count is the right
+frame when it will be pooled.** Nothing in this analysis interprets the 6 bp band separately.
+
+Dropping to 5 bp would roughly double the total to 0.57 and 4 bp would take it to 2.5. One honest
+wrinkle: at 9 and 10 bp a single decoy hit appears where chance predicts ~0.1, the same
+non-uniformity of real genomic sequence that makes short clips match a little more often than 4⁻ᴸ
+implies. It does not move the total, and it is why the analytic rate is validated against decoys
+rather than trusted on its own.
+
+**And here is the fact the floor actually rests on.** Under the `L %/% 10` mismatch budget, **21 of
+those 35 molecules at 6 bp match a decoy flank — a 60% error rate.** Under exact matching, the rate is
+the 0.73% above. A 6-base clip allowed one mismatch matches most of a decoy set, so `min_len = 6`
+without `exact_below` would be far worse than leaving the floor at 10. That coupling is the whole
+case for the current setting, and it is why the two numbers are stored as a single `assign_floor`
+policy with a load-time assertion rather than as two constants a reader is asked not to separate.
+
+**What the change cost and bought.** Against the previous rule — floor 10, budget throughout — the
+new rule gains **57** three-prime assignments and loses **5**:
+
+| | clip lengths | assignments |
+|---|---|---|
+| gained, newly above the floor | 6, 7, 8, 9 bp | 25, 20, 4, 8 |
+| **lost**, now rejected for carrying a mismatch | 10, 11, 12 bp | 1, 1, 3 |
+
+The five losses are the point rather than a regret: they are assignments that previously rested on a
+mismatch at a length where the decoys say a mismatch is unsafe. Net across both channels, with the
+called-cell filter applied at the same time, the table moves from 1,213 assignments over 1,186 cells
+to **`r scales::comma(nrow(assign))` over `r scales::comma(dplyr::n_distinct(paste(assign$tube, assign$barcode)))`**.
+
+**A second instrument exists and does not decide this.** Because every site belongs to one mouse,
+a clip assigned to a site in the *wrong* mouse is a detectable error on real reads. It agrees with
+the decoys at the current floor, but it cannot set one — it measures chance matching plus hashtag
+error plus doublets, and it has 8% power against a 1% error rate at the band that matters. It needs
+the hashtag calls, so it is computed further down, under *Cells carrying more than one site*.
+
+#### How much ambiguity there is to resolve, which bounds everything above
+
+One number sizes the whole question. Across the entire dataset, **25 molecules match more than one
+called site exactly** — and every one of them has a clip of 1 or 2 bases. At 6 bp and above, every
+molecule that matches a site matches exactly one. There is no ambiguity above 2 bp for any
+tie-breaking rule to work on.
+
+That bounds the most attractive idea for breaking the ties, too. Because every site belongs to one
+mouse and each cell's hashtag names its mouse, the candidate sites for a cell can be restricted from
+all of them to the 2–7 in its own mouse (B0301 holds 2, B0304 6, B0303 7). Applied to those 25
+molecules it resolves **8** of them to a single site, leaves 13 still ambiguous, and finds no hashtag
+call for 4. So it works, it is free, and it operates on eight molecules at clip lengths that should
+not be used anyway. Worth knowing before building anything on it.
+
+Its companion instrument, the labelled validation set, is thinner still: 573 cells carry a ≥20 bp
+clip and 151 carry a sub-floor clip, but only **27 carry both**. That is enough to catch a gross
+disagreement and nothing finer, because sub-floor molecules come one to a cell — all 151 of them, in
+151 different cells. **No cell in this data carries two sub-floor molecules**, which also retires the
+idea of aggregating several short clips within a cell into one confident call: it has no instances
+here. At λ ≈ 0.3–0.7 you do not get two attempts at the same cell. The exception is instructive:
+IS05, at 2.75 molecules a cell, is the one site where within-cell replication exists at all.
+
+```{r clip-length}
+junction_clips <- anchor_ends %>%
+  dplyr::filter(anchor_end == JUNCTION, !polya)
+
+ggplot(junction_clips, aes(clip_len, weight = reads)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", colour = "white") +
+  geom_vline(xintercept = MIN_ASSIGN, linetype = "dashed", colour = "grey30") +
+  geom_vline(xintercept = MIN_DISC, linetype = "dashed", colour = "firebrick") +
+  labs(x = "clip length (bases of host sequence)", y = "reads",
+       title = "How much host sequence the read-through reads deliver",
+       subtitle = sprintf("dashed grey = assignment threshold (%d); dashed red = discovery threshold (%d)",
+                          MIN_ASSIGN, MIN_DISC))
+```
+
+Rather than pick one threshold, the pipeline asks two different questions and gives each its own.
+
+| tier | clip | searched against | asks |
+|---|---|---|---|
+| discovery | ≥ `r MIN_DISC` bp | the whole genome, 2.7 Gb | is there an integration *anywhere*? |
+| assignment | ≥ `r MIN_ASSIGN` bp | the called flanks, a few kb | does this clip match a site *already found*? |
+
+Those are not the same question, and treating them as one is what the old single threshold did.
+Discovery must survive 2.7 Gb of alternatives, so it needs a clip long enough to be unique there.
+Assignment only has to choose among a handful of known flanks — **and the clip must land on the
+junction base exactly**, not merely somewhere in the flank. That positional constraint is the real
+discriminator, and it is strong enough that a 6 bp clip is decisive: it has 400 places to land in
+each flank and one is accepted. The floor is 6, set from the per-base decoy curve below, and only in
+company with exact matching beneath 15 bases — under the mismatch budget a 6 bp clip matches most of
+a decoy set.
+
+The evidence that this is safe rather than merely generous is the control: 28,010 cells across the
+wild-type tubes that never saw the vector. Dropping the threshold from 25 to 10 raises labelled
+cells by about two thirds and leaves them at zero.
+
+They are no longer at exactly zero, and the events are worth running down rather than rounding away,
+because the UMIs identify what each one is. Four junction-bearing barcodes sit in wild-type tubes —
+two in Rx_1 and two in Rx_5 — and the called-cell filter is what separates them:
+
+- **The Rx_5 pair are not cells**, and one of them is **index hopping, demonstrated rather than
+  inferred**: the read carries 121 bases of host at MAPQ 255, and its UMI `AGGCGGTTGTGT` appears at
+  the same junction base in **Rx_6**, as does its barcode. One molecule from one cell, read out under
+  two sample indices. Both Rx_5 barcodes are absent from Cell Ranger's filtered list, so the
+  called-cell filter removes them — which is the right outcome and also a check on it: the one
+  provable hopping event in the data landed in an empty droplet, not in a cell.
+- **One Rx_1 barcode is a called cell**, and it survives. Its 32-base clip carries UMI
+  `AGGGGTTACCAG`, which appears in no other tube, and neither does its barcode. A single read with no
+  second-index twin is either genuine carry-over of a cell or a chance match; one read cannot
+  distinguish them.
+
+So among called cells the cross-tube rate is **1 in `r scales::comma(nrow(assign))`**, and that one event is unexplained rather
+than demonstrated. The demonstrable hopping is in the ambient fraction, where it does no harm.
+That is what the wild-type tubes were included to supply, and it is a tighter answer than a
+percentage.
+
+```{r tier-contribution}
+summary_tbl %>% DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12))
+```
+
+
+# The sites
+
+```{r site-table}
+sites %>%
+  DT::datatable(rownames = FALSE, filter = "top",
+                options = list(pageLength = 20, scrollX = TRUE)) %>%
+  DT::formatStyle("cells", fontWeight = "bold")
+```
+
+```{r site-map}
+#| fig-cap: "The called sites in genomic coordinates. Point area is cells carrying the site;
+#|   colour is which channel called it; an open point is a site no single discovery channel supports
+#|   on its own (tier D), which should be excluded from repertoire counts."
+#| fig-width: 7.5
+#| fig-height: 4.6
+
+# Evidence tier as identity, in a fixed order - these categories mean the same thing in every figure,
+# so the hues are assigned to the category and not to its rank in this run's table. Okabe-Ito, which
+# is CVD-safe; the fourth entry is for the TSD-rescued site added by rule C'.
+tier_pal <- c(`both channels` = "#0072B2", `genomic channel only` = "#D55E00",
+              `pooled only` = "#009E73", `TSD-rescued` = "#CC79A7")
+
+site_map <- sites |>
+  dplyr::mutate(
+    chrom = factor(chrom, levels = rev(c(paste0("chr", c(1:19, "X")),
+                                         setdiff(unique(chrom), paste0("chr", c(1:19, "X")))))),
+    mb = pos / 1e6,
+    # The open-point category is "no single discovery channel called it", which is pooled_only OR
+    # tsd_rescued. Keying it on pooled_only alone drew IS16 as a filled point, i.e. as well supported
+    # as IS02 - exactly the distinction this shape exists to make.
+    weakest = pooled_only | tsd_rescued,
+    tier = factor(called_by, levels = names(tier_pal)))
+
+ggplot(site_map, aes(mb, chrom, colour = tier)) +
+  geom_point(aes(size = cells, shape = weakest), stroke = 0.9, fill = NA) +
+  ggrepel::geom_text_repel(aes(label = site_id), size = 3, min.segment.length = 0.2,
+                           seed = 1, show.legend = FALSE, colour = "grey20") +
+  scale_shape_manual(values = c(`FALSE` = 19, `TRUE` = 1), guide = "none") +
+  scale_colour_manual(values = tier_pal, name = NULL) +
+  scale_size_area(max_size = 9, breaks = c(10, 100, 300), name = "cells") +
+  labs(x = "position (Mb)", y = NULL,
+       title = "Called integration sites by genomic position") +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_line(colour = "grey93"),
+        legend.position = "bottom", legend.box = "horizontal",
+        plot.title = element_text(size = 11))
+```
+
+### What each channel contributes
+
+The channels do not contribute equally to that list. Run each one's reads
+through the same site caller on its own:
+
+Running each channel's reads through the same site caller alone gives 9 sites from the 3′ channel
+and 13 from the genome-mapped one — which recovers **every** site the 3′ channel finds, the 3′-only
+column being empty, and adds four of its own. That leaves 9 + 4 = 13 against a pooled call of 15, so
+the arithmetic needs a third category rather than a sentence. `site_provenance()` records it per site:
+
+```{r called-by}
+sites |>
+  dplyr::group_by(`called by` = called_by) |>
+  dplyr::summarise(sites = dplyr::n(),
+                   which = paste(sort(site_id), collapse = ", "), .groups = "drop") |>
+  dplyr::arrange(dplyr::desc(sites)) |>
+  knitr::kable()
+```
+
+**IS14 and IS15 clear the cell floor only on the two channels' reads summed** — neither channel
+reaches `min_cells` at either locus alone. That is legitimate evidence and it is also the weakest
+evidence in the set, so they are flagged `pooled_only` in the site table. They are the same two
+sites the mini-reference gate holds out for lacking 5′ confirmation, which is not a coincidence:
+nothing independent vouches for either. **Exclude them from any repertoire count, diversity
+statistic or denominator** until a second line of evidence arrives.
+
+### The count, and the four tiers it collapses
+
+A site count is not one claim. A site can rest on two independent
+channels *and* a sequence-verified target-site duplication, or on one channel, or only on reads that
+no single channel could call alone — and a single integer hides which. This report has quoted 15, 13
+and 12 at various points, each correct under a caveat stated somewhere else. `evidence_tier` makes
+the caveat part of the number:
+
+```{r evidence-tiers}
+ev |>
+  dplyr::group_by(tier = evidence_tier) |>
+  dplyr::summarise(sites = dplyr::n(),
+                   cells = sum(cells),
+                   which = paste(site_id, collapse = ", "), .groups = "drop") |>
+  knitr::kable()
+```
+
+`flank_gated` is orthogonal to the tier and stays its own column: it disqualifies a site from
+*quantification* without disputing that the site is there. IS07 is tier B and gated, which is why the
+defensible count is 12 rather than 13. **The usable form of the count is "16 across four tiers, 12 at
+tiers A–C less the flank-gated IS07".**
+
+Per assignment the same argument applies, and the same fix. A cell placed by ~130 bases of host
+sequence at MAPQ 255 and a cell placed by a 6-base exact match against a known flank are both one row
+in `cell_site_assignments.csv`:
+
+```{r assignment-tiers}
+assign |>
+  dplyr::count(`assignment tier` = assignment_tier, name = "assignments") |>
+  dplyr::mutate(share = sprintf("%.1f%%", 100 * assignments / sum(assignments))) |>
+  knitr::kable()
+```
+
+### Rule C′, which now promotes nothing
+
+IS16 at `chrX:100,691,113` was admitted by a rule rather than by a judgement, and the rule is set out
+here because an earlier draft of this report proposed promoting the locus by hand — and because at
+the current floor **the rule fires on nothing at all**. chrX clears
+`r sprintf("\u2265%d cells", IS_DEFAULTS$min_cells)` on its own, so C′ has no work to do. A safeguard
+with zero current effect is the right state for one; it is kept, with its price measured, against the
+next run.
+
+When the floor was at three cells the problem was real. The floor is applied **within** a discovery
+channel, chrX reached only 2 cells in the 3′ channel and nothing in the genome-mapped one, so it
+failed — while IS14 and IS15, which reach 3 cells on the two discovery channels *summed*, passed. The
+tempting fix, pooling all three channels, is wrong: the largest 5′ orphan in this dataset is the chr19
+*Hells* fusion at 14 cells, and a pooled-across-everything floor would admit it as a site larger than
+six real ones. **The 5′ channel cannot be trusted to call on its own.**
+
+What it can be trusted to do is corroborate. Rule C′ admits a sub-floor cluster if and only if a 5′
+junction supplies a 3′ partner at signed Δ = ±`expect` **whose sign agrees with the 3′ alignment's
+strand**, and the pooled count then reaches the floor. The warrant is not that this rejects the
+*Hells* fusion — that is a consequence of the rule, not its basis — but that a target-site
+duplication is a signature of integrase 3′ processing and of nothing else: the enzyme cuts the two
+host strands with a 5 bp stagger, so the two junctions of one provirus must be 4 bp apart *and* on
+the orientation that stagger implies. Splicing, mismapping and chimeric reads can each place two
+features 4 bp apart; none can make the sign agree.
+
+And the specificity is computable rather than asserted:
+
+```{r tsd-chance}
+chance <- readr::read_csv(file.path(sites_dir, "tsd_chance_rate.csv"), show_col_types = FALSE)
+chance |>
+  dplyr::transmute(
+    `Δ (bp)` = expect_bp, `tolerance` = tolerance_bp,
+    `accepting window` = sprintf("%d bp (one side; strand fixes which)", accepting_width),
+    `genome` = sprintf("%.2f Gb", genome_bases / 1e9),
+    `discovery clusters` = discovery_clusters,
+    `orphans tested` = candidates_tested,
+    `expected by chance` = sprintf("%.2g", expected_chance_rescues)) |>
+  knitr::kable()
+```
+
+One match against an expectation of 2 × 10⁻⁷ is evidence; the same match with no denominator is an
+anecdote. Two caveats on that number, both of which leave the decision where it is.
+
+**The genome-wide density is the wrong one.** Lentivirus prefers transcribed gene bodies, and both
+the 5′ orphans and the clusters they are tested against live there, so the effective density is
+higher than 28 clusters over 2.73 Gb. Computed rather than estimated — the union of protein-coding
+gene bodies in this reference is 1.04 Gb, 38% of it — the rate rises by ×2.6 to
+**`r sprintf("%.2g", chance$expected_chance_rescues_footprint)`**. It had been put at "5–10× higher,
+so ~10⁻⁶" from intuition; gene bodies are too large a share of the mouse genome for that.
+
+**And the sequence check is not independent evidence, which was claimed here and is withdrawn.**
+`tsd_obs = 1` says the duplicated span appears in every 5′ read at the locus — but those reads
+*align* to that span, so their bases match the reference there by construction of a clean alignment.
+That leg carries almost nothing. The informative form is three-way, comparing the 5′ clip's host
+tail, the 3′ clip's host head and the reference, and it is now computed:
+
+```{r tsd-three-way}
+three <- read_bwa_hits(file.path(sites_dir, "work", "discovery.sam"), channel = "three_prime")
+five  <- read_bwa_hits(file.path(sites_dir, "work", "five_prime.sam"), channel = "five_prime")
+tw <- tsd_three_way(sites, five, three, file.path(Sys.getenv(
+  "CR_REF",
+  "/well/ludwig/users/nrs939/data_hub/10x_resources/reference_genomes/modified/GRCm39-2024-A_LeGO_SFFV_mCherry_DRE"),
+  "fasta", "genome.fa"))
+tw |>
+  dplyr::filter(!is.na(pos_5p)) |>
+  dplyr::transmute(site_id, chrom, pos_3p, pos_5p, delta,
+                   reference = ref_span, `5′ clip tail` = five_span,
+                   `3′ clip head` = three_span,
+                   `reads 5′ / 3′` = sprintf("%d / %d", n_five, n_three),
+                   `all three agree` = ifelse(is.na(three_way), "—",
+                                              ifelse(three_way, "yes", "**NO**"))) |>
+  knitr::kable()
+```
+
+Even this is a check on the pipeline rather than evidence about biology, and the distinction matters:
+both clips align to the same reference span, so both matching it is guaranteed by their alignments,
+and their agreement with each other is the Δ = 4 relationship restated in bases. What it does catch
+is a class of bug this analysis has had three times — an off-by-one in either channel, a 0- versus
+1-based slip, or the wrong end of a minus-strand alignment — because a mis-derived coordinate in
+either channel makes the two observed strings disagree. **The evidence that an integrase made these
+two junctions is the coordinate relationship and its chance rate, and nothing in the sequence adds
+to it.**
+
+**IS16 is still not defensible, and this is where the floor change exposed a gap.** Once chrX cleared
+the floor directly, every flag that had excluded it switched off: not `pooled_only`, not
+`tsd_rescued`, not `flank_gated`. It became defensible because the *threshold* moved, which is a bad
+reason — its three cells are all replicate B0301 against that replicate's 46.8% share of called cells
+in those tubes, *p* = 0.10, and three cells establish nothing.
+
+The floor had been standing in for a clonality criterion nobody had written down. So `defensible` now
+requires one, using the instrument this analysis already had: a clone arises once, in one cell, in one
+animal, so its cells must be confined to one replicate beyond chance. `defensible` requires
+*p* < 0.05 from `replicate_confinement()`. It costs nothing where it matters — every other defensible
+site passes, IS13 at *p* = 2.8 × 10⁻⁵ on 7 of 7 cells — and it removes exactly the site that should
+never have been admitted. **`defensible` is now a statement about the evidence rather than about the
+threshold, and it does not move when the threshold does.**
+
+The largest addition is not marginal. **IS10, `chr13:5,676,485`, is the fifth largest clone in the
+experiment at 99 cells, and the 3′ channel cannot see it at all.** Not for want of reads: three
+discovery clips of 44–49 bases end at exactly 5,676,485, the called junction base, with no
+mismatches. All three align at **MAPQ 0**. The host sequence immediately 3′ of that junction is
+repetitive, so a 44-base clip has nowhere unique to go, and the `MAPQ ≥ 30` filter — which is the
+only thing standing between discovery and the genome's repeats — discards them. The genome-mapped
+reads at the same junction carry 120–140 bases of host and land at MAPQ 255. Same locus, same
+junction base, same cells; the difference is entirely how much host each read brought with it.
+
+Across the whole 3′ channel, 86 of 974 discovery clips (8.8%) sit at MAPQ 0. That is the size of the
+blind spot, and IS10 is what it was hiding.
+
+### Site labels are pinned, not ranked
+
+`IS01`–`IS15` are pinned to loci by [`metadata/integration_site_registry.csv`](../../metadata/integration_site_registry.csv),
+and the table above is *sorted* by size without being *numbered* by it.
+
+This is a correction, not a convenience. The labels used to be ranks, so when the genome-mapped
+channel joined discovery and `chr9:53,079,916` overtook `chr13:83,681,311` on cell count, `IS01`
+through `IS04` all moved — every sentence in this report that named a site silently came to mean a
+different site. A rank is not an identity. The registry pins a locus to its number permanently, gives
+a newly discovered locus the lowest number never yet used, and is tracked in git, unlike anything
+under `output/`. Its first nine rows were seeded by hand with the numbering this report was already
+written against, so `IS01`–`IS09` mean what they have always meant and the six sites the
+genome-mapped channel added are `IS10`–`IS15`.
+
+### Three sites the assignment step is forbidden to use
+
+Three rows are held out of the mini-reference, and the table below marks them. They are shown rather
+than quietly dropped, because a site discovery found and assignment was then not allowed to touch is
+a different thing from a site that was never there.
+
+Cell assignment works by matching clips against the flanks of the called sites (see the tier table
+above), so a flank has to be distinctive enough to match *against*. A flank containing a long
+homopolymer is not: it attracts clips that belong nowhere in particular. IS07 is held out for that.
+IS14 and IS15 are held out for the other reason the gate exists — both sit at the cell floor with no
+5′ junction to vouch for them, so there is nothing to distinguish them from the background they were
+called out of.
+
+None of the three reports zero cells any more, and the reason matters. The genome-mapped channel
+assigns a cell by reading 120–140 bases of host at MAPQ 255, not by matching a short clip against a
+flank, so the mini-reference gate has no purchase on it: IS07 keeps 3 cells, IS14 and IS15 keep 2
+each. That is the right outcome rather than a leak — the hazard the gate exists to stop is a bad
+flank *attracting* clips, and a channel that never consults the flank cannot be fooled by it — but it
+does mean the gate no longer caps a site's count, only its assignment-tier count. A site whose flank
+cannot support quantification can still accumulate cells here, and for IS07 all three of them sit in
+the mCherry⁻ fractions, exactly where the argument below says a real site should not be.
+
+```{r low-complexity}
+# longest run of one base in each site's flank, the quantity the pipeline gates on
+flank_fa <- file.path(sites_dir, "work", "site_flanks.fa")
+kept     <- if (file.exists(flank_fa)) {
+  sub("\\|.*", "", grep("^>", readLines(flank_fa), value = TRUE)) |> sub(pattern = "^>", replacement = "")
+} else character(0)
+
+sites |>
+  dplyr::transmute(site_id, chrom, pos, cells,
+                   `in the mini-reference` = ifelse(site_id %in% kept, "yes", "NO - gated")) |>
+  dplyr::arrange(`in the mini-reference`, dplyr::desc(cells)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12)) |>
+  DT::formatStyle("in the mini-reference", target = "row",
+                  backgroundColor = DT::styleEqual("NO - gated", "#fde8e8"))
+```
+
+The homopolymer-gated site is `JH584304.1:35,417` (IS07), on an unplaced scaffold, whose flank
+carries a **23-base homopolymer** against 5–6 for every other site. Three independent things said it
+was not real before the gate existed:
+
+- it had **zero** cells in both high-signal tubes while carrying 14 in the mCherry⁻ fractions — a
+  real site appearing only where there is least vector is backwards. It still does: its three
+  surviving cells are 2 in Rx_3 and 1 in Rx_7, and none anywhere else
+- it has no 5′ junction, so the target-site duplication check cannot support it
+- when the assignment threshold was lowered it gained **4.7×** more cells, against 1.6× for genuine
+  sites: it was absorbing the extra sensitivity rather than benefiting from it
+
+It therefore appears in the legend of every figure below with no points against it.
+
+#### Why it is shown rather than dropped
+
+The two stages ask different questions, and a site can pass one and fail the other without either
+being a mistake.
+
+| | asks | about | verdict on IS07 |
+|---|---|---|---|
+| discovery | does this ≥25 bp clip place uniquely in 2.7 Gb? | the **clip** | yes — 3 clips at MAPQ ≥ 30 |
+| assignment | can this flank tell apart clips that belong to it from clips that do not? | the **locus** | no — the homopolymer |
+
+The evidence is also partly independent: discovery's verdict comes from the read, assignment's from
+the reference sequence around the site. So the gate never disputes that those three clips aligned
+where they did. Its claim is narrower, and worth stating precisely: **this flank cannot support
+quantification**. Not *no provirus is there* — unmeasurable, not false. The 4.7× inflation is that
+claim measured directly.
+
+That distinction decides what happens next. If a bulk integration-site assay on the same genomic DNA
+ever gives an independently derived site list, `JH584304.1:35,417` is precisely the call it would
+adjudicate.
+
+Three reasons to leave the disagreement visible:
+
+- **It localises the problem.** Agreement between the stages gives two kinds of support;
+  disagreement says *where* the trouble is. Here it was the locus's sequence rather than the reads,
+  which is what pointed at the homopolymer in the first place.
+- **It measures a limit of the method.** The pipeline can call sites it cannot then quantify. A
+  reader shown eight clean sites has no way to know that failure mode exists, or how one is handled.
+- **It is a standing check on the gate.** `max_homopolymer` is a threshold chosen from a single
+  example. Keeping the gated case in view means a future run producing a similar site that is *not*
+  caught would be noticeable.
+
+One detail sharpens all of this. Discovery's call was marginal to begin with: **3 clips, 3 cells,
+against a floor of exactly 3** — and all three came from Rx_3 and Rx_7, the mCherry⁻ fractions, with
+none from the two high-signal tubes. So this is not two confident stages contradicting each other.
+It is a borderline call, admitted by a threshold with zero margin, that a second and independent
+criterion then rejected, with the tube distribution agreeing. That is the system working rather than
+an awkward edge case — and it is the clearest illustration of what the cell floor lets through
+at its boundary.
+
+```{r site-plot, fig.height=5}
+cells_long <- sites %>%
+  dplyr::select(site_id, gene, context, dplyr::starts_with("cells_")) %>%
+  tidyr::pivot_longer(dplyr::starts_with("cells_"),
+                      names_to = "tube", values_to = "cells",
+                      names_prefix = "cells_") %>%
+  dplyr::filter(cells > 0) %>%
+  dplyr::mutate(label = ifelse(is.na(gene) | gene == "",
+                               site_id, paste0(site_id, " · ", gene)))
+
+ggplot(cells_long, aes(reorder(label, cells, sum), cells, fill = tube)) +
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL, y = "cells carrying the junction", fill = "tube",
+       title = "Integration sites by the number of cells supporting them")
+```
+
+### What the floor admits, and what it turns away
+
+The floor is **`r sprintf("≥%d cells and ≥%d UMIs", IS_DEFAULTS$min_cells, IS_DEFAULTS$min_umis)`**,
+and nothing below depends on those numbers being what they are — the text reads them from
+`IS_DEFAULTS` and the figures from `site_floor_curve.csv`, so the section argues the choice rather
+than asserting it. It was `≥3 and ≥3` until the trade-off was measured, and two things came out of
+measuring it.
+
+**First, the floor was counting the wrong thing.** A junction read carries whatever barcode its
+droplet had, while the cell table, the clone sizes, the detection model and every completeness figure
+restrict to Cell Ranger's *called* barcodes. So the threshold was applied to one quantity and read as
+another, and a cluster could clear a two-cell floor on one real cell plus one empty droplet. Three of
+the four positions a relaxed floor first admitted did exactly that — they arrived in the site table
+with one cell, and one with none. `cluster_support.csv` now reports `cells` (called) beside
+`barcodes` (every droplet), so the gap is visible in a column:
+
+```{r droplet-gap}
+csup <- readr::read_csv(file.path(sites_dir, "cluster_support.csv"), show_col_types = FALSE)
+csup |>
+  dplyr::filter(barcodes > cells) |>
+  dplyr::transmute(chrom, pos, `called cells` = cells, `barcodes` = barcodes,
+                   `droplets that are not cells` = barcodes - cells,
+                   umis, tubes, channels, called) |>
+  dplyr::arrange(dplyr::desc(`droplets that are not cells`)) |>
+  knitr::kable()
+```
+
+**Second, "how many sites" is the gain and not the loss, so the loss needed measuring too.** The
+quality axis is vector transcript: a cell with no vector transcript cannot emit a read-through
+junction, so the share of a cluster's cells carrying any is a direct measure of whether the cluster
+could be what it claims — and it is measured per cell, independently of the junction data that
+produced the cluster.
+
+```{r floor-tradeoff, fig.height=3.8, fig.width=8}
+fgrid <- readr::read_csv(file.path(sites_dir, "site_floor_curve.csv"), show_col_types = FALSE)
+cur_mu <- IS_DEFAULTS$min_umis
+tr <- fgrid |>
+  dplyr::filter(min_umis == cur_mu) |>
+  dplyr::transmute(min_cells,
+                   `sites called` = n_sites,
+                   `mean vector share` = mean_vector_share,
+                   `single-tube sites` = n_single_tube,
+                   is_current) |>
+  tidyr::pivot_longer(c(`sites called`, `mean vector share`, `single-tube sites`))
+
+ggplot(tr, aes(min_cells, value)) +
+  geom_vline(data = dplyr::filter(tr, is_current), aes(xintercept = min_cells),
+             colour = "firebrick", linewidth = 0.7, linetype = "22") +
+  geom_line(linewidth = 0.7, colour = "#0072B2") +
+  geom_point(size = 2, colour = "#0072B2") +
+  facet_wrap(~ name, scales = "free_y", nrow = 1) +
+  scale_x_continuous(breaks = unique(tr$min_cells)) +
+  labs(x = "minimum called cells", y = NULL,
+       title = sprintf("Gain and loss at each floor, at min_umis = %d", cur_mu),
+       subtitle = "dashed red = the floor in use. Left panel is the gain; the other two are the cost") +
+  theme(panel.grid.minor = element_blank(), plot.title = element_text(size = 11),
+        strip.text = element_text(size = 9))
+```
+
+```{r floor-readout}
+#| echo: false
+at <- function(mc, col) fgrid[[col]][fgrid$min_umis == cur_mu & fgrid$min_cells == mc]
+cur <- IS_DEFAULTS$min_cells
+```
+
+**There is no cliff, and relaxing costs nothing measurable.** Going from a three-cell floor to
+`r cur` admits `r at(cur, "n_sites") - at(3L, "n_sites")` more positions, and the mean vector share
+*rises* from `r sprintf("%.2f", at(3L, "mean_vector_share"))` to
+`r sprintf("%.2f", at(cur, "mean_vector_share"))` rather than falling; the number of single-tube
+sites is unchanged at `r at(cur, "n_single_tube")`, and both admissions are seen by both discovery
+channels. Tightening instead to four buys nothing — the count is flat from there on.
+
+The relaxed value is therefore the defensible one, and the evidence tier carries the difference: the
+positions admitted here are tier C and D, none is in the mini-reference, and none is `defensible`.
+**The floor decides how many thin positions get a name, not how many cells get labelled** —
+coverage runs `r scales::comma(max(fgrid$cells_covered))` cells at the most permissive setting
+against `r scales::comma(at(cur, "cells_covered"))` at the one in use.
+
+```{r floor-grid, fig.height=3.6, fig.width=7}
+# The full grid, kept because the one-dimensional view above fixes min_umis. Sequential, one hue
+# light to dark: a magnitude, with the number on every tile, so the fill aids scanning rather than
+# carrying the encoding.
+ggplot(fgrid, aes(factor(min_umis), factor(min_cells))) +
+  geom_tile(aes(fill = n_sites), colour = "white", linewidth = 1) +
+  geom_tile(data = dplyr::filter(fgrid, is_current),
+            fill = NA, colour = "firebrick", linewidth = 1.1) +
+  geom_text(aes(label = n_sites), size = 3.2, colour = "grey15") +
+  scale_fill_gradient(low = "#eef3f8", high = "#9ecae1", guide = "none") +
+  labs(x = "minimum UMIs", y = "minimum called cells",
+       title = "Sites called, by floor",
+       subtitle = sprintf("red outline = the floor in use (%d, %d)",
+                          IS_DEFAULTS$min_cells, IS_DEFAULTS$min_umis)) +
+  theme(panel.grid = element_blank(), aspect.ratio = 1)
+```
+
+Read along the current row and the UMI floor is **implied rather than inert**: two called cells
+cannot share one molecule, so `≥2 UMIs` follows from `≥2 cells` and the only non-trivial setting
+would be 3 — which the data rejects, and for a sharp reason. At `min_umis = 3` the floor admitted the
+*worse* of the two best marginal clusters and rejected the better: `chr11:69,817,658` passes a
+three-UMI floor on ten UMIs concentrated in one cell of one tube, while `chr1:156,241,543` fails it
+on two UMIs spread across two tubes and both channels with **both** of its cells vector-positive. A
+floor selecting molecules-in-one-cell over cells-in-two-tubes is backwards.
+
+### What each orphan 5′ junction turned out to be
+
+A 5′ junction with no called 3′ partner is not a finding, and "real site or artefact?" stood open on
+four of them. `orphan_evidence.csv` decides each from evidence already on disk — the exon
+annotation, the bases beyond the junction, the vector's acceptors, and hashtag identity as an
+instrument independent of every junction.
+
+```{r orphan-evidence}
+readr::read_csv(file.path(sites_dir, "orphan_evidence.csv"), show_col_types = FALSE) %>%
+  dplyr::mutate(replicate_p = signif(replicate_p, 2)) %>%
+  dplyr::select(chrom, pos_5p, pooled_cells, pooled_umis, meets_floor, delta,
+                exon_gene, exon_end_dist, donor, clip_beyond, vector_acceptor,
+                site_in_same_gene, replicate, replicate_p, verdict) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t", scrollX = TRUE))
+```
+
+**`chr19:38,932,385` is not an integration site.** Every prediction of the splicing hypothesis holds:
+the junction is on a *Hells* exon's **last base** rather than near it, the intron after it opens
+`GT`, the bases beyond the junction are the same four in every read that has any — `ATTC`, which is
+not the next *Hells* exon — and the vector contig holds one `AG|ATTC`, an acceptor at position 875.
+IS03 sits **inside that intron**. Hashtag identity settles it: 13 of 13 non-multiplet cells are
+IS03's own mouse, *p* = 3.6 × 10⁻⁶. These reads are a fusion transcript from a provirus already
+called. Only one of those cells is assigned to IS03, so this junction sees cells IS03's own channels
+missed — independent evidence that its per-cell detection is low, consistent with its clone size
+being inestimable.
+
+**Two of those four legs are worth much less than this report previously claimed, and the sum is
+still decisive.** They were presented as "four predictions, all of which held"; two of them hold
+under chance alone.
+
+```{r hells-legs}
+contig_len <- Rsamtools::seqinfo(Rsamtools::FaFile(file.path(Sys.getenv(
+  "CR_REF",
+  "/well/ludwig/users/nrs939/data_hub/10x_resources/reference_genomes/modified/GRCm39-2024-A_LeGO_SFFV_mCherry_DRE"),
+  "fasta", "genome.fa")))@seqlengths[
+    match(IS_DEFAULTS$contig, Rsamtools::seqinfo(Rsamtools::FaFile(file.path(Sys.getenv(
+      "CR_REF",
+      "/well/ludwig/users/nrs939/data_hub/10x_resources/reference_genomes/modified/GRCm39-2024-A_LeGO_SFFV_mCherry_DRE"),
+      "fasta", "genome.fa")))@seqnames)]
+exp_acceptor <- 2 * contig_len * (1 / 4)^6
+
+dplyr::tibble(
+  leg = c("junction on an exon's LAST base",
+          "intron after it begins GT",
+          "one `AG|ATTC` in the vector contig",
+          "IS03 lies inside that same intron",
+          "13/13 non-multiplet cells are IS03's mouse"),
+  `chance of seeing it` = c(
+    "0.28% of the genome lies within 5 bp of an annotated exon end — *p* ≈ 0.003 for one position",
+    "~99% of introns begin GT, so **given** an exon end this is a consistency check, not evidence",
+    sprintf("a 6-mer is expected %.2f times in %s bp (both strands): **P(≥1) = %.2f**",
+            exp_acceptor, scales::comma(contig_len), 1 - exp(-exp_acceptor)),
+    "the intron is 1,449 bp of 2.73 Gb, and IS03 was called independently",
+    "*p* = 3.6 × 10⁻⁶, binomial against B0303's share of called cells in those tubes"),
+  verdict = c("**load-bearing**", "consistency only", "**worth ~nothing**",
+              "**load-bearing**", "**load-bearing**")) |>
+  knitr::kable()
+```
+
+The acceptor leg is a coin flip and was written as though a unique hit were the finding. It also
+cannot be strengthened from this data: all **32** reads at the junction carry exactly **four** bases
+beyond it, every one `ATTC`, and four bases cannot pin an acceptor in a 3.2 kb contig. A read
+reaching ~10 bases into the vector would make the placement unique; none does.
+
+So three legs, not four — **and they are not three independent legs.** The exon boundary and
+IS03-in-the-same-intron are both statements about position within *Hells*, so they share whatever a
+mis-annotation or a mismapping to that locus would produce. The independent leg is hashtag identity,
+and it is also the strongest: 13 of 13 non-multiplet cells are B0303 against that replicate's
+`r sprintf("%.3f", 0.382)` share of called cells in those tubes, *p* = 3.6 × 10⁻⁶. It uses no
+sequence reasoning, no annotation and no alignment coordinate.
+
+### One cell-level check, and it came out the wrong way
+
+Hashtag identity is an *animal*-level argument: it says these cells are B0303's, and IS03 is B0303's
+site. The sharper version is cell-level — are these IS03's *own cells*?
+
+```{r hells-cells}
+fus <- five[five$chrom == "chr19" & abs(five$pos - 38932385) <= IS_DEFAULTS$cluster_window, ]
+fus_cells <- unique(paste0(fus$tube, "_", fus$barcode))
+is03_cells <- unique(paste0(assign$tube, "_", assign$barcode)[assign$site_id == "IS03"])
+any_cells  <- unique(paste0(assign$tube, "_", assign$barcode))
+dplyr::tibble(
+  what = c("cells with a fusion junction", "IS03's called cells",
+           "**overlap**", "fusion cells with ANY site label"),
+  n = c(length(fus_cells), length(is03_cells),
+        sum(fus_cells %in% is03_cells), sum(fus_cells %in% any_cells))) |>
+  knitr::kable()
+```
+
+**`r sum(fus_cells %in% is03_cells)` of `r length(fus_cells)`.** That is not the expected answer and
+it is reported rather than explained. If these reads were transcripts of the IS03 provirus, IS03's
+own channels should have labelled most of the same cells; they labelled one. The reading that fits
+is that the fusion junction *detects cells IS03's own channels missed* — consistent with IS03's
+per-cell detection being low enough that the ZTP will not fit it — but that is an interpretation of
+a 13-cell discrepancy, not a result, and the alternative (that these are B0303 cells carrying
+something else at that locus) is not excluded by anything here.
+
+What it does settle is the narrower question that mattered for the site table: admitting this
+junction as a site would have added a position whose cells are almost entirely *unlabelled*, so it
+would not have double-counted IS03's clone — it would have created an extra clone out of a
+transcript. Either way it is not an integration site.
+
+### Does any site the floor trusts carry the same signature?
+
+The *Hells* fusion was found in the 5′ channel, which never calls. The question that matters for the
+site table is whether the same mechanism is operating in the two channels that **do** call — and it
+had not been asked. Running the exon-boundary test over every discovery cluster, called or not,
+rather than over the one junction that prompted it:
+
+The scan itself returns nothing, and **nothing is the wrong statistic to report**, so both are
+printed: what the scan found, and the measurement that actually carries information.
+
+```{r splice-all}
+cs_splice <- readr::read_csv(file.path(sites_dir, "cluster_support.csv"), show_col_types = FALSE)
+genome_fa_path <- file.path(Sys.getenv(
+  "CR_REF",
+  "/well/ludwig/users/nrs939/data_hub/10x_resources/reference_genomes/modified/GRCm39-2024-A_LeGO_SFFV_mCherry_DRE"),
+  "fasta", "genome.fa")
+spl  <- exon_boundary_context(cs_splice$chrom, cs_splice$pos, gtf_path, genome_fa_path)
+orph <- readr::read_csv(file.path(sites_dir, "orphan_evidence.csv"), show_col_types = FALSE)
+bg   <- 0.0028   # share of the genome within +/-5 bp of an annotated exon end, measured above
+
+dplyr::tibble(
+  measurement = c(
+    "**the underpowered one** — discovery clusters on an exon end with a GT donor, floor not applied",
+    "expected by chance at that many clusters",
+    "**the powered one** — 5′ orphans that are splice artefacts",
+    "chance of ≥1 of those against the same background",
+    "so the 5′ channel's measured splice-contamination rate"),
+  value = c(
+    sprintf("%d of %d", sum(spl$exon_end_dist == 0 & spl$donor == "GT", na.rm = TRUE), nrow(spl)),
+    sprintf("%.2f — a zero here is unremarkable, not reassuring", nrow(spl) * bg),
+    sprintf("%d of %d", sum(orph$verdict == "spliced host-vector fusion"), nrow(orph)),
+    sprintf("%.3f", 1 - (1 - bg)^nrow(orph)),
+    sprintf("%.0f%% (1 of %d) — interval very wide", 100 / nrow(orph), nrow(orph)))) |>
+  knitr::kable()
+```
+
+**The 0-of-28 scan is not evidence, and it is printed only so nobody runs it again.** At 0.28% of
+the genome, 0.08 clusters are expected to sit on an exon end by chance, so observing zero is exactly
+what chance predicts. This test family cannot be powered at 28 clusters — a bare GT scan over the
+same clusters would expect ~1.75 chance hits, which is worse — so no variant of it will settle
+anything, and none should be run.
+
+**The measurement with power runs the other way: 1 of the 4 five-prime orphans is a splice
+artefact**, which against a 0.28% background is *p* ≈ 0.01 for seeing at least one. That is a
+positive result about the 5′ channel, and it is the real reason the channel is barred from calling:
+not a measured absence of phantoms in the trusted channels, but a measured **presence** of one in
+the untrusted channel, at a rate of roughly 1 in 4 on a denominator of four. Mechanism plus that
+contamination rate is the argument. The phantom rate in the discovery channels is unmeasured and
+unmeasurable at this scale, and claiming otherwise from the scan above would be reading a
+coin-flip's silence as a result.
+
+And none of this has any power over a splice to an **unannotated** donor.
+
+
+**`chrX:100,691,117` became IS16**, and the rule that admitted it is set out under *IS16, and the
+rule that admitted it* above. In short: a 3′ partner at 100,691,113 at signed Δ = +4 with the sign
+agreeing with the 3′ alignment's strand, found by testing the single position the partner must
+occupy rather than by scanning, at an expected chance rate of 2 × 10⁻⁷. Note what the table no longer
+shows — chrX is not an orphan any more, so only three candidates are tested here and none is
+rescued, which is the rule behaving correctly rather than a loss of signal. Its clonality remains
+untested: all 3 cells are B0301 against that replicate's 46.8% share, *p* = 0.10, which is why IS16
+is tier D and not defensible.
+
+**`chr14:62,948,717` is unsupported** — four reads, intergenic, no soft clip at all, no 3′ partner,
+and its cells split across mice, which one clone cannot do. **`chr19:38,932,221`** carries the same
+`ATTC` and is the same fusion, below threshold.
+
+## What the gene context tells us
+
+Lentivirus does not integrate at random: it strongly prefers the bodies of actively transcribed
+genes. That gives an internal control the analysis never assumed, so if the called sites are real they
+should be enriched for intragenic positions in genes this tissue expresses.
+
+```{r context}
+sites %>%
+  dplyr::count(context = sub(",.*", "", context), gene_type, name = "sites") %>%
+  dplyr::arrange(dplyr::desc(sites)) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+A site falling in an intergenic desert is not thereby wrong, but it is the kind of call to treat with
+more caution — particularly at low cell counts.
+
+**This is weaker evidence than it looks, and the obvious null is the wrong one.** Comparing 75%
+intragenic against the genome's genic fraction would overstate the case, because a site can only be
+*called* where a clip places uniquely, and unique sequence is itself concentrated in genes. The
+filter that finds sites is correlated with the feature being tested.
+
+The matched null draws 3,000 random genomic positions, puts a 40-mer from each through the same
+`MAPQ >= 30` requirement a real clip must clear, and asks how many of the survivors are intragenic:
+
+| | intragenic |
+|---|---|
+| mappability-matched random positions (n = 2,302) | **49.2%** |
+| called sites (n = 8) | **75.0%** |
+| | one-sided binomial **p = 0.135** |
+
+The direction matches the literature and the effect may well be real, but at eight sites it does not
+reach significance. Treat the integration preference as *consistent with* expectation rather than as
+evidence for it. The sort agreement, replicate confinement and target-site duplication are
+unaffected, and they are what the result rests on.
+
+## The other end of the provirus
+
+Everything above comes from one end of the provirus — reads running off its 3′ terminus. There is a
+second, independent channel at the **5′** end, and it exists for the same reason the ψ artefact does:
+reverse transcription makes both proviral LTRs identical and the contig keeps a single copy, so a
+read crossing the **host → 5′ LTR** junction also lands on that copy, clipping host sequence to its
+*left* instead of its right.
+
+The anchor is contig 2736. The contig reads `…GGGGGG AC TGGAAGG…`, and integrase removes that `AC`
+during 3′ processing, leaving the `TG` that partners the `CA` ending the contig at 3236 — the
+canonical retroviral inverted repeat.
+
+Unlike the 3′ end these anchors **smear**. The contig continues upstream of 2736, so host bases at the
+clip's end that happen to match it are absorbed into the alignment by greedy extension and the
+reported start slides left; a `GGGGGG` run at 2728–2733 makes this common. Anchoring on 2736 exactly
+returns one clip; accepting a ten-base window and adding the absorbed bases back returns 150. The 3′
+channel is immune because the contig simply stops at 3236, which is why 510 reads pile on one base
+there.
+
+### Target-site duplication
+
+This is the strongest check in the report. Integrase cuts the two host strands with a **5 bp
+stagger**, and repair fills the overhang, so those five bases are duplicated onto *both* flanks of
+every provirus:
+
+```
+         ┌──────── 5 bp duplicated ────────┐
+host ────┴──┬ CA ─── provirus ─── CA ┬─────┴──── host
+            └─ 5′ junction           └─ 3′ junction
+```
+
+The two junction coordinates therefore differ by **4** (a 5 bp shared span). Two independent read
+populations, from opposite ends of the provirus, must agree to the base. Nothing that merely
+resembles a junction can produce that.
+
+```{r tsd-table}
+# One name per column, and the column set is checked rather than assumed: tsd_check() has gained
+# columns twice (the duplicated span, then the observed-read fraction), and a colnames vector one
+# shorter than the data is an error DT raises at render time, i.e. at the worst moment.
+tsd_cols <- c(site_id = "site", chrom = "chrom", pos_3p = "3′ junction", pos_5p = "5′ junction",
+              delta = "Δ", tsd = "verdict", tsd_seq = "duplicated span",
+              tsd_obs = "span seen in 5′ reads", strand = "strand", strand_ok = "strand agrees",
+              reads_5p = "5′ reads", cells_5p = "5′ cells")
+stopifnot(setequal(names(tsd), names(tsd_cols)))
+
+tsd |>
+  dplyr::mutate(site_id = tidyr::replace_na(site_id, "—")) |>
+  dplyr::select(dplyr::all_of(names(tsd_cols))) |>
+  DT::datatable(rownames = FALSE, colnames = unname(tsd_cols),
+                options = list(dom = "t", pageLength = 15, scrollX = TRUE)) |>
+  DT::formatStyle("tsd", target = "row",
+                  backgroundColor = DT::styleEqual("PASS", "#e8f5e9"))
+```
+
+Every site with enough 5′ reads to test passes at exactly 4 — IS01, IS03, IS04 and IS09 — and the
+check goes further than the coordinate. A Δ of 4 can be manufactured by an off-by-one in either
+channel, by a 0- versus 1-based slip, or by taking the wrong end of an alignment, and this analysis
+has had all three. The duplicated **bases** cannot be manufactured that way: the two junctions must
+share one five-base span of reference, and `span seen in 5′ reads` is the fraction of that cluster's
+5′ reads that actually contain it. It is **1.00 at all four sites** — `GATTC`, `GTTCC`, `GAATA`,
+`GTTCC` — so the reference and the reads agree base for base, and `strand agrees` confirms that the
+sign of Δ matches the called strand in every case.
+
+Two details about that table, both checked rather than assumed. `GTTCC` appears as the duplicated
+span at two different sites, IS01 and IS09. The two values are read independently — each from its own
+locus, `chr13:83,681,307-311` and `chr2:31,009,148-152`, by a separate reference lookup, and each
+confirmed against that site's own 5′ reads — so it is a coincidence between two loci, not a
+carry-over. A repeat among four 5-mers is a ~0.6% coincidence under uniform sampling and rather more
+likely than that given integrase's target-site preference, so it needs no explanation beyond having
+been verified.
+
+And **the check cannot be run on IS10–IS15 at all.** The whole 5′ channel is 76 reads, which reach
+only the largest sites; no 5′ cluster falls within 2 kb of any of the six new loci. Those sites are
+therefore not *failing* the TSD test — they are outside its reach, and the TSD column is empty rather
+than negative for them. For IS14 and IS15 that is the second independent thing missing, which is why
+they are flagged `pooled_only`.
+
+The rest of the table is as informative as the passes:
+
+- **`no 3′ site nearby`** — a 5′ junction with no called site within 2 kb. These are candidate sites
+  the 3′ channel missed, not errors. They are reported rather than dropped.
+- **`distinct locus`** — a junction more than 50 bp from the nearest site. It is a separate feature
+  that happens to lie nearby, *not* a failed duplication for that site. chr19:38,932,385 carries more
+  reads than IS03's own 5′ junction while sitting 1.4 kb away; it is kept out of the arithmetic
+  deliberately, and it is explained below — it is a spliced host exon, not a second integration.
+
+### Seeing it
+
+The duplication is easier to believe as geometry than as a number. Each panel is a window around one
+site with both channels on a common axis anchored at the 3′ junction: 3′ clips above the line,
+5′ clips below, each scaled within its own channel because the 3′ channel is up to a hundred times
+deeper.
+
+```{r junction-pileup, fig.height=8.5, fig.width=10}
+tsd_band <- coverage |>
+  dplyr::group_by(site_id) |>
+  dplyr::filter(any(grepl("^5", channel))) |>
+  dplyr::summarise(
+    lo = max(min(offset[grepl("^3", channel)]), min(offset[grepl("^5", channel)])),
+    hi = min(max(offset[grepl("^3", channel)]), max(offset[grepl("^5", channel)])),
+    .groups = "drop") |>
+  dplyr::mutate(bp = hi - lo + 1L, lab = paste0("TSD ", bp, " bp"))
+
+coverage |>
+  dplyr::group_by(site_id, channel) |>
+  dplyr::mutate(rel = depth / max(depth)) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(rel = ifelse(grepl("^5", channel), -rel, rel)) |>
+  ggplot() +
+  geom_rect(data = tsd_band, aes(xmin = lo - 0.5, xmax = hi + 0.5, ymin = -Inf, ymax = Inf),
+            fill = "#f0c200", alpha = 0.85, inherit.aes = FALSE) +
+  geom_col(aes(offset, rel, fill = channel), width = 1) +
+  geom_hline(yintercept = 0, colour = "grey20", linewidth = 0.3) +
+  geom_text(data = tsd_band, aes(x = lo + bp / 2, y = 1.22, label = lab),
+            size = 2.9, colour = "grey20", inherit.aes = FALSE) +
+  facet_wrap(~ site_id, ncol = 2) +
+  scale_fill_manual(values = c("#D55E00", "#0072B2")) +
+  scale_y_continuous(labels = abs, limits = c(-1.1, 1.4)) +
+  coord_cartesian(xlim = c(-55, 55)) +
+  labs(x = "offset from the 3′ junction (bp)", y = "coverage, scaled within channel", fill = NULL,
+       title = "Chimeric read pile-up either side of each integration junction") +
+  theme(legend.position = "top", panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+
+Three things are worth reading off it.
+
+**Each channel stops where the provirus starts.** Neither spills across the junction, because a clip
+is by construction the host half of a read whose other half aligned to the vector. The hard edge at
+offset 0 is the provirus boundary, not a plotting limit.
+
+**The orientation flips between sites.** Where the 3′ pile-up lies left of the junction the provirus
+is on the minus strand, and right of it on the plus strand. The 5′ channel always takes the opposite
+side, which is what two ends of one insert requires.
+
+**They overlap by exactly 5 bases, every time.** That is the shaded band: the target-site duplication
+drawn rather than asserted, the stagger integrase leaves, measured independently at four sites.
+Sites with no 5′ reads show one channel and no band — missing evidence, not contrary evidence.
+
+### What it has already caught
+
+The check has already earned its place. It caught a coordinate bug in the 3′ channel — minus-strand
+junctions were being reported about 48 bp from their true position, and worse, clips from one
+junction were scattering far enough that clustering split them and dropped cells. Every filter in the
+3′ channel was blind to it, because each fragment still clustered tightly on its own. Only the
+disagreement with the 5′ end revealed it.
+
+Two safeguards were added after that. The reported Δ is **signed**, because its sign is a free check
+on the strand call — a plus-strand provirus has its 5′ junction above its 3′ junction and a
+minus-strand one below — and `strand_ok` asserts the two agree. All four sites with both channels
+pass. And `tsd_seq` is tested against **observed read sequence**, not only against coordinates: a
+difference of 4 can be manufactured by an off-by-one in either channel, a 0- versus 1-based slip, or
+the wrong end of an alignment, and this analysis has produced all three. The duplicated bases
+themselves cannot be manufactured that way, and `tsd_obs` reports the fraction of each cluster's 5′
+reads that physically contain the span. It is 1.00 at all four sites.
+
+### A third channel: splicing into the provirus
+
+Two 5′ junctions upstream of IS03 were unexplained for some time, at chr19:38,932,385 (32 reads in
+14 cells) and 38,932,221 (1 read), 1,357 and 1,521 bp from the site. One GTF query and two base lookups settle the
+larger one:
+
+| test | sequence | verdict |
+| --- | --- | --- |
+| is 38,932,385 an exon 3′ end? | annotated *Hells* exons `38932133-38932385`, `38932158-38932385` | yes |
+| donor consensus after it | `38,932,384-389` = `GG` **`GT`** `AA` | canonical `GT` |
+| acceptor consensus before the integration point | `38,933,737-742` = `TGTT` **`AG`** | canonical `AG` |
+
+A canonical `GT`–`AG` intron running from a *Hells* exon donor into the provirus. For those 32 reads
+this is not read-through at all but **splicing** from a host exon into the vector, which makes it a
+third channel — and one carrying more reads than IS03's own read-in junction (32 against 27), though
+at gene-level rather than base-pair resolution.
+
+**The reads carry physical confirmation of the splice, and it was found by chasing what looked like
+a bug.** 33 of the 76 placed 5′ hits end in a 4-base soft clip — `bwa` aligns the clip and then
+refuses its last four bases. A constant 4-base tail next to a TSD test that expects Δ = 4 looks
+exactly like a coordinate error, so it was run down. All 33 sit at the two spliced junctions
+(`38,932,385` and `38,932,221`), and in every one the four refused bases are **`ATTC`** — the last
+four bases of IS03's duplicated span `GATTC`, which lies **1,357 bp away** at the integration site.
+The host sequence immediately after the exon is `GTAA`, the intron's donor, so `bwa` is right to stop
+there and right to refuse `ATTC`: no contiguous alignment exists.
+
+So the clip physically contains a *Hells* exon joined directly to the target-site duplication of the
+provirus, with the intron absent. That is the splice, in the read, at base resolution — independent
+of the GTF query and the consensus lookups above, which is what makes it worth the detour. It also
+clears the absorbed-base repair in `read_five_prime_clips()`: the four bases are real host sequence
+carried across the splice, not an over-extension. The pipeline correctly declines to call it a second
+integration: `tsd_check()` labels anything beyond 50 bp a `distinct locus` rather than a failure of
+the nearby site. The 1-read neighbour at 38,932,221 has no `GT` after it and remains unexplained.
+
+## Sharing between tubes
+
+Tubes that are different sorted fractions of the same animal should share clones; tubes from different
+animals should not. A wild-type tube should show nothing at all, and whatever it does show sets the
+cross-tube background — index hopping and ambient contamination — against which small sites in the
+other tubes have to be judged.
+
+```{r sharing, fig.height=5}
+ggplot(cells_long, aes(tube, reorder(label, cells, sum), fill = cells)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = cells), size = 3) +
+  scale_fill_gradient(low = "grey95", high = "firebrick", trans = "sqrt") +
+  labs(x = NULL, y = NULL, fill = "cells",
+       title = "Which tubes each site appears in")
+```
+
+
+
+# Limitations
+
+**Only intact proviruses are visible.** The junction filter requires a clean processed `CA`. Integrants
+with deleted or rearranged LTR ends present no such junction and are invisible here. For clonality
+that is arguably a feature, but it means site counts are a floor, not a census.
+
+**The junction position is tied to the contig boundary.** 3236 is the last base of *this* contig. If
+the cassette is ever re-cut with a different 3′ boundary, the filter position must move with it; the
+constant lives in `scripts/slurm/analysis/integration-sites.sh`.
+
+**Detection is read-through-limited, so absence is weak evidence.** A cell is labelled only if one of
+its few read-through molecules happened to be captured and sequenced. Most cells in a real clone carry
+no label. Clone *sizes* here are therefore samples, not counts, and comparing them across tubes
+assumes comparable depth.
+
+**Small sites sit near the background, and the wild-type tubes do not bound all of it.** A wild-type
+tube bounds *cross-tube* error — index hopping and carry-over — and nothing else. It cannot bound
+within-tube ambient, where every lysed mCherry⁺ cell sheds vector RNA into the shared soup. That is
+measured separately from sub-threshold droplets, computed each run across both channels:
+
+```{r ambient}
+readr::read_csv(file.path(sites_dir, "ambient_rate.csv"), show_col_types = FALSE) |>
+  dplyr::filter(junction_barcodes >= 10) |>
+  dplyr::transmute(tube, `junction-bearing barcodes` = junction_barcodes,
+                   `of those, a called cell` = in_called_cells,
+                   `not a cell` = not_cells,
+                   `ambient share` = sprintf("%.1f%%", 100 * ambient_share),
+                   `rate per called cell` = sprintf("%.2f%%", 100 * rate_per_cell),
+                   `rate per empty droplet` = sprintf("%.1e", rate_per_empty),
+                   `ratio` = scales::comma(round(ratio))) |>
+  knitr::kable()
+```
+
+The comparison that makes the number mean something is the last column: a junction in one of 2.5
+million empty droplets and a junction in one of 20,000 cells are different events, and per droplet
+the signal is three to four orders of magnitude stronger in cells. These are also exactly the
+barcodes the called-cell filter removes from the cell table — the filter is applied where cells are
+counted and **not** to the clip and genomic tables, because this measurement is computed from the
+rows it removes.
+
+Folding in the genome-mapped channel was a check on this in its own right: it raised the
+junction-bearing barcode count substantially and left the non-cell count unchanged. The new channel
+added signal without adding ambient, which is what should happen if the extra reads are real
+junctions rather than background — a doubling of a background-driven signal would have doubled its
+background with it. Scaled by the depth difference between a cell and an empty droplet — the one
+multiplier not measured here — this is of order 1–2% of labelled cells, consistent with the doublet
+rate. Scaled by the depth difference between a cell and an empty droplet — the one multiplier not
+measured here — that is of order 1–2% of labelled cells, consistent with the doublet rate.
+
+The assignment tier's own error rate is now measured rather than argued, by **decoy flanks**: 100
+flanks cut from random matched positions and carried through the identical positional test. They
+return zero hits at every clip length from 10 bp up, which also audits the anchoring, since a decoy
+has no junction and any hit passing it would mean the test is mis-implemented. Below 10 bp they
+return 2, which is what set `min_assign`.
+
+**The genome-mapped channel needed its own decoy, and it is a different decoy.** The flank decoys
+bound assignment and say nothing about the channel that now calls four sites on its own and carries
+IS10's 99 cells. That channel's claim is narrower: a read the aligner placed at MAPQ 255, whose
+soft-clipped end matches the last 13 bases of the provirus terminus within the absorption window, is
+a junction read. `genomic_decoy_rate()` tests how often that is true of a terminus that cannot be
+there — the same 13 bases **permuted to the same composition**, which matters, because the real
+13-mer `AAAATCTCTAGCA` carries six adenines and a permutation of the whole 18-base terminus leaves
+only three. A-rich *k*-mers are commoner in a mammalian genome, so a composition-mismatched decoy
+understates the rate in the direction that flatters the channel.
+
+On chr19 in Rx_4 — 27.6M alignments, a slice that contains a real site with 29 reads —
+`CCTACAAAGTTAA` returns **zero hits**. Nothing else on that chromosome in that tube looks like a
+junction once the terminus is scrambled. Stated as a bound rather than as a zero: 0 observed puts a
+95% Poisson ceiling of 3 events on that slice, against 29 real.
+
+**The genome-wide pass has now run** (job 35768797, 2 h 00 m, all eight tubes), and the answer is
+not zero:
+
+| tube | Rx_1 | Rx_2 | Rx_3 | Rx_4 | Rx_5 | Rx_6 | Rx_7 | Rx_8 | total |
+|---|---|---|---|---|---|---|---|---|---|
+| real reads | 0 | 12 | 47 | 800 | 1 | 537 | 25 | 0 | **1,422** |
+| decoy reads | 0 | 2 | 3 | 1 | 0 | 4 | 0 | 5 | **15** |
+| decoy positions | 0 | 1 | 1 | 1 | 0 | 2 | 0 | 2 | 9 |
+
+**1.1% of reads, and no callable site.** The 15 decoy reads scatter over 7 positions across 8 tubes —
+at most a few reads at any one of them — while the 1,422 real reads concentrate at 47 positions, 800
+of them at 16 positions in Rx_4 alone. A site needs `min_cells` distinct cells and `min_umis`
+molecules at one base, and nothing in the decoy output approaches that. So the error rate to quote is
+**1.1% at the read level and zero at the site level**, which is the level the site list is built at.
+
+Two details worth keeping. **Rx_8 is the sharpest result in the table**: a wild-type tube, zero real
+reads, and 5 decoy reads — so in material with no provirus at all, the real 13-mer finds nothing and
+a composition-matched random one finds five. The real terminus is not merely better than chance here,
+it is cleanly separated from it. And at the cell level 1.1% of 1,396 folded-in reads is roughly 15
+reads, so of the labelled cells perhaps 15 could carry a spurious label — the same order as the
+ambient and doublet rates, and not concentrated anywhere.
+
+One limitation of this run, for whoever tightens it: `genomic_decoy_rate()` stores counts per tube,
+not cells per decoy position, so "no callable site" is inferred from reads-per-position rather than
+measured against the floor directly. That is the next thing to add if the bound ever needs to be
+airtight.
+
+It is a separate job rather than a stage of the main one because it costs what the genomic scan
+costs, and a control must not sit on the critical path of a run someone is waiting for. It reads the
+real counts from the genomic stage's cache instead of rescanning for them, which is the difference
+between ~1 h 50 m and ~3 h 30 m.
+
+The cell and UMI floor was the one genuinely arbitrary parameter in the chain, and it is now measured
+rather than asserted — gain against loss at every value, with vector transcript as the quality axis
+(*What the floor admits, and what it turns away*). Rule C′ still gives a sub-floor cluster one
+principled route back in, on a strand-matched target-site duplication, but at the relaxed floor it
+**promotes nothing**: chrX:100,691,113 now clears the floor on its own. The rule stands with zero
+current effect, which is the right state for a safeguard.
+
+**Per-clone detection is not uniform, so λ differs by site** — and this is the covariate the
+completeness section now regresses λ on, in place of one imputed median. Vector expression per cell
+spans about sevenfold across clones — median UMIs on the reporter contig run from 1 at IS03 and 3 at IS04 to 6 at
+IS02 and 7 at IS05, with IS04 at roughly half of IS01 and IS02 combined (Wilcoxon *p* = 2.5 × 10⁻⁵).
+This is direct evidence that position effects operate at these loci, and it means a per-site
+detection rate assumed constant is misspecified — which matters for every clone-size statement.
+Separately, read-through termination is multi-site: the vector-portion length distribution at IS02
+shows at least three over-represented positions at molecule level (reads per UMI is flat at ~1.5
+across it), so a λ built on a single termination site is also misspecified.
+
+**Leakage into the mCherry⁻ tubes was reported here as animal-structured. On the proper
+denominator it is not, and the correction is instructive.** The figures were B0304 14.0% of its
+labelled cells in the mCherry⁻ tubes, against 3.6% for B0301 and 0.2% for B0303 — a seventy-fold
+spread. Those numbers are arithmetically correct and they measure the wrong thing: they are the
+*composition* of each mouse's labelled cells, and composition follows where that mouse's cells were
+sorted.
+
+```{r leakage-rates}
+# Per-mouse, per-sort-fraction cell counts, from the hashtag call. The denominator is the only thing
+# that makes the labelled counts comparable, and it is the quantity the metadata queries asked for.
+sort_of <- function(tb) ifelse(tb %in% c("Rx_4", "Rx_6"), "mCherry+", "mCherry−")
+mouse_cells <- embedding |>
+  dplyr::filter(tube %in% c("Rx_3", "Rx_4", "Rx_6", "Rx_7"),
+                grepl("^TotalSeq-B03", as.character(replicate))) |>
+  dplyr::transmute(cell, tube, mouse = sub("^TotalSeq-", "", replicate), sort = sort_of(tube))
+
+dplyr::left_join(
+  dplyr::count(mouse_cells, mouse, sort, name = "cells"),
+  labelled |>
+    dplyr::inner_join(dplyr::select(mouse_cells, cell, mouse), by = "cell") |>
+    dplyr::distinct(cell, mouse, tube) |>
+    dplyr::mutate(sort = sort_of(tube)) |>
+    dplyr::count(mouse, sort, name = "labelled"),
+  by = c("mouse", "sort")) |>
+  dplyr::mutate(labelled = tidyr::replace_na(labelled, 0L),
+                `rate` = sprintf("%.3f%%", 100 * labelled / cells)) |>
+  knitr::kable()
+```
+
+B0304 has **92.0%** of its cells in the mCherry⁻ fraction — 20,817 of 22,632 — against 33.7% for
+B0301 and 35.6% for B0303. Divide by that and the picture changes completely. (The figures below are
+counted over every barcode the demultiplexer called; the table above recounts over this report's
+embedding, so the two differ by whatever QC dropped. The ratios are not sensitive to that.)
+
+| mouse | cells, mCherry⁺ | cells, mCherry⁻ | rate, mCherry⁺ | rate, mCherry⁻ | ⁻ as % of ⁺ |
+|---|---|---|---|---|---|
+| B0301 | 18,122 | 9,217 | 0.94% | 0.054% | **5.8%** |
+| B0303 | 17,557 | 9,724 | 3.74% | 0.103% | **2.7%** |
+| B0304 | 1,815 | 20,817 | 7.93% | 0.130% | **1.6%** |
+
+The per-cell detection rate in the mCherry⁻ fraction spans 0.054% to 0.130% — a factor of 2.4, not
+70 — and measured against each mouse's *own* mCherry⁺ rate, B0304 leaks the **least** of the three.
+The earlier conclusion is withdrawn in both of its versions: it is not B0301 and it is not B0304.
+
+This is the second time in this report that a composition has been mistaken for a rate, the first
+being the labelled-cell denominator in the co-occurrence test. Both times the error produced a
+large, clean-looking number pointing at a real-sounding conclusion. The guard is mechanical: **never
+divide labelled cells by labelled cells.**
+
+**What is left, and it is the more interesting finding.** B0304's cells are 92% mCherry⁻ while the
+other two mice are near a third, and its mCherry⁺ cells carry the highest detection rate of any
+mouse at 7.93%. That is a statement about the animal — engraftment, sorting, or vector expression —
+and not about any integration site. It is the same phenomenon as the IS05 question below, in the
+same mouse, and the two should be treated as one open item.
+
+**IS10 follows from that, and nothing should be read into its mCherry⁻ fraction.** IS10 is a B0304
+clone — 87 of 87 singlet-called cells — and its 26% mCherry⁻ fraction is its mouse's sorting
+composition, not a property of the locus. Per cell it runs at 0.125% in the negative fraction
+against 4.02% in the positive, a ratio of 3.1% against B0304's 1.6% overall: the same order, nothing
+anomalous. **No silencing or position-effect claim should be built on IS10.**
+
+**The 5′ channel advertises a 10 bp floor it does not have.** `classify_five_prime_clips()` sorts
+5′ clips into a discovery tier at `min_discovery` (25 bp) and an assignment tier at `min_assign`
+(10 bp), but only the discovery tier is ever written: `write_clip_fasta(five, "discovery", …)`. The
+assignment tier is computed, counted in the waterfall, and then dropped. `five_prime.fa` contains no
+clip shorter than 25 bases, which confirms it. This is the same family as `-T 30` and `-T 12` — a
+threshold that reads as active and is not — except that here nothing silently discards the reads
+downstream; they are never sent downstream at all.
+
+The gain being left on the table is real but modest: those clips could be matched against the
+mini-reference by the same exact positional test the 3′ assignment tier uses, since the flanks are
+cut ±200 bp around the 3′ junction and so contain the 5′ junction four bases away. It is a design
+change rather than a fix, so it is recorded rather than made. Note also that the 5′ discovery clips
+that *are* sent place poorly — 44% of the 25–34 bp band reaches MAPQ ≥ 30, 54% of 35–49 — so this
+channel sits in the same MAPQ-0 blind spot as the 3′ one.
+
+**The 20 bp clustering window is not hiding junction-base scatter.** Reads are merged into sites
+within `cluster_window = 20`, which could in principle absorb a spread of nearby junction positions
+into one call and make a fuzzy site look exact. It does not: of the 1,396 genome-mapped reads that
+fall inside a called site, **every one sits at offset exactly 0** from that site's junction base — one
+distinct position per site, at every one. The window could be set to 1 and nothing in this channel
+would change. Integration is a point event and these reads resolve it to the base.
+
+**Clip length biases which loci are findable, and that bias is now measured rather than asserted.** A
+junction whose flanking host sequence is repetitive yields clips that align at MAPQ 0 and is silently
+lost: 86 of 974 discovery clips (8.8%) sit at MAPQ 0. IS10 is what that was hiding — a 99-cell clone
+whose three 3′ clips end on the junction base exactly and are all unplaceable. The genome-mapped
+channel largely repairs this, because 120–140 bases of host place where 44 do not, which is why it
+finds four sites the 3′ channel cannot and misses none that it can. What remains is that sites are
+still enriched for integrations into sequence unique *at 130 bp* — which is also where genes are,
+partly confounding the intragenic enrichment used above as a sanity check.
+
+**A replicate's absence from a compartment may be sampling, not biology.** B0304 contributes 1,399
+cells to Rx_4 but only **108** to Rx_6 after QC (1,614 and 201 before it — the counts in the
+leakage table above are pre-QC, and the argument here uses the post-QC ones because the detection
+rate it multiplies is also post-QC). At IS05's detection rate in Rx_4 (2.64%) that predicts ≈2.9
+labelled cells in Rx_6 against 0 observed, *p* ≈ 0.055 — so the apparent "IS05 is HSC-only" pattern is
+not supported, and no lineage claim should be built on it. The same caution now has a second
+instance: IS05 is one of six B0304 sites rather than that animal's only clone, and IS10, IS11, IS12,
+IS14 and IS15 are all sampled from the 1,815 mCherry⁺ cells B0304 contributes against 17,557 for
+B0303. **Every B0304 result in this report rests on a tenth of the cells the other animals supply.** B0302 likewise has only 215 cells in Rx_4,
+so its zero labelled cells bound within-tube ambient only weakly (<~1.4%), far less tightly than the
+empty-droplet measurement above. B0304's hashtag-to-animal mapping used to be the one that could not be
+cross-checked by shared clones between compartments, because its only clone was the one missing from
+MNC. IS10 closes that: it carries 69 cells in Rx_4 and 4 in Rx_6, so B0304 now has a clone on both
+sides of the compartment split.
+
+Even with more cells, RNA could not settle it. If the IS05 provirus sits in a locus that
+heterochromatinises on differentiation, the promoter silences, read-through stops, and this pattern
+appears with no lineage difference at all — and a silenced provirus is equally absent from the
+mCherry⁻ tube. Only DNA distinguishes the two: a bulk integration-site assay on sorted mature B0304
+cells, asking whether the IS05 junction is present in genomic DNA. Present in DNA and absent in RNA
+means silencing; absent in DNA means genuinely no mature output.
+
+**The ~50 bp clip edge is real but unexplained.** Both channels taper off sharply above ~50 bp of
+clipped sequence, with maxima of 62 (host clip) and 69 (vector clip). It is *not*
+`outFilterMatchNminOverLread`: chr19 alone holds 30,889 reads of exactly 150 bp with clips ≥ 60 and
+matched fractions down to 30–39%, so no 0.66 filter is in force. The implied gap is roughly 70–87
+bases of anchor. The reads are absent rather than mis-placed — every read overlapping a junction is
+MAPQ 255 with no supplementary, secondary or low-MAPQ population, on both plus- and minus-strand
+sites — so there is no hidden yield there, but the cause is not established.
+
+**These reads are counted as host-gene expression — at four sites, and the rule for
+which is exact.** A genome-mapped junction read is an ordinary alignment to the host gene as far as
+Cell Ranger is concerned: it carries `GN:Z:<host gene>` and `xf:i:25`, and bit 8 of `xf` is the flag
+that makes a read a UMI count. So for an affected site the carrying cells gain host-gene UMIs that
+are really vector transcript, in exactly the cells a cis-effect test would compare.
+
+It needs **two** conditions, and the second keeps it off most sites. The read has to land inside the
+gene, and it has to be in the gene's own orientation — an antisense read is tagged with the gene but
+not counted. An earlier draft of this paragraph cited "177 spurious *Ddx10* UMIs in Rx_4"; that was
+wrong, because IS02's provirus is antisense to *Ddx10* and none of those reads is counted. The
+prediction was tested against the count matrix at six sites and it holds at all six:
+
+| site | host gene | orientation | junction share of carriers' host-gene UMIs |
+|---|---|---|---|
+| IS10 | *Gm35330* | same sense | **23.5%** |
+| IS04 | *Abhd17c* | same sense | **20.9%** |
+| IS11 | *Stau2* | same sense | **12.1%** |
+| IS03 | *Hells* | same sense | 2.3% |
+| IS02 | *Ddx10* | antisense | 0.4% |
+| IS01 | *Mef2c* | antisense | 0.0% |
+| IS09 | *Fnbp1* | antisense | 0.0% |
+
+`integration_sites.csv` carries this as `cis_confound`, true for **IS03, IS04, IS10 and IS11**. For
+those four, any cis-effect test must drop UMIs whose reads contain the provirus terminus before
+comparing anything; for the other eleven the question does not arise. IS03's share is small only
+because *Hells* is highly expressed, not because the mechanism is weaker there.
+
+**What this measurement is not.** Carrying cells do show more host-gene signal than other cells —
+2.5× for *Hells*, 4.0× for *Stau2* — and removing the junction UMIs does not remove that. It is not
+evidence of a cis-effect either, because "other cells" here is every other cell in the tube, which
+mixes cell type with clone identity: a clone is a lineage, and its host gene may simply be a gene
+that lineage expresses. The confound is now quantified and removable; the cis-effect question is
+untouched and needs a matched comparison.
+

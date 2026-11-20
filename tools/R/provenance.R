@@ -372,6 +372,12 @@ render_summary <- function(p) {
     sprintf("%d uncommitted file(s) since %s: %s", length(p$uncommitted), commit_link(p),
             paste0("`", p$uncommitted, "`", collapse = ", "))
   } else paste("committed:", commit_link(p))
+  # The analysis code is a PACKAGE now, not a file in this repository, so the commit above says
+  # nothing about which version of it produced the numbers. targets cannot watch a package either,
+  # which means a package change does not re-render the report. Recording the version is the least
+  # a reader needs in order to know what they are looking at.
+  pkg <- tryCatch(as.character(utils::packageVersion("scarab")), error = function(e) NA_character_)
+  if (!is.na(pkg)) code <- paste0(code, " &middot; `scarab` ", pkg)
   renv <- if (isTRUE(p$renv_synced)) "match `renv.lock`"
           else if (isFALSE(p$renv_synced)) "differ from `renv.lock`" else "unknown (renv not active)"
   pipeline <- if (is.na(p$report)) "not a target in `_targets.R`: no pipeline information"

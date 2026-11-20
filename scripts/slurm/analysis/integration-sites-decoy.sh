@@ -44,7 +44,8 @@ if [[ ! -s $out/work/genomic_Rx_4.csv ]]; then
 fi
 
 echo "=== scrambled-terminus decoy over the genome-mapped channel ${region:+for $region} ==="
-$rscript scripts/R/call-integration-sites.R genomic-decoy \
+$rscript -e 'a <- commandArgs(TRUE)
+  scarab::scarab_genomic_decoy(a[1], a[2], genome_fa = a[4], region = a[3])' \
   "$out" "$PROJ/data" "$region" "$CR_REF/fasta/genome.fa"
 
 echo "=== done ==="

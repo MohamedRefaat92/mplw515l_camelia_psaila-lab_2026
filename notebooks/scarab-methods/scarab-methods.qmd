@@ -1,0 +1,259 @@
+---
+title: "scarab — method and parameters"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+How integration sites are read out of read-through transcripts, and what every threshold in the pipeline was measured against. Reference material: it describes the method rather than this run's results, and changes only when the method does.
+
+Part of the scarab integration-site analysis, which is four reports:
+[method and parameters](../scarab-methods/scarab-methods.html) ·
+[detections and confidence](../scarab-qc/scarab-qc.html) ·
+[clones](../scarab-clones/scarab-clones.html) ·
+[exploration](../scarab-exploration/scarab-exploration.html).
+
+```{r setup}
+#| include: false
+# This report deliberately does NOT source notebooks/integration-sites/_setup.R, which the other
+# three share. _setup.R reads eleven pipeline output tables, and a report that reads a file declares
+# a dependency on it: sourcing it here would make this document appear to depend on every result in
+# the run when it describes the method and reports no result at all. It would also mean a re-run
+# that changed one number rebuilt a methods section that cannot have changed.
+#
+# What it needs instead is one object, taken from the package rather than from a file.
+library(scarab)
+IS_DEFAULTS <- scarab_opts()
+```
+
+# Introduction
+
+The transgene assay tells us *whether* a cell carries the lentiviral cassette. This report asks a
+harder question: **where in the genome did it integrate**, and can that be used as a clone label.
+
+The idea rests on a leak in the vector. Transcription of the cassette is supposed to terminate at the
+polyadenylation site in the 3′ LTR's R region, at contig 3152. Termination is not perfect, and a
+minority of transcripts read through to the end of the provirus and on into the flanking host DNA.
+Such a molecule aligns to the reporter contig as far as its last base and then stops matching, so the
+aligner soft-clips the remainder — and that clipped tail is host sequence that names the integration
+locus. Because the read still carries its 10x cell barcode and UMI, the locus comes attached to a
+**cell**.
+
+## Why the junction is at exactly one position
+
+Integration chemistry fixes it. Reverse transcription makes a blunt double-stranded DNA whose plus
+strand ends `…TGGAAAATCTCTAGCA`**`GT`**. Integrase then performs 3′ processing: it removes that
+terminal `GT`, leaving a recessed 3′-OH on a `CA`, and it is that `CA` which attacks the host DNA in
+the strand-transfer step.
+
+```
+…host host host │ CA ──────── provirus ──────── CA │ host host host…
+                  ↑                                 ↑
+            processed end                      processed end
+```
+
+The reporter contig ends `…TCTCTAG`**`CA`** — exactly that processed terminus. So **contig position
+3236 is the integration junction itself**, and a clip anchored anywhere else cannot be one. That is a
+statement about enzymology rather than a tuning parameter, which is why it is the first filter
+applied and why it costs no sensitivity.
+
+It also does the heavy lifting against artefacts, as the next section shows.
+
+# How these tables were produced
+
+This report does no site calling of its own. It reads five CSVs written by a batch job and plots them,
+so that re-rendering is cheap and the calling is reproducible independently of the report.
+
+## The pipeline
+
+```
+data/cellranger_<tube>/sample_alignments.bam        8 tubes, ~55 GB each
+        │
+        │  1. EXTRACT   scarab :: read_junction_clips(), classify_clips()
+        │     Rsamtools reads a 87-base window of one contig per tube (seconds, despite the
+        │     BAM size), keeps reads whose anchor ends exactly at the junction, and splits the
+        │     soft-clipped tails into the discovery and assignment tiers.
+        ▼
+   work/discovery.fa  work/assign.fa  work/five_prime.fa
+        │
+        │  2. ALIGN (genome)   bwa mem -k 16 -T 20. The seed is shortened because a 25-48
+        │     base query will not seed at the default 19 -- and -T is set explicitly because
+        │     the default of 30 silently discarded every clip below 30 bp, 244 of them, while
+        │     min_discovery advertised 25.
+        ▼
+   work/discovery.sam  work/five_prime.sam
+        │
+        │  3. GENOMIC   read_genomic_clips()
+        │     The second, independent read of the same junctions: reads STAR placed on the
+        │     HOST genome with the vector soft-clipped, which stage 1 cannot see because it
+        │     only ever reads one window of one contig. The coordinate is already resolved at
+        │     MAPQ 255 behind 120-140 bases of host, so no alignment follows. A streaming pass
+        │     over every alignment in each BAM, one core per tube, cached per tube.
+        ▼
+   work/genomic_<tube>.csv                          cached per tube; schema declared on read back,
+        │                                            because the wild-type tubes cache zero rows
+        │
+        │  3b. GENOMIC DECOY (optional)   genomic_decoy_rate()
+        │     The same scan with the terminus permuted to the same base composition, which bounds
+        │     this channel's false-positive rate the way the decoy flanks bound assignment's. Costs
+        │     what stage 3 costs, so it is opt-in and takes a chromosome argument.
+        ▼
+   genomic_decoy_rate.csv
+        │
+        │  4. SITES     call_sites(), label_sites(), summarise_sites(), write_site_flanks()
+        │     GenomicRanges clusters BOTH channels' placements into sites together -- the
+        │     genome-mapped reads call sites on their own, and several sites exist only
+        │     because of them -- the cell and UMI floor is applied, label_sites() pins each
+        │     locus to its IS number from metadata/integration_site_registry.csv, rtracklayer
+        │     annotates the host gene, the flanks are cut, and 1,000 DECOY flanks from random
+        │     matched positions go into the same file to measure the error rate.
+        ▼
+   work/site_flanks.fa                            13 real flanks + 1,000 decoys
+        │
+        │  5. ASSIGN    assign_clips_exact(), genomic_site_hits(), decoy_error_rate(),
+        │     summarise_cells(), update_site_counts(), channel_capture_recapture(),
+        │     tsd_check(), rescue_orphan_junctions(), junction_coverage()
+        │     No aligner. The clip must match a flank at the junction base exactly, forward or
+        │     reverse-complemented, within the mismatch budget. The genome-mapped reads then
+        │     rejoin as CELL evidence rather than only as discovery: they already carry their
+        │     coordinate, so genomic_site_hits() returns each to the site it was clustered
+        │     into. Leaving them out halved the clone sizes of the largest sites.
+        ▼
+   output/objects/integration-sites/*.csv           what this report reads
+```
+
+bwa used to run a second time here, against the flanks. It was removed: MAPQ against a handful of
+short sequences is near-meaningless and was already being ignored, `-a` had to be passed to stop its
+ranking discarding true hits, and `-T 12` silently enforced a 12 bp floor while `min_assign`
+advertised 8 — 169 reads written and dropped with no error, the same failure as `-T 30` one tier up.
+**That `-T 12` problem is resolved by removal, not by a fix:** there is no aligner in this tier any
+more, so the flag gates nothing and cannot be reintroduced by changing a threshold. It is recorded
+here so nobody reopens it looking for the setting that corrects it.
+What remained once those were stripped away was a positional test, which is exact, deterministic and
+runs in seconds.
+
+## Files
+
+| file | role |
+|---|---|
+| `scarab` (R package) | **all the logic.** It was `src/R/integration-sites.R` and `scripts/R/call-integration-sites.R` in this repository; both are retired and the package is the single definition. 79 exported functions across 17 modules, `R CMD check` clean, with its own conda environment. `scarab::scarab_opts()` is the one place parameters live — a validated constructor, so a misspelled override is an error rather than a silent no-op |
+| `scarab::scarab_extract()` and friends | the five stages — `extract`, `genomic`, `genomic_decoy`, `call_sites`, `assign` — split where bwa has to run between them, and where the genomic scan has to be restartable on its own. `scarab_run()` does all five in order and skips any whose output is already present |
+| [`scripts/slurm/analysis/integration-sites.sh`](../../scripts/slurm/analysis/integration-sites.sh) | the batch job, five stages. The genomic scan dominates: ~105 min for eight BAMs forked one core per tube, against ~14 h in series. Everything else is minutes. |
+| [`scripts/slurm/analysis/integration-sites-decoy.sh`](../../scripts/slurm/analysis/integration-sites-decoy.sh) | the genome-mapped channel's error bound: the same scan with the terminus permuted to the same base composition. Its own job, ~1 h 50 m, because a control must not sit on the critical path. Takes an optional chromosome |
+| [`scripts/slurm/setup/bwa-index.sh`](../../scripts/slurm/setup/bwa-index.sh) | builds the bwa index once, ~50 min |
+
+Both jobs run on the `short` partition and **not** the `_el9` ones: renv keys its library path on the
+OS release, so on a Rocky 9 node it finds no library and the first `library()` call fails.
+
+## Inputs
+
+| input | where from |
+|---|---|
+| `data/cellranger_<tube>/sample_alignments.bam` | `scripts/slurm/cellranger/cellranger-multi.sh`, linked into `data/` so the provenance catalogue sees it |
+| `$CR_REF/bwa/genome.*` | the mouse genome **plus the reporter contig**, indexed. The contig is included deliberately: a clip landing back on the vector is then recognisable rather than quietly unmapped. |
+| `$CR_REF/genes/genes.gtf.gz` | GRCm39 / GENCODE vM33, for the host-gene annotation |
+| `metadata/cellranger/libraries.csv` | the list of tubes to process |
+| [`metadata/integration_site_registry.csv`](../../metadata/integration_site_registry.csv) | pins each `IS` label to its locus, so a label means the same site across runs. Written by `label_sites()`; tracked, because `output/` is not. See *Site labels are pinned, not ranked* below. |
+
+## Outputs
+
+| file | rows | one row per |
+|---|---|---|
+| `integration_sites.csv` | 15 | **site**: position, strand, host gene, reads/cells/UMIs, and cells per tube |
+| `cell_site_assignments.csv` | ~1,200 | **cell × site**: the table that joins onto Seurat metadata and turns a locus into a clone label. Carries `channels`, `reads_three`, `reads_genomic`, `umis_three` and `umis_genomic` per cell, so the per-site overlap between the two channels stays recoverable — collapsing it to one label would destroy the channel-overlap analysis without a re-run. The UMI columns are not a convenience: the overlap has to be counted in molecules, and counting it in reads gets the answer wrong by a factor of three. |
+| `clip_waterfall.csv` | 33 | tube × filter class — every clip counted once, under the first reason it met |
+| `anchor_ends.csv` | 811 | tube × anchor position × clip length — the coverage view below |
+| `site_calling_summary.csv` | 7 | what each tier contributed |
+| `decoy_error_rate.csv` | 5 | clip-length band × the decoy hit rate, and ε scaled to the real flanks |
+| `tsd_check.csv` | 8 | 5′ cluster: signed Δ, the duplicated span, whether reads contain it, strand agreement |
+| `orphan_rescue.csv` | 4 | orphan 5′ junction tested at the one position its partner must occupy, with the denominator — now as columns, since attributes do not survive a `write_csv` |
+| `orphan_evidence.csv` | 4 | the same junctions with what decides each one: pooled cell and UMI counts, the nearest exon boundary and its donor dinucleotide, the bases beyond the junction, the vector acceptor they match, hashtag confinement with a binomial *p*, and a `verdict` derived from those columns |
+| `cluster_support.csv` | ~30 | **every discovery cluster with the floor NOT applied**: cells, UMIs, tubes, channels, MAPQ. Without it the floor cannot be questioned from the outputs, because `call_sites()` returns only what passed |
+| `site_floor_curve.csv` | 36 | sites admitted across a 6×6 grid of cell and UMI floors, with the current setting flagged, plus the **mean and minimum vector share** of the admitted set. **The measurement that sets `min_cells`** — gain and loss at every value, not a count |
+| `tsd_chance_rate.csv` | 1 | the price of rule C′: genome size from the reference `.fai`, the accepting window, the cluster count, and the expected number of chance strand-matched TSD partners. **The warrant for admitting IS16 on one match** |
+| `detection_regression.csv` | 16 | per-site vector expression, and λ either fitted by the ZTP or predicted from that expression with a 95% prediction interval. Replaces imputing one median detection rate to the sites the ZTP cannot fit |
+| `discovery_power.csv` | 112 | P(clone discovered) over a grid of clone size × per-cell detection. The completeness question asked in the form the data can answer, since `min_cells` makes Chao1 undefined |
+| `junction_coverage.csv` | — | site × channel × offset: the pile-up figure |
+| `genomic_decoy_rate.csv` | 8 | **written only when the decoy stage is run, and it is not run by default** — the decoy pass costs what the real pass costs, so enabling it roughly doubles the job, and a control must not sit on the critical path of a run someone is waiting for. Absent from a default run's output directory. Tube: real against decoy hits for the genome-mapped channel, from the scrambled-terminus run. Region-tagged when restricted to one chromosome, so a narrow probe cannot overwrite a genome-wide measurement. Last measured: chr19 in Rx_4, 27.6M alignments containing a real 29-read site, zero decoy hits |
+| `clip_floor_curve.csv` | ~50 | clip length: what a clip of that length matches, real sites and decoy flanks, under both the exact and budgeted rules. **The measurement that sets `min_assign` and `exact_below`** |
+| `repertoire_completeness.csv` | 1 | the assumption-free floor and the detection-corrected share of the mCherry⁺ population, with the number of sites whose detection had to be imputed |
+| `unassigned_molecules.csv` | 4 | what becomes of junction molecules matching no called site: below the floor, unplaceable, or at a locus that failed the cell floor |
+| `ambient_rate.csv` | 8 | tube: junction-bearing barcodes that are and are not called cells, per-cell against per-empty-droplet |
+| `work/called_barcodes.csv.gz` | ~161,000 | Cell Ranger's called barcodes, captured with the run so every cell count is reproducible from the outputs alone |
+| `detection_model.csv` | 15 | site: per-cell detection rate from a zero-truncated Poisson on molecule counts, the detection-corrected clone size with a bootstrap interval, and the observed-against-fitted check. `NA` where the truncated mean is too close to 1 to fit — that is the estimator declining, not a gap |
+| `clip_table.csv.gz` | ~1,800 | **molecule**: one row per tube + barcode + UMI with **no floor**, its longest clip, and how many called sites and decoy flanks that clip matches. The table every floor and detection question is answered from |
+| `clip_matches.csv.gz` | ~9,000 | clip × flank × orientation with the mismatch count, for anything the molecule view collapses away |
+| `channel_capture_recapture.csv` | 15 | site: cells seen by each channel, their overlap, Chapman's estimator — **and the molecule-model expectation that stops it being read as a clone size** |
+
+## Re-running it
+
+```bash
+sbatch scripts/slurm/setup/bwa-index.sh          # once, if the reference changes
+sbatch scripts/slurm/analysis/integration-sites.sh
+```
+
+To change a threshold, pass it to `scarab::scarab_opts()` — the job file holds no analysis
+parameters of its own, so the two cannot disagree, and an unknown parameter name is an error rather
+than a silent no-op. After changing the package, reinstall it into this project's library:
+
+```bash
+env/bin/R CMD INSTALL -l renv/library/linux-rocky-8.10/R-4.5/x86_64-conda-linux-gnu \
+  /well/ludwig/users/nrs939/projects/scarab
+```
+
+That step is manual on purpose, and it is the one cost of the package split: `targets` can watch a
+file but not an installed package, so a package change does **not** re-render this report. The
+provenance banner records `packageVersion("scarab")` so a reader can at least see which version
+produced the numbers. To work interactively instead:
+
+```r
+# scarab is attached in the setup chunk; there is nothing to re-source.
+clips <- read_junction_clips("data/cellranger_Rx_4/sample_alignments.bam", "Rx_4")
+table(classify_clips(clips)$class)
+
+# the genome-mapped channel, restricted to a window so it returns in seconds rather than ~105 min
+read_genomic_clips("data/cellranger_Rx_4/sample_alignments.bam", "Rx_4",
+                   region = GenomicRanges::GRanges("chr9", IRanges::IRanges(53079416, 53080416)))
+```
+
+Two parameters in `IS_DEFAULTS` are measurements rather than preferences, and should not be adjusted
+without redoing the measurement. `min_assign = 10` is where the decoy flanks stop returning hits.
+`absorb_window = 2` is **mandatory**: the provirus's terminal base is absorbed into the host
+alignment whenever it matches the host's first base, and without the tolerance the boundary test
+returns zero hits at a site known to be there — a failure that presents as "the channel doesn't
+work" rather than as a bug.
+
+The thresholds used for the tables in this report are listed below; the setup that loads them runs first.
+
+
+```{r is-defaults}
+# Not vapply(..., character(1)): assign_floor is a two-element policy rather than a scalar, and
+# flattening the defaults assumed every entry was length one. A nested entry is printed as its
+# named parts, so the floor shows as "min_len = 6, exact_below = 15" and stays one row.
+fmt_default <- function(x) {
+  if (is.list(x) && !is.null(names(x))) {
+    paste(sprintf("%s = %s", names(x), vapply(x, as.character, character(1))), collapse = ", ")
+  } else {
+    paste(as.character(x), collapse = ", ")
+  }
+}
+
+dplyr::tibble(parameter = names(IS_DEFAULTS),
+              value     = vapply(IS_DEFAULTS, fmt_default, character(1))) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 12))
+```
+
+

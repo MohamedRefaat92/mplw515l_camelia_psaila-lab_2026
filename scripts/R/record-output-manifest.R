@@ -19,7 +19,7 @@
 suppressMessages({
   library(readr)
 })
-source("src/R/integration-sites.R")
+library(scarab)   # for write_csv_checked() and record_in_manifest(); the pipeline is a package now
 
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) != 1L) {

@@ -1,0 +1,790 @@
+---
+title: "scarab — qualifying clones and their distribution"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+Which sites qualify as clones, how many cells each carries, how they distribute across samples and replicates, and where they sit in transcriptional space. Clone-size estimation and what share of the repertoire this assay can account for.
+
+Part of the scarab integration-site analysis, which is four reports:
+[method and parameters](../scarab-methods/scarab-methods.html) ·
+[detections and confidence](../scarab-qc/scarab-qc.html) ·
+[clones](../scarab-clones/scarab-clones.html) ·
+[exploration](../scarab-exploration/scarab-exploration.html).
+
+```{r setup}
+#| include: false
+# Shared across the four reports: the pipeline's output tables, the clone palette, the tube map and
+# the parameter object. One file, so four reports cannot disagree about what they read or how a
+# clone is coloured.
+source("notebooks/integration-sites/_setup.R")
+```
+
+# Cell-level clone labels
+
+`cell_site_assignments.csv` is the table that matters downstream: one row per cell per site, which
+joins onto the Seurat metadata and turns a genomic locus into a clone label.
+
+The two compartments are embedded separately, so each keeps its own UMAP: the HSC panel comes from
+`mpn_processed_hsc_fullcc` (tubes Rx_3, Rx_4, Rx_5) and the MNC panel from `mpn_processed_mnc` (Rx_6,
+Rx_7, Rx_8). Both carry the `umap.nn` reduction. The extraction's `tube` and `barcode` concatenate to
+exactly the Seurat cell name, so the join needs no barcode surgery.
+
+```{r join-metadata}
+# The slim embedding TARGET, not the 2 GB Seurat objects. `is_cell_embedding` is built once in
+# _targets.R from all four objects - both compartments, pre- and post-QC - and carries coordinates,
+# cluster, replicate call and QC flag. A report that draws clones on a UMAP needs those columns and
+# nothing else from the object they came from; reading the object instead cost ten minutes per
+# report, which splitting one report into four would have multiplied by four.
+#
+# What is NOT in it: the counts and the cell-cell graph. Those are their own targets, read only by
+# scarab-exploration, which is the one report that needs them.
+#
+# The tar_read() is written out here, literally, in every report that needs it, because
+# tar_knitr_deps() scans the .qmd and not the file it sources: a tar_read() inside _setup.R would
+# leave the pipeline unaware that this report depends on the target at all.
+emb_all <- tar_read(is_cell_embedding)
+
+# `embedding`, `labelled`, `embedding_raw`, `labelled_raw`, `hashtag_calls` - the join between the
+# assignment table and the cells, with the hashtag-file-vs-object check. In _setup.R because
+# scarab-qc and scarab-exploration need the same tables and must not build them differently.
+list2env(build_cell_tables(emb_all), environment())
+
+dplyr::tibble(
+  metric = c("cell-site assignments in the table",
+             "in a tube these two objects cover",
+             "matched to a cell in them",
+             "of those, cells passing QC",
+             "distinct cells with a clone label"),
+  value  = c(nrow(assign),
+             sum(assign$tube %in% unique(embedding$tube)),
+             nrow(labelled),
+             sum(labelled$pass_cell, na.rm = TRUE),
+             dplyr::n_distinct(labelled$cell))
+) %>% DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+**Where the labelled cells go, since the pipeline's count and the figures' count differ and the
+difference should be named rather than noticed.** The pipeline writes
+**`r scales::comma(nrow(assign))` assignments over
+`r scales::comma(dplyr::n_distinct(paste(assign$tube, assign$barcode)))` distinct cells**. Counted outside the Seurat objects, they sit in the tubes like this:
+
+| tube | Rx_1 | Rx_2 | Rx_3 | Rx_4 | Rx_5 | Rx_6 | Rx_7 |
+|---|---|---|---|---|---|---|---|
+| labelled cells | 1 | 5 | 36 | 665 | 1 | 466 | 12 |
+
+and reach the joined table above by one subtraction:
+
+- **−5 or so** in the stroma tubes, Rx_1 and Rx_2. Those tubes are in neither embedded panel — the
+  HSC panel is Rx_3/4/5 and the MNC panel Rx_6/7/8 — so their cells cannot join and drop out of
+  every figure below. One of them is the Rx_1 wild-type cell discussed under Limitations.
+
+There used to be a second subtraction, and it was a defect rather than a filter. 33 barcodes in the
+cell table appeared in no demultiplexer output at all, and the reason turned out to be that **none of
+them was a called cell**: the BAM carries error-corrected `CB` tags for droplets Cell Ranger did not
+call, and this pipeline read those tags without checking. They were the ambient population arriving
+in the cell table as cells — 2.8% of it. `read_called_barcodes()` now restricts cell evidence to
+Cell Ranger's filtered barcode list, captured with the run in `work/called_barcodes.csv.gz`, and the
+filter removed **34** barcodes on the current run. The clip and genomic tables deliberately keep
+them, because the ambient rate above is computed from exactly those rows.
+
+The `pass_cell` row in the table above is the last step, and only the render can produce it, because
+`pass_cell` lives in the Seurat objects; everything above it is reproducible from the CSVs alone.
+
+Two separate drops are expected. Assignments in tubes these objects do not cover — the stroma tubes —
+fall out at the second row. The larger drop is at the third: the extraction uses every barcode Cell
+Ranger corrected, which is a substantially bigger set than the cells that survived calling and QC.
+The fourth row equals the third because these processed objects are already QC-filtered, so it is a
+consistency check rather than a further filter.
+
+## Do the labels land where the sort says they should?
+
+An independent check that costs nothing. These cells were FACS-sorted on mCherry protein before
+sequencing, and that sort knows nothing about soft-clipped reads. If the junctions are genuine vector
+integrations, labelled cells should sit almost entirely in the mCherry⁺ fraction.
+
+```{r sort-check}
+labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::count(sorted, name = "labelled cells") %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+A handful in the mCherry⁻ fraction is expected rather than alarming: the sort gates on protein, and a
+transduced cell expressing below the gate still carries the provirus. The same cells drove the
+false-negative discussion in the transgene-detection report.
+
+## Where the clones sit on the UMAP
+
+The question these tables answer is whether clone labels survive QC, and whether they are
+concentrated in the part of the manifold QC removes — debris, dying cells, ambient-heavy droplets.
+A clone label is attached to a *barcode*, and the extraction never consulted the QC flags, so this
+has to be checked rather than assumed.
+
+```{r raw-vs-clean}
+labelled_raw |>
+  dplyr::count(panel, pass_cell, name = "labelled barcodes") |>
+  tidyr::pivot_wider(names_from = pass_cell, values_from = `labelled barcodes`,
+                     values_fill = 0L, names_prefix = "pass_cell_") |>
+  dplyr::mutate(`% kept by QC` = sprintf("%.0f%%", 100 * pass_cell_TRUE /
+                                           (pass_cell_TRUE + pass_cell_FALSE))) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+Labelled barcodes are spread across the manifold rather than piled into one corner, so the labels are
+not an artefact of low-quality droplets. Their QC survival, though, does not simply track the overall
+rate, and the two compartments disagree about the direction:
+
+| | labelled barcodes kept | all barcodes kept |
+|---|---|---|
+| HSC | **82%** | 69% |
+| MNC | **58%** | 68% |
+
+In HSC, labelled barcodes are *enriched* for cells that pass. That is the expected direction and has
+a mechanical explanation: detection requires capturing one of a few read-through molecules, which is
+likelier in a deeply sequenced cell, and deeply sequenced cells also pass QC more often. Labelling is
+partly a depth assay.
+
+MNC runs the other way, modestly. I do not have an explanation for that, and with 128 labelled
+barcodes it is not a large enough sample to pursue one. It is recorded rather than explained, and it
+is worth remembering before treating HSC and MNC clone sizes as directly comparable — the two
+compartments do not lose labelled cells at the same rate.
+
+### After QC filtering
+
+This is the embedding the rest of the report uses.
+
+```{r umap-clones, fig.height=6, fig.width=11}
+clone_umap <- function(panel_name) {
+  bg  <- dplyr::filter(embedding, panel == panel_name, pass_cell)
+  fg  <- dplyr::filter(labelled,  panel == panel_name, pass_cell)
+  ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(colour = "grey88", size = 0.25, stroke = 0) +
+    geom_point(data = fg, aes(colour = site_id), size = 1.5, alpha = 0.9) +
+    # Set1 caps at 9 colours and there are more sites than that, so a qualitative ColorBrewer palette is out;
+    # site_palette is glasbey, built above for exactly this reason
+    scale_colour_manual(values = site_palette, drop = FALSE) +
+    labs(title = panel_name, colour = "clone",
+         subtitle = sprintf("%s cells, %s carrying a detected integration site",
+                            scales::comma(nrow(bg)), scales::comma(nrow(fg)))) +
+    theme(axis.text = element_blank(), panel.grid = element_blank())
+}
+
+clone_umap("HSC") | clone_umap("MNC")
+```
+
+Grey is every cell passing QC in that compartment; colour is the few hundred carrying a detected
+junction. The sparseness is the point and is not evidence of rarity — detection needs a read-through
+molecule to have been captured for that specific cell, so most members of a real clone carry no
+label. Read the colours as a *sample* of each clone, not its extent.
+
+## The same map, weighted by how well each cell is supported
+
+Every coloured dot above is drawn identically, which overstates the weaker ones. Each assignment
+rests on a different amount of evidence, and there are two measures of it that mean different things:
+
+| measure | range here | what it means |
+|---|---|---|
+| **UMIs** | 1 (96%), 2 (11 cells), 3 (2 cells) | *independent molecules* — the honest measure |
+| **reads** | 1–9 | sequencing depth on those molecules, mostly PCR duplicates |
+
+The principled choice is UMIs, and it is nearly useless here: 310 of 323 assignments rest on a single
+captured molecule. So size encodes **reads**, which at least varies, and a black ring marks the 13
+cells with more than one UMI — the only ones whose evidence is genuinely independent.
+
+```{r umap-confidence, fig.height=6, fig.width=11}
+confidence_umap <- function(panel_name) {
+  bg <- dplyr::filter(embedding, panel == panel_name, pass_cell)
+  fg <- dplyr::filter(labelled,  panel == panel_name, pass_cell) |>
+    dplyr::arrange(dplyr::desc(reads))      # large drawn first, so small stay visible on top
+  ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(colour = "grey88", size = 0.25, stroke = 0) +
+    # Two layers, and the no-border one uses stroke = 0 rather than a colour. Every other way of
+    # saying "no border" fails: colour = NA, whether mapped or fixed, makes ggplot treat the row as
+    # missing and drop the point at draw time, and "transparent" (= white at alpha 0) collides with
+    # alpha=, which overwrites the alpha channel and leaves an opaque white ring. stroke = 0 gives
+    # the border no width, so its colour never matters.
+    geom_point(data = dplyr::filter(fg, umis < 2),
+               aes(fill = site_id, size = reads),
+               shape = 21, stroke = 0, alpha = 0.85) +
+    geom_point(data = dplyr::filter(fg, umis >= 2),
+               aes(fill = site_id, size = reads),
+               shape = 21, colour = "black", stroke = 0.7, alpha = 0.85) +
+    scale_fill_manual(values = site_palette, drop = FALSE) +
+    # limits from the whole table, not the panel: otherwise each panel scales to its own maximum
+    # (6 in HSC, 9 in MNC) and a dot of a given size would mean different things in the two
+    scale_size_continuous(range = c(1.2, 5), breaks = c(1, 2, 4, 6, 9),
+                          limits = range(labelled$reads)) +
+    guides(fill = guide_legend(override.aes = list(size = 3))) +
+    labs(title = panel_name, fill = "clone", size = "reads") +
+    theme(axis.text = element_blank(), panel.grid = element_blank())
+}
+
+confidence_umap("HSC") | confidence_umap("MNC")
+```
+
+```{r confidence-table}
+labelled |>
+  dplyr::filter(pass_cell) |>
+  dplyr::mutate(support = dplyr::case_when(
+    umis >= 2   ~ "2+ UMIs (independent molecules)",
+    reads >= 3  ~ "1 UMI, 3+ reads",
+    reads == 2  ~ "1 UMI, 2 reads",
+    TRUE        ~ "1 UMI, 1 read (weakest)")) |>
+  dplyr::count(panel, support, name = "cells") |>
+  tidyr::pivot_wider(names_from = panel, values_from = cells, values_fill = 0L) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+The conclusion to draw from this figure is not that some dots are trustworthy and others are not. It
+is that **per-cell confidence is uniformly low**, because a cell is labelled only when one of its rare
+read-through molecules happened to be sequenced. The evidence for a clone is not in any single dot; it
+is in the 109 independent cells that carry IS01. Confidence lives at the site level, which is what the
+cell and UMI floor in the pipeline tests, and this plot is best read as a reminder that no
+individual dot should be leaned on.
+
+## Detected clones by replicate
+
+Each tube pools several hashtagged mice, and `dm2_class` records which one a cell was called to. That
+makes this the figure that decides whether the clones are what they appear to be. A lentiviral
+integration site is created once, in one transduced cell, in one animal. **A genuine clone must
+therefore sit inside a single replicate.** A site spread evenly across replicates is not a clone — it
+is cross-contamination, ambient vector, or a demultiplexing failure.
+
+Shown before and after QC filtering, for each compartment. The grey in each panel is that replicate's
+own cells.
+
+```{r replicate-umap-fn}
+replicate_umap <- function(emb, lab, panel_name, subtitle) {
+  bg <- dplyr::filter(emb, panel == panel_name, !is.na(replicate))
+  fg <- dplyr::filter(lab, panel == panel_name, !is.na(replicate))
+  ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(colour = "grey85", size = 0.18, stroke = 0) +
+    geom_point(data = fg, aes(colour = site_id), size = 1.3, alpha = 0.9) +
+    scale_colour_manual(values = site_palette, drop = FALSE) +
+    facet_wrap(~ replicate, nrow = 1, drop = FALSE) +
+    guides(colour = guide_legend(override.aes = list(size = 3))) +
+    labs(title = panel_name, subtitle = subtitle, colour = "clone", x = NULL, y = NULL) +
+    theme(axis.text = element_blank(), panel.grid = element_blank(),
+          strip.text = element_text(size = 8))
+}
+```
+
+```{r replicate-hsc, fig.height=3.2, fig.width=13}
+replicate_umap(embedding_raw, labelled_raw, "HSC", "before QC filtering")
+replicate_umap(dplyr::filter(embedding, pass_cell), dplyr::filter(labelled, pass_cell),
+               "HSC", "after QC filtering")
+```
+
+```{r replicate-mnc, fig.height=3.2, fig.width=13}
+replicate_umap(embedding_raw, labelled_raw, "MNC", "before QC filtering")
+replicate_umap(dplyr::filter(embedding, pass_cell), dplyr::filter(labelled, pass_cell),
+               "MNC", "after QC filtering")
+```
+
+```{r replicate-table}
+dplyr::bind_rows(
+  dplyr::mutate(labelled_raw, stage = "before QC"),
+  dplyr::mutate(dplyr::filter(labelled, pass_cell), stage = "after QC")
+) |>
+  dplyr::filter(!is.na(replicate)) |>
+  dplyr::count(stage, panel, site_id, replicate, name = "cells") |>
+  tidyr::pivot_wider(names_from = replicate, values_from = cells,
+                     values_fill = 0L, names_prefix = "") |>
+  dplyr::arrange(stage, panel, site_id) |>
+  DT::datatable(rownames = FALSE, filter = "top",
+                options = list(pageLength = 20, scrollX = TRUE))
+```
+
+Read the table rather than the figure for this one: the question is whether each row has its mass in a
+single column. Where a site is confined to one replicate, it behaves like a clone. Where it is spread,
+it does not, whatever its total cell count — and that is a check the site-level thresholds in the
+pipeline cannot make, because they only count cells and UMIs.
+
+## The same map, split by sample
+
+Each compartment pools three samples, and they are not equivalent: one sorted mCherry⁺, one sorted
+mCherry⁻, one wild-type. Pooling them hides the single most informative comparison, because the
+wild-type samples are the assay's negative control and should be empty.
+
+`sample.name` is one-to-one with the tube, so the six samples are exactly the six cells of this grid.
+Faceting on the sort fraction rather than the name itself keeps each compartment in its own row — the
+two UMAPs are separate embeddings and must not be drawn in each other's panels.
+
+Each panel shows **that sample's own cells** in grey, with its detected clones highlighted on top. So
+the grey is a result too, not just scenery: it is where that sample sits in the shared embedding, and
+the three samples do not occupy it identically.
+
+```{r umap-by-sample, fig.height=7, fig.width=12}
+sample_key <- embedding %>%
+  dplyr::distinct(panel, sorted, sample_name, tube) %>%
+  dplyr::arrange(panel, sorted)
+
+ggplot(dplyr::filter(labelled, pass_cell), aes(UMAP_1, UMAP_2)) +
+  # The grey keeps `sorted`, so each panel is that sample's own cells and nothing else.
+  geom_point(data = dplyr::filter(embedding, pass_cell),
+             colour = "grey80", size = 0.2, stroke = 0) +
+  geom_point(aes(colour = site_id), size = 1.6, alpha = 0.9) +
+  scale_colour_manual(values = site_palette, drop = FALSE) +
+  # drop = FALSE keeps the wild-type column, which has no labelled cells and is the point
+  facet_grid(panel ~ sorted, switch = "y", drop = FALSE) +
+  labs(title = "Detected clones by sample", colour = "clone", x = NULL, y = NULL) +
+  theme(axis.text = element_blank(), panel.grid = element_blank(),
+        strip.text.y.left = element_text(angle = 0))
+```
+
+```{r sample-key}
+labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::count(panel, sorted, name = "labelled cells") %>%
+  dplyr::right_join(sample_key, by = c("panel", "sorted")) %>%
+  dplyr::mutate(`labelled cells` = tidyr::replace_na(`labelled cells`, 0L)) %>%
+  dplyr::select(sample = sample_name, tube, compartment = panel, sorted, `labelled cells`) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+The wild-type columns are the result to check first. Those animals never received the vector, so a
+clone label there would be an outright false positive — ambient contamination or index hopping — and
+would put a number on the floor beneath every other panel. The mCherry⁻ columns are a different
+matter: those cells failed a gate on *protein*, which is not the same as lacking the provirus, so a
+label there is informative rather than wrong.
+
+::: {.panel-tabset}
+
+```{r umap-facet, fig.height=7.5, fig.width=12, results="asis"}
+# One panel per clone, so sites with few cells are not hidden under the larger ones; one tab per
+# compartment, the clones wrapped into rows of square panels so each UMAP keeps its shape (a single
+# row of 15 squashed every panel to a narrow strip). The grey layer has no `site_id`, so ggplot
+# repeats it in every panel.
+clone_cols <- 5
+for (cmp in levels(factor(embedding$panel))) {
+  cat("### ", cmp, "\n\n", sep = "")
+  print(
+    ggplot(dplyr::filter(labelled, pass_cell, panel == cmp), aes(UMAP_1, UMAP_2)) +
+      geom_point(data = dplyr::select(dplyr::filter(embedding, pass_cell, panel == cmp),
+                                      UMAP_1, UMAP_2),
+                 colour = "grey90", size = 0.15, stroke = 0) +
+      geom_point(colour = "firebrick", size = 1.1) +
+      facet_wrap(~ site_id, ncol = clone_cols, drop = FALSE) +
+      labs(title = paste0("Each clone on its own panel: ", cmp), x = NULL, y = NULL) +
+      theme(axis.text = element_blank(), axis.ticks = element_blank(),
+            panel.grid = element_blank(), aspect.ratio = 1)
+  )
+  cat("\n\n")
+}
+```
+
+:::
+
+The same clones, one tab each, with HSC and MNC side by side: where a clone sits in one
+compartment against where it sits in the other. This is the transpose of the figure above, not a
+repeat of it — that one asks which clones occupy a compartment, this one asks where a given clone
+sits in both.
+
+::: {.panel-tabset}
+
+```{r umap-facet-by-clone, fig.height=5, fig.width=10, results="asis"}
+# Each compartment has its own embedding, so scales are free; the grey layer carries `panel`, so
+# each side gets its own compartment's cells. drop = FALSE keeps a compartment with no cells of the
+# clone as an empty map, which is itself the result - and it only does so if `panel` is a factor
+# carrying every compartment as a level, which a filtered character column is not.
+panel_levels <- levels(factor(embedding$panel))
+as_panel  <- function(d) dplyr::mutate(d, panel = factor(panel, levels = panel_levels))
+clone_ids <- levels(factor(labelled$site_id))
+bg_cells  <- as_panel(dplyr::select(dplyr::filter(embedding, pass_cell), panel, UMAP_1, UMAP_2))
+for (clone in clone_ids) {
+  cells <- as_panel(dplyr::filter(labelled, pass_cell, site_id == clone))
+  n_by  <- table(cells$panel)
+  cat("### ", clone, "\n\n", sep = "")
+  print(
+    ggplot(cells, aes(UMAP_1, UMAP_2)) +
+      geom_point(data = bg_cells, colour = "grey90", size = 0.15, stroke = 0) +
+      geom_point(colour = "firebrick", size = 1.3) +
+      facet_wrap(~ panel, nrow = 1, scales = "free", drop = FALSE,
+                 labeller = labeller(panel = function(p) sprintf("%s (%d cells)", p, n_by[p]))) +
+      labs(title = paste0("Clone ", clone, ": HSC and MNC"), x = NULL, y = NULL) +
+      theme(axis.text = element_blank(), axis.ticks = element_blank(),
+            panel.grid = element_blank(), aspect.ratio = 1)
+  )
+  cat("\n\n")
+}
+```
+
+:::
+
+A clone confined to one region of the embedding would suggest its cells share a state; one scattered
+across the map suggests the opposite. The eye is not admissible evidence for that, so the next
+section tests it.
+
+
+## Clone sizes by compartment
+
+
+```{r clone-sizes}
+labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::count(site_id, sorted, panel, name = "cells") %>%
+  tidyr::pivot_wider(names_from = panel, values_from = cells, values_fill = 0) %>%
+  dplyr::mutate(total = rowSums(dplyr::pick(dplyr::where(is.numeric)))) %>%
+  dplyr::arrange(dplyr::desc(total)) %>%
+  DT::datatable(rownames = FALSE, options = list(pageLength = 20, scrollX = TRUE))
+```
+
+Reading a clone present in both HSC and MNC as evidence of ongoing output from a labelled stem cell is
+tempting, and it is the interesting hypothesis — but note the asymmetry in what the two fractions
+sample, and that both are drawn from the same ambient pool, before leaning on it.
+
+
+# Clone size
+
+The two results below — how large the clones are, and what share of the transduced
+population they account for — are what this report is most likely to be cited for. They used to sit
+three levels down, under a methods question about cells carrying more than one site.
+
+## A detection rate that works, and a capture–recapture that cannot
+
+The two channels read the same junctions through different reads, so the tempting argument writes
+itself: a cell carrying a clone can be captured by either channel, the overlap between them measures
+the capture probability, and Chapman's `(n₁+1)(n₂+1)/(m+1) − 1` turns that into the clone size
+*including* the cells neither channel saw. `channel_capture_recapture.csv` carries that calculation,
+and the estimate that replaces it.
+
+```{r channel-overlap}
+readr::read_csv(file.path(sites_dir, "channel_capture_recapture.csv"), show_col_types = FALSE) |>
+  dplyr::transmute(site_id, detected, umis_per_cell = round(umis_per_cell, 2),
+                   frac_one_umi = round(frac_one_umi, 2),
+                   lambda = round(lambda, 2), detection = round(detection, 3), n_ztp,
+                   n_three, n_genomic, m_both,
+                   chapman = round(chapman), `± se` = round(chapman_se),
+                   m_expected = round(m_exp_molecule, 1), ratio = round(m_ratio, 2)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 15, scrollX = TRUE)) |>
+  DT::formatStyle("chapman", color = "#999999")
+```
+
+It returns 650–950 cells for the four largest sites against 130–342 detected: the assay would be
+seeing a third to a half of each clone. **That number has no referent in this design**, and the
+reason is structural rather than a matter of bias.
+
+**It is a partition, not two samples.** Lincoln–Petersen estimates a population from two independent
+*samples* of it. These two channels are not two samples — they are a partition of one. Every junction
+molecule belongs to exactly one channel, decided by where its fragment straddles the junction: more
+vector than host and it is read against the contig, more host than vector and it is read against the
+genome. Nothing is released and recaptured, so there is no capture probability to estimate, and
+`n₁n₂/m` is not a biased estimate of the clone — it is a ratio of two halves of one draw. No
+correction rescues a quantity that has nothing to refer to.
+
+The molecule model makes that concrete and predicts the overlap, which is the useful thing a wrong
+model can do. Which channel a junction read falls in is decided by where its fragment straddles the
+junction — more vector than host and it reads against the contig, more host than vector and it reads
+against the genome — and every read of one UMI is a duplicate of one fragment. **The draw happens
+once per molecule, not once per read**, so a cell can appear in both channels only if it holds at
+least two junction molecules. Between 73% and 100% of cells hold exactly one. `m` is therefore small
+for a reason that has nothing to do with undetected cells, and a small `m` is precisely what inflates
+`N̂`.
+
+`m_expected` is that model's prediction with **no hidden population at all**: for a cell with `k`
+molecules and a per-molecule probability `p` of landing in the 3′ channel, `P(both) = 1 − pᵏ −
+(1−p)ᵏ`, summed over the cells actually in hand. Across the eleven sites with at least ten cells it
+predicts 110 cells in both channels against 150 observed. The same calculation done on reads instead
+of molecules predicts 430 — being wrong by a factor of three is what the molecule distinction is
+worth, and why `cell_site_assignments.csv` carries `umis_three` and `umis_genomic` and not only the
+read counts.
+
+So the mechanism is real and large. An earlier version of this section then reported a 40-cell
+excess of observed overlap over that prediction, `z = 6`, and attributed it to residual correlation in
+capture. **That excess was an artefact of counting, and the diagnostic that found it is one query.**
+
+Under the model a molecule has one anchor length and therefore falls in exactly one channel, so a
+cell holding a single molecule cannot appear in both. Ask whether the cells counted in `m` really
+hold two molecules:
+
+| of the 150 cells counted in both channels | |
+|---|---|
+| share at least one UMI between the channels | **72 (48%)** |
+| hold only **one** distinct molecule in total | **52 (35%)** |
+| `m` recounted on genuinely distinct molecules | **83**, against 150 as counted |
+
+73 of 1,434 molecules appear in both channels, so the split is **not a partition at the molecule
+level** — which is the assumption every channel-overlap estimator rests on — and a third of the
+apparent two-capture cells are one molecule counted twice. With `m` on distinct molecules the totals
+read 83 observed against 109.8 predicted, where before they read 150 against 109.8. The prediction
+sits between the two ways of counting, so the honest statement is that **the overlap is consistent
+with the per-molecule model and the earlier excess is withdrawn**. `m_distinct` and
+`cells_sharing_a_umi` are in the CSV so the arithmetic is inspectable.
+
+The consequence for the estimator is sharper than the consequence for the model. Any λ derived from
+the channel overlap inherits the inflated `m`: fitted on these data it exceeds the molecule-count λ
+at every site where both are defined, by 1.17× to 2.22×, in exactly the direction double counting
+predicts. **That estimator is therefore not used here.** The one below uses the molecule counts,
+which do not require the partition to hold.
+
+### The estimate the section actually needs
+
+The same molecule counts that invalidate the overlap support a different estimator, and this one does
+have a referent. If a clone's cells each yield Poisson(λ) *detected* junction molecules, the cells
+with zero are exactly the ones missing from the table, and the mean of the **zero-truncated**
+distribution — `λ / (1 − e^−λ)` — identifies λ from the cells in hand. Then `1 − e^−λ` is a per-cell
+detection rate and `detected / (1 − e^−λ)` a clone size. No second sample is required.
+
+```{r detection-model}
+readr::read_csv(file.path(sites_dir, "detection_model.csv"), show_col_types = FALSE) |>
+  dplyr::transmute(site = site_id, detected = cells,
+                   `molecules/cell` = round(mean_molecules, 2), λ = round(lambda, 2),
+                   detection = round(detection, 3), `clone size` = clone_size,
+                   `95% CI` = ifelse(is.na(clone_lo), NA_character_,
+                                     sprintf("%d – %d", clone_lo, clone_hi)),
+                   `obs 1 mol` = obs_1, `exp 1 mol` = round(exp_1),
+                   `obs 2 mol` = obs_2, `exp 2 mol` = round(exp_2)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "t", pageLength = 15, scrollX = TRUE))
+```
+
+**Read the top row and the bottom row together.** IS05 averages 2.75 molecules a cell and the
+estimator returns 58 against 53 detected — 92% detection, tightly bounded, and the one case where
+the method can see what it is doing.
+
+**But be precise about what IS05 validates.** It is the only site with within-cell replication, the
+only one where the fit can be checked against itself, and the anchor for the claim that this
+machinery works — and it sits at **91% detection**, where the correction is a factor of 1.1 and
+barely matters. The sites where the correction is large have no comparable check: IS01 at 28%
+detection is a **3.6× extrapolation** with nothing validating it at that depth. IS05 also belongs to
+B0304, the animal supplying a tenth of the mCherry⁺ cells. **IS05 validates the fit, not the
+extrapolation.** The nine sites at or below 1.09 molecules a cell get `NA`: at
+exactly 1.00 the fit is degenerate, λ → 0 and the clone size goes to infinity, so the pipeline
+declines rather than printing a number. **Those are not nine gaps to fill later** — for a 2-cell site
+the correction would be meaningless against its own uncertainty.
+
+**The Poisson fits, which was not expected.** 240 IS02 cells hold one molecule against 232 predicted
+and 76 hold two against 85; IS01 gives 273 against 269 and 37 against 43. The plan anticipated
+overdispersion and a negative-binomial refit, on the strength of 150 both-channel cells against a
+predicted 110 — and that excess turned out to be the same molecule counted twice. With the counting
+fixed there is nothing left to refit. (Do not read the fit from the variance-to-mean ratio: a
+zero-truncated Poisson with small λ is underdispersed by construction, 0.41 at IS02 and 0.17 at IS01,
+so comparing it to 1 suggests a problem that is not there.)
+
+# Repertoire completeness, and what the denominator should be
+
+Detection-corrected clone sizes make completeness answerable, and the first attempt used the obvious
+denominator — the 43,332 sorted mCherry⁺ cells. That denominator is wrong, and the test that shows it
+is independent of junctions entirely.
+
+```{r vector-expression}
+#| fig-cap: "Cells carrying vector transcript, by tube. Measured from reads on the reporter contig
+#|   (mCherry, DRE, WPRE-LTR), so it is independent of the junction data. The wild-type tubes are the
+#|   control: 4 and 6 cells, which is the false-positive rate of the measurement."
+#| fig-width: 7.5
+#| fig-height: 3.4
+
+vexp <- readr::read_csv(file.path(sites_dir, "vector_expression.csv"), show_col_types = FALSE) |>
+  dplyr::left_join(dplyr::select(tube_map, tube = Tube, label = Label), by = "tube") |>
+  dplyr::mutate(label = ifelse(is.na(label), tube, paste0(tube, "  ", label)),
+                sorted = dplyr::case_when(tube %in% c("Rx_4", "Rx_6") ~ "sorted mCherry+",
+                                          tube %in% c("Rx_3", "Rx_7") ~ "sorted mCherry−",
+                                          TRUE ~ "wild-type / stroma"),
+                label = stats::reorder(label, vector_share))
+
+ggplot(vexp, aes(vector_share, label, fill = sorted)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = sprintf("%.1f%%", 100 * vector_share)),
+            hjust = -0.15, size = 3.1, colour = "grey20") +
+  scale_fill_manual(values = c(`sorted mCherry+` = "#D55E00",
+                               `sorted mCherry−` = "#0072B2",
+                               `wild-type / stroma` = "#999999"), name = NULL) +
+  scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "called cells carrying any vector transcript", y = NULL,
+       title = "The mCherry+ gate is about half pure") +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank(),
+        legend.position = "bottom", plot.title = element_text(size = 11))
+```
+
+**Only 65.2% of Rx_4 and 43.2% of Rx_6 called cells carry any vector transcript — 53.6% pooled.** The
+wild-type tubes give 4 of 26,822 and 6 of 17,784, so the measurement has essentially no
+false-positive rate and the shortfall is real. A cell with no vector transcript cannot produce a
+junction read, whether it was never transduced or its provirus is wholly silent, so it has no place
+in the denominator of a junction-based completeness figure.
+
+```{r completeness}
+comp_tbl <- readr::read_csv(file.path(sites_dir, "repertoire_completeness.csv"),
+                            show_col_types = FALSE)
+comp_tbl |>
+  dplyr::transmute(denominator, cells = scales::comma(cells),
+                   `labelled` = scales::comma(detected_cells),
+                   `floor (model-free)` = sprintf("%.1f%%", 100 * floor_share),
+                   `corrected cells` = scales::comma(corrected_cells),
+                   `corrected, 95% PI` = sprintf("%s – %s", scales::comma(corrected_cells_lo),
+                                                 scales::comma(corrected_cells_hi)),
+                   `ceiling usable?` = ifelse(ceiling_uninformative, "**no**", "yes")) |>
+  knitr::kable()
+```
+
+### The ceiling was the median's false precision, and it is withdrawn
+
+The corrected column rests on filling in detection for the sites where the zero-truncated Poisson is
+degenerate — 10 of 16, where molecules per cell never clears 1.10. That filling-in used to be the
+**median detection of the six sites that do fit**, and that is a model: it assumes detection is
+exchangeable across sites. It was unstated, it carried no uncertainty, and it was fitted on a sample
+*selected for high λ*, since high λ is exactly what makes a site estimable. Three ways to be wrong at
+once, and the result — "12.5% ceiling" — was quoted as though it were measured.
+
+Replace it with the one covariate that is available and is measured independently of the junction
+data. A junction read is a read-through of the vector transcript, so a site whose cells carry ten
+times the vector UMIs should have roughly ten times the chance of yielding one; vector expression per
+cell is already computed above, and it spans ~20× across these sites. Regress log λ on log mean
+vector expression over the sites that fit, and predict the rest with a **prediction** interval:
+
+```{r detection-regression}
+detr |>
+  dplyr::transmute(
+    site_id, cells,
+    `vector UMIs/cell` = round(vector_umis_mean, 1),
+    `λ` = signif(lambda_used, 3),
+    source = ifelse(lambda_source == "fitted (ZTP)", "fitted", "predicted"),
+    detection = sprintf("%.2f", detection_used),
+    `detection, 95% PI` = ifelse(is.na(detection_lo), "—",
+                                 sprintf("%.2f – %.2f", detection_lo, detection_hi)),
+    `clone size` = round(size_used),
+    `clone size, 95% PI` = ifelse(is.na(size_lo), "—",
+                                  sprintf("%s – %s", scales::comma(round(size_lo)),
+                                          scales::comma(round(size_hi))))) |>
+  knitr::kable(align = "lrrrlrlrl")
+```
+
+```{r regression-fit}
+#| fig-cap: "Per-cell detection against vector expression, over the six sites where the ZTP fits.
+#|   The fitted slope is where the mechanism says it should be, and six points cannot establish it."
+#| fig-width: 5.6
+#| fig-height: 3.8
+
+fitted_only <- dplyr::filter(detr, lambda_source == "fitted (ZTP)")
+ggplot(detr, aes(vector_umis_mean, lambda_used)) +
+  geom_smooth(data = fitted_only, method = "lm", formula = y ~ x, se = TRUE,
+              colour = "#0072B2", fill = "#0072B2", alpha = 0.12, linewidth = 0.6) +
+  geom_linerange(aes(ymin = lambda_used_lo, ymax = lambda_used_hi), colour = "grey70",
+                 linewidth = 0.5, na.rm = TRUE) +
+  geom_point(aes(shape = lambda_source), size = 2.4, colour = "grey20", fill = "white",
+             stroke = 0.8) +
+  ggrepel::geom_text_repel(aes(label = site_id), size = 2.9, colour = "grey30", seed = 2,
+                           min.segment.length = 0.2) +
+  scale_shape_manual(values = c(`fitted (ZTP)` = 19,
+                                `predicted (vector expression)` = 21), name = NULL) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "mean vector UMIs per cell", y = expression(lambda),
+       title = sprintf("slope %.2f ± %.2f, p = %.2f, R² = %.2f",
+                       detr$slope[1], detr$slope_se[1], detr$slope_p[1], detr$r2[1])) +
+  theme(legend.position = "bottom", plot.title = element_text(size = 10))
+```
+
+**The slope lands exactly where the mechanism predicts, and six points cannot establish it.**
+Proportionality means a slope of 1 on these axes; the estimate is 1.04 ± 0.72, with *p* = 0.22 and
+R² = 0.34. The covariate is not distinguishable from no covariate at all — and that is a statement
+about **power, not about mechanism**, which is a distinction worth keeping. The point estimate is the
+predicted value; what is missing is sites. This should be revisited when more than six have an
+estimable λ, not written off. The prediction intervals
+that follow span roughly two orders of magnitude, and summed across the sites they put the
+corrected cell count **above the denominator** — `ceiling_uninformative` is `TRUE` in the table above.
+
+That is not a failure of the method. It is the measurement the median was concealing: **this data
+bounds completeness from below and not from above.** Quote the 5.3% floor. The 12.5% ceiling it used
+to be quoted against was never more than an artefact of imputing one number nine times without an
+error bar, and it is withdrawn.
+
+### What the assay can see at all, by clone size
+
+There is a better question than total richness, and it is answerable. Chao1 and ACE estimate unseen
+richness from singletons and doubletons — and `min_cells` discards every cluster seen in fewer than
+`r IS_DEFAULTS$min_cells` called cells before the site table exists, so here **f₁ = 0 by
+construction** (and f₂ too at any floor above 2) and both estimators are not biased but undefined. Computing either on the surviving counts would silently describe the
+richness of the post-floor sample.
+
+But ecology has to *infer* its detection process, and this assay measures it. A clone of *N* cells is
+discovered when at least `min_cells` of its cells yield a junction molecule — a binomial with a rate
+the ZTP estimates:
+
+```{r discovery-power}
+#| fig-cap: "The probability a clone of a given size is discovered at all, at the per-cell detection
+#|   rates measured here. The assay is near-complete above ~20 cells and nearly blind below 5."
+#| fig-width: 6.4
+#| fig-height: 3.6
+
+dp <- readr::read_csv(file.path(sites_dir, "discovery_power.csv"), show_col_types = FALSE)
+ggplot(dp, aes(detection, p_discovered, group = clone_size, colour = factor(clone_size))) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.4) +
+  scale_colour_viridis_d(name = "clone size", option = "C", end = 0.9) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "per-cell detection rate", y = "P(clone discovered)",
+       title = sprintf("Discovery requires %d of a clone's cells to yield a junction",
+                       dp$min_cells[1])) +
+  theme(legend.position = "right", plot.title = element_text(size = 11))
+```
+
+At a detection rate of 0.39 — mid-range for the sites that fit — a clone of 3 is found **6%** of the
+time, a clone of 5 **30%**, a clone of 10 **82%** and a clone of 20 **99.5%**. Two things follow.
+
+**The called sites are close to the complete set of *large* clones.** Anything above ~20 cells that
+expressed at a detectable rate would almost certainly have been found, so the repertoire is not
+hiding another IS01.
+
+**And the 84% unaccounted share needs no extra hypothesis.** A repertoire dominated by clones of a
+few cells each is invisible to this assay by arithmetic alone — 20,000 cells spread over thousands of
+small clones would produce exactly what is observed. That is the expected shape of a low-MOI
+transduction. The competing explanation, clones whose proviruses are silent and so detect at ~0, is
+not excluded by anything here; both are consistent, and separating them still needs the FACS
+mCherry⁺ fraction per animal.
+
+## What the remaining cells are, and what cannot settle it
+
+So roughly 84% of vector-expressing mCherry⁺ cells belong to no called site. An earlier draft of this
+section argued two incompatible things about them at once — that the unassigned-molecule census shows
+"not a large population of undetected clones", and that those cells are clones which "never yielded a
+captured junction molecule at all". **Both cannot hold, and the second one makes the first
+unmeasurable:** a clone that yields no junction molecule leaves none to count, so a molecule census
+has no power over precisely the population it was being used to reassure about. That claim is
+withdrawn.
+
+```{r unassigned}
+readr::read_csv(file.path(sites_dir, "unassigned_molecules.csv"), show_col_types = FALSE) |>
+  dplyr::transmute(`what the molecule is` = class, molecules, cells,
+                   `cells with no assignment at all` = cells_with_no_assignment) |>
+  knitr::kable()
+```
+
+What the census *does* settle is narrower and still worth having: of the junction molecules we have,
+the ones matching no called site are overwhelmingly explained. The long, placeable ones split between
+a handful of loci that failed the cell floor — one of which, `chrX:100,691,113`, the relaxed floor
+now admits directly as IS16 — and the repetitive-flank blind spot. So **we are not discarding evidence of a
+large hidden repertoire**; we simply have no evidence about clones that produce no junctions, and the
+discovery-power curve above says how many of those there could be.
+
+The remaining gap is therefore one open question rather than a finding: whether the unaccounted cells
+are a repertoire far larger than `r nrow(ev)` clones — which, given that a clone of 3 is found 6% of the
+time, is entirely compatible with the data — or residual gate impurity beyond the vector-transcript
+test. The FACS mCherry⁺ fraction per animal is the measurement that separates them, which returns it
+to load-bearing rather than a cross-check.
+
+**One estimator, not three in agreement.** The zero-truncated Poisson gives **660 and 1,167** for
+IS02 and IS01, with bootstrap intervals of 591–757 and 952–1,530. It is the one to quote: it has a
+referent, an interval, and a fit check that passes.
+
+The other two should not be lined up beside it as corroboration. Chapman's 648 and 948 come from a
+design that cannot support the estimator at all — a partition of one capture is not two samples — so
+their closeness to the right answer is a coincidence, not agreement. And the co-occurrence inversion's
+2,312 assumes IS01 and IS02 are **fully** shared, which the depth analysis above has just argued
+against: under partial sharing the inversion is not a clone-size estimate of anything. Quoting three
+numbers that "agree on order 10³" dressed one estimate up as a consensus. **It is one estimate, and
+order 10³ against 342 and 320 detected is what it says.**
+

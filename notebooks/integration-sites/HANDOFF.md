@@ -1020,22 +1020,47 @@ junction, so they are listed under *Closed* with what each turned out to be.
 
 ## 10. Files
 
+**The pipeline is no longer in this repository.** `src/R/integration-sites.R` (3,534 lines) and
+`scripts/R/call-integration-sites.R` (629 lines) are deleted; both are now the `scarab` package at
+`/well/ludwig/users/nrs939/projects/scarab`, installed into this project's library like any other
+dependency. The reasoning behind every threshold lives beside the code that applies it, and
+`scarab::scarab_opts()` is the one place parameters live — a validated constructor, so a misspelled
+override is an error rather than a silent no-op. `scarab::scarab_inputs()` is the input contract:
+call it before submitting anything, since it checks all 52 requirements in about two seconds and the
+genome-mapped scan costs ~105 minutes a tube.
+
 | | |
 |---|---|
-| `src/R/integration-sites.R` | all logic, as functions. Attaches no packages — `source()` it and step through. All thresholds in `IS_DEFAULTS`. |
-| `scripts/R/call-integration-sites.R` | driver, five stages (`extract`, `genomic`, `genomic-decoy`, `sites`, `assign`), separate because bwa runs between them and because a control must not sit on the critical path of a run someone is waiting for |
-| `scripts/R/export-hashtag-calls.R` | exports the demultiplexer's calls to `work/hashtag_calls.csv.gz`, which is what lets the report resolve replicates without loading a 2 GB Seurat object |
+| `scarab` package | all pipeline logic. `scarab_run()` is one call for the five stages; `?scarab_inputs` documents what a run needs and the two modes (`vector`, `genomic`). Reinstall with `env/bin/R CMD INSTALL -l renv/library/linux-rocky-8.10/R-4.5/x86_64-conda-linux-gnu /well/ludwig/users/nrs939/projects/scarab` |
+| `scripts/R/export-hashtag-calls.R` | exports the demultiplexer's calls to `work/hashtag_calls.csv.gz`, which is what lets the reports resolve replicates without loading a 2 GB Seurat object. **Invoked by nothing** — not a target, not in any slurm script — so it is a manual step, and a forgotten run leaves a stale file the reports read as current. Takes the output directory as its one argument. |
 | `scripts/R/record-output-manifest.R` | records existing outputs in `manifest.tsv`. Not part of a run — the pipeline writes it as it goes. For outputs that predate it, or a lost manifest. |
-| `scripts/slurm/analysis/integration-sites.sh` | the job. 1 h 49 m for the full five stages (job 35742986); the genome-mapped scan dominates. |
+| `scripts/slurm/analysis/integration-sites.sh` | the job: ONE `scarab_run()` call, not five stage invocations, so the bwa flags cannot drift out of step with the package (`-T 20` against bwa's default 30 is the difference between placing a 25 bp clip and silently discarding it — 244 clips here). 1 h 49 m for eight tubes; the genome-mapped scan dominates. |
+| `scripts/slurm/analysis/integration-sites-targets.sh` | the four derived targets the reports read, plus the two pre-QC Seurat objects they depend on. ~30 min, 42 GB peak. |
 | `scripts/slurm/setup/bwa-index.sh` | one-off index build, ~50 min |
-| `notebooks/integration-sites/integration-sites.qmd` | the report, registered in `_targets.R` |
+| `notebooks/scarab-methods/` | the method, the parameters, the evidence rules. Reads **nothing** and declares no data files: it reports no result, so a data dependency would make it rebuild whenever a number moved. |
+| `notebooks/scarab-qc/` | every detection, every candidate locus, coverage and depth, the floor the sites were called at, the confidence tier |
+| `notebooks/scarab-clones/` | the clones that qualify, their size, their distribution across samples and replicates, projected on the UMAP |
+| `notebooks/scarab-exploration/` | the cis artefact, the clustering permutation test, the matched DE scan |
+| `notebooks/integration-sites/_setup.R` | shared by three of the four reports: the pipeline's output tables, the clone palette, the tube map, `IS_DEFAULTS`, and `build_cell_tables()`. One file, so four reports cannot disagree about what they read or how a clone is coloured. `scarab-methods` deliberately does not source it. |
 | `output/objects/integration-sites/*.csv` | 25 output tables plus `manifest.tsv`; `work/` holds the per-tube genomic cache, the called-barcode list and the hashtag calls. Three are new: `tsd_chance_rate.csv` (the warrant for rule C′), `detection_regression.csv` (λ predicted from vector expression, replacing the median imputation) and `discovery_power.csv` (completeness stratified by clone size) |
 | `data_hub/10x_resources/reference_additions/README.md` | contig derivation and verification — **outside git, not version controlled** |
 
 ```bash
-sbatch scripts/slurm/analysis/integration-sites.sh
-tools/quarto.sh render notebooks/integration-sites/integration-sites.qmd   # renders AND archives
+sbatch scripts/slurm/analysis/integration-sites.sh          # the pipeline, one scarab_run() call
+sbatch scripts/slurm/analysis/integration-sites-targets.sh  # the targets the reports read
+Rscript scripts/R/export-hashtag-calls.R output/objects/integration-sites   # manual, easy to forget
+
+for r in scarab-methods scarab-qc scarab-clones scarab-exploration; do
+  tools/quarto.sh render notebooks/$r/$r.qmd                # renders AND archives
+done
 ```
+
+**Why four reports and not one.** It was one report of 3,771 lines answering four questions — what
+the method is, what was detected, which clones qualify, and what their expression does. Each is now
+its own document, registered separately in `_targets.R` and declaring only the files it reads. The
+reports no longer read the Seurat objects at all: what they need from them (coordinates, cluster,
+QC flag, counts, the cell-cell graph) is extracted once into four targets totalling ~390 MB, where
+reading the objects cost ten minutes each and would have been multiplied by four.
 
 Render from `tools/quarto.sh`, not `env/bin/quarto`: conda's quarto needs the variables its
 activation script sets, and `./env` is never activated here. A bare `quarto render` fails three times

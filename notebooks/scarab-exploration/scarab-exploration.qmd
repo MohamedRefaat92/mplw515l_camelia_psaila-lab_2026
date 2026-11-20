@@ -1,0 +1,1134 @@
+---
+title: "scarab — exploratory analyses"
+format:
+  html:
+    code-fold: true
+    code-tools: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    fig-width: 9
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+editor_options:
+  chunk_output_type: inline
+---
+
+{{< include ../_provenance.qmd >}}
+
+Questions beyond the clone labels: whether a clone's cells share a transcriptional state, whether a provirus acts on its neighbouring genes, how expression differs across replicates within a cluster, and which sites appear to share cells. Several of these are open rather than settled, and the section says which.
+
+Part of the scarab integration-site analysis, which is four reports:
+[method and parameters](../scarab-methods/scarab-methods.html) ·
+[detections and confidence](../scarab-qc/scarab-qc.html) ·
+[clones](../scarab-clones/scarab-clones.html) ·
+[exploration](../scarab-exploration/scarab-exploration.html).
+
+```{r setup}
+#| include: false
+# Shared across the four reports: the pipeline's output tables, the clone palette, the tube map and
+# the parameter object. One file, so four reports cannot disagree about what they read or how a
+# clone is coloured.
+source("notebooks/integration-sites/_setup.R")
+
+# The cell tables. The tar_read() is written out here, literally, rather than in _setup.R, because
+# tar_knitr_deps() scans the .qmd and not the file it sources: a tar_read() inside _setup.R would
+# leave the pipeline unaware that this report depends on the target at all.
+#
+# `is_cell_embedding` is a few megabytes - coordinates, cluster, replicate call and QC flag for all
+# four processed objects - where the objects themselves are 2 GB each and cost ten minutes to read.
+emb_all <- tar_read(is_cell_embedding)
+
+# `embedding`, `labelled`, `embedding_raw`, `labelled_raw`, `hashtag_calls`, with the
+# hashtag-file-against-object check that halts if one of them is stale.
+list2env(build_cell_tables(emb_all), environment())
+```
+
+## Is any clone actually clustered? A permutation test
+
+IS05's cells look clustered above, and that observation sat open in the handoff. Testing it is not
+hard; getting the test *right* took three attempts, and two of them produced confident wrong answers
+that are documented here rather than deleted.
+
+**Not in UMAP space.** UMAP distances are not metric-faithful — the algorithm tears and stretches
+neighbourhoods to make a readable picture — so clustering in the figure is not clustering in the
+data. The test runs on the PCA coordinates the UMAP was built from, and the autocorrelation half on
+the shared-nearest-neighbour graph Seurat already built. The UMAP above stays a picture.
+
+**The null must be stratified by ANIMAL, not by tube.** Tubes are hashtag-multiplexed: Rx_4 holds
+four mice. Every site in this dataset is mono-replicate by construction — that is what makes the
+hashtag a clonality control in the first place — and the same fact means **every clone is perfectly
+confounded with its animal**. No tube-level stratum can separate them.
+
+**And by depth**, because labelled cells are systematically deeper than unlabelled ones (HSC median
+4,725 genes against 3,728) — a junction read needs depth to be seen at all. Depth enters as a decile
+*within* the stratum, so a permuted draw matches the observed set's animal, tube and depth profile.
+
+**And the ranking statistic subtracts the null before dividing by detection:**
+
+$$\text{excess per detection} = \frac{\text{enrichment} - \text{null}}{\text{detection}}$$
+
+The signal scales with detection — each clonemate is seen with probability *d* — while the null is
+drawn from the stratum pool and does not, so dividing the raw enrichment rescales a component that
+needs no rescaling. The two orders disagree about which site ranks first; the comparison is printed
+below the table.
+
+```{r clustering-test}
+#| cache: false
+# Everything this report needs from the 2 GB HSC object, as four small targets: the PCA coordinates
+# and metadata (is_cell_embedding, read in setup), the SNN graph, the loadings, and the counts.
+# Reading the object itself took ten minutes and ~24 GB three times over in this report alone.
+hsc_md  <- emb_all |> dplyr::filter(panel == "HSC", stage == "post-QC", pass_cell)
+pcs_h   <- as.matrix(dplyr::select(hsc_md, dplyr::num_range("PC_", 1:30)))
+cells_h <- hsc_md$cell
+rownames(pcs_h) <- cells_h
+tube_h  <- as.character(hsc_md$tube)
+nfeat_h <- hsc_md$nFeature_RNA
+clus_h  <- as.character(hsc_md$`sNN_pca.SCT_30_res.0.5`)
+graph_h <- tar_read(is_hsc_graph)
+# The PCA's variable features, to ask below whether the cis artefact can reach the statistic at all.
+# From the loadings, not VariableFeatures(), which can be re-set after the PCA was run.
+vf_h    <- rownames(tar_read(is_hsc_loadings))
+
+# The graph is subset to pass_cell in _targets.R and the table is filtered on it here: two separate
+# operations on two separate targets. Moran's I below indexes the graph POSITIONALLY by each cell's
+# place in cells_h, so a disagreement about order would compute the autocorrelation on the wrong
+# cells and still return a perfectly plausible number.
+#
+# So the graph is reordered to cells_h by NAME rather than asserted to match it. An earlier version
+# asserted identical() and halted the render - which is the right failure, but the wrong remedy: the
+# two orders agreeing is a property of how _targets.R happens to build them, and nothing downstream
+# should depend on that holding. Subsetting by name makes the alignment true by construction, and
+# the set check below is then the only thing that has to hold.
+# Reported rather than asserted bare: a failed stopifnot() here printed only "is not TRUE", which
+# does not distinguish a genuine cell-order mismatch from rownames() returning NULL because an S4
+# method was not registered - and those need opposite remedies.
+if (!setequal(rownames(graph_h), cells_h)) {
+  stop("the SNN graph and the embedding disagree about which cells passed QC.\n",
+       "  graph: ", nrow(graph_h), " rows, ",
+       if (is.null(rownames(graph_h))) "NO rownames (is Matrix attached?)"
+       else paste0(length(setdiff(rownames(graph_h), cells_h)), " not in the embedding"), "\n",
+       "  embedding: ", length(cells_h), " cells, ",
+       length(setdiff(cells_h, rownames(graph_h))), " not in the graph\n",
+       "  Both come from mpn_processed_hsc_fullcc$pass_cell in _targets.R; one target is stale.",
+       call. = FALSE)
+}
+stopifnot(ncol(pcs_h) == 30L, !anyNA(pcs_h))
+graph_h <- graph_h[cells_h, cells_h]
+
+akey_h <- paste0(assign$tube, "_", assign$barcode)
+lab_h  <- assign$site_id[match(cells_h, akey_h)]
+# A cell at more than one site belongs to neither here: it is a doublet or a multi-copy integrant,
+# and either way its position is not evidence about one clone's state.
+lab_h[cells_h %in% akey_h[assign$n_sites_in_cell > 1L]] <- NA
+# `replicate` (B0301..B0304), not `call` (TotalSeq-B0301..): the short form is what
+# replicate_confinement() and orphan_evidence.csv use, and two spellings of one animal in a single
+# report is how a join silently returns nothing.
+rep_h <- hashtag_calls$replicate[match(cells_h, hashtag_calls$cell)]
+
+# Depth decile within whatever the stratum is, not within tube: once the stratum is tube x animal the
+# pool is a tenth the size, and a tube-wide decile would pile a small animal into two bins.
+decile_in <- function(groups, x = nfeat_h) {
+  stats::ave(x, interaction(groups, drop = TRUE), FUN = function(v)
+    as.integer(cut(rank(v, ties.method = "first"),
+                   breaks = min(10, max(2, length(v) %/% 20)), labels = FALSE)))
+}
+strata_tube   <- paste(tube_h, decile_in(list(tube_h)), sep = ":")
+strata_animal <- paste(tube_h, rep_h, decile_in(list(tube_h, rep_h)), sep = ":")
+
+det_fit <- detr |>
+  dplyr::filter(lambda_source == "fitted (ZTP)") |>
+  dplyr::transmute(site_id, detection = detection_used)
+
+clust_tube <- knn_site_clustering(pcs_h, lab_h, strata_tube, detection = det_fit,
+                                  graph = graph_h, k = 30L, n_perm = 1000L, min_cells = 10L)
+clust <- knn_site_clustering(pcs_h, lab_h, strata_animal, detection = det_fit,
+                             graph = graph_h, k = 30L, n_perm = 1000L, min_cells = 10L)
+
+animal_of <- function(ids) vapply(ids, function(s)
+  names(sort(table(rep_h[!is.na(lab_h) & lab_h == s]), decreasing = TRUE))[1], character(1))
+
+dplyr::left_join(
+  clust |> dplyr::transmute(site_id, cells, animal = animal_of(site_id),
+                            `null` = sprintf("%.4f", null_mean),
+                            `z` = sprintf("%.1f", z),
+                            `p` = ifelse(p_value <= 1 / (n_perm + 1),
+                                         sprintf("< %.3f", 1 / (n_perm + 1)),
+                                         sprintf("%.3f", p_value)),
+                            `p Holm` = sprintf("%.3f", p_holm),
+                            `Moran z` = sprintf("%.1f", morans_z),
+                            `Moran p Holm` = sprintf("%.3f", morans_p_holm),
+                            `excess / detection` = ifelse(is.na(excess_per_detection), "—",
+                                                          sprintf("%.4f", excess_per_detection))),
+  clust_tube |> dplyr::transmute(site_id, `z, tube-only null` = sprintf("%.1f", z)),
+  by = "site_id") |>
+  dplyr::relocate(`z, tube-only null`, .after = animal) |>
+  knitr::kable(align = "lrlrrrrrrr")
+```
+
+`p Holm` corrects across the `r nrow(clust)` sites tested and is the pre-registered correction;
+Bonferroni is not shown, because Holm dominates it uniformly and printing both would hand the reader
+a choice at the one site where they differ. **`excess / detection` is `—` for IS10**, which has no
+fitted λ (its truncated mean is 1.09, where the ZTP is degenerate), **so the two sites that clear the
+test cannot be ranked against each other.** The plausible direction is worth stating: IS10's
+molecules per cell are low, so its detection is probably low, and a small divisor would put its
+adjusted excess *above* IS05's rather than below.
+
+```{r clustering-readout}
+#| echo: false
+surv <- clust$site_id[clust$p_holm < 0.05]
+cmp  <- clust |> dplyr::filter(!is.na(detection)) |>
+  dplyr::transmute(site_id, plain = enrichment / detection, subtracted = excess_per_detection)
+# HOLM on both sides, not raw p. Holm is the pre-registered correction, so "significant" has to
+# mean the same thing in the prose as in the table - an earlier version filtered on raw p and so
+# counted IS03 (animal-null raw p = 0.049, Holm 0.34) as surviving, which it does not.
+lost <- clust_tube |> dplyr::filter(p_holm < 0.05) |>
+  dplyr::anti_join(dplyr::filter(clust, p_holm < 0.05), by = "site_id") |> dplyr::pull(site_id)
+never <- clust_tube |> dplyr::filter(p_holm >= 0.05, p_value < 0.05) |> dplyr::pull(site_id)
+is02 <- clust[clust$site_id == "IS02", ]
+```
+
+**`r paste(sort(surv), collapse = " and ")` clear the test, and the animal stratum is what removed
+the rest.** Compare the two *z* columns: the survivors fall by roughly half and stay at the
+permutation floor, while every other site drops below significance. Two counts, because they say
+different things. Corrected, **`r paste(lost, collapse = ", ")`** is what the animal stratum removes
+— significant under the tube-only null at Holm
+`r sprintf("%.3f", clust_tube$p_holm[clust_tube$site_id %in% lost][1])`, and
+`r sprintf("%.2f", clust$p_holm[clust$site_id %in% lost][1])` once the null draws from its own
+animal. Uncorrected, `r paste(never, collapse = " and ")` would have been reported too, at raw
+*p* < 0.05 under the tube null; they never clear Holm under either.
+
+**Multiplicity alone would not have caught `r lost[1]`** — its tube-null Holm value is
+`r sprintf("%.3f", clust_tube$p_holm[clust_tube$site_id %in% lost][1])`, which survives at 0.05, and
+Bonferroni's would not have either. The stratification did, and that is the useful finding here: the
+correction a reader would reach for first is not the one that mattered.
+
+On the statistic: the plain ratio ranks **`r cmp$site_id[which.max(cmp$plain)]`** first, the
+null-subtracted form ranks **`r cmp$site_id[which.max(cmp$subtracted)]`** first. They are not
+interchangeable and only the second is defensible.
+
+IS02 is worth naming separately: the largest clone in the dataset, `r is02$cells` HSC cells, sits at
+*z* = `r sprintf("%.1f", is02$z)` — indistinguishable from cells drawn from its own animal at matched
+depth. That is a fact about IS02, not a result about clone size in general; one large unconfined clone
+measured once is n = 1 for any claim about a relationship.
+
+### Is the animal effect itself the explanation? The test that cannot answer it
+
+Both survivors are B0304. The obvious worry is that B0304 cells are transcriptionally distinct as a
+group, so anything drawn from them looks confined. Measured directly, with no clone label at all —
+B0304 membership against a tube- and depth-matched draw from every animal:
+
+```{r b0304-whole}
+#| cache: false
+lab_anim <- ifelse(!is.na(rep_h) & rep_h == "B0304", "B0304", NA_character_)
+b0304_whole <- knn_site_clustering(pcs_h, lab_anim, strata_tube, graph = graph_h,
+                                   k = 30L, n_perm = 1000L, min_cells = 50L)
+# `relative` is computed BEFORE the formatted columns, and the formatted ones are given new names.
+# Assigning `enrichment = sprintf(...)` and then dividing by `enrichment` in a later argument of the
+# same transmute() divides by a character string - dplyr evaluates the arguments in order and the
+# second one sees the first one's result. It is a parse-clean runtime error, which is the worst kind
+# to put in a 25-minute render.
+b0304_whole |>
+  dplyr::transmute(`cells` = cells,
+                   `share of panel` = sprintf("%.0f%%", 100 * cells / nrow(pcs_h)),
+                   `relative` = sprintf("%.2f×", enrichment / null_mean),
+                   `enrichment` = sprintf("%.3f", enrichment),
+                   `null` = sprintf("%.3f", null_mean),
+                   `z` = sprintf("%.1f", z),
+                   `p` = sprintf("< %.3f", 1 / (n_perm + 1))) |>
+  dplyr::relocate(`relative`, .after = `null`) |>
+  knitr::kable()
+```
+
+**B0304 is enriched for itself, strongly — and this does not bear on the clone findings, which is
+worth spelling out because it looks as though it should.** The animal-stratified null *already*
+draws from B0304, so if B0304 clusters as a group, every permuted draw lands in the same
+B0304-dense regions and the null rises to meet it. That is exactly what was observed: IS05's null
+went from 0.0018 under the tube stratum to 0.0048 under the animal stratum, a 2.7× rise. **The
+animal effect is absorbed into the null by construction**, so measuring it again outside the null
+confirms the original error without touching the corrected result.
+
+Two further reasons not to read this table as a demotion. The effect is modest in relative terms —
+`r sprintf("%.2f×", b0304_whole$enrichment / b0304_whole$null_mean)` against IS05's
+`r sprintf("%.2f×", clust$enrichment[clust$site_id == "IS05"] / clust$null_mean[clust$site_id == "IS05"])`
+— and at `r sprintf("%.0f%%", 100 * b0304_whole$cells / nrow(pcs_h))` of the panel the statistic is
+in a saturated regime where it is not comparable to a 48-cell clone anyway.
+
+What *would* invalidate the clone findings is B0304 sub-structure that a clone's cells
+disproportionately occupy. That is a different test, and it is the next one.
+
+### The shared cluster, and the finding it removes
+
+IS05's and IS10's neighbourhoods cross-enrich, and both clones over-occupy one transcriptional
+cluster. If that cluster *is* their enrichment, neither result is about a clone. Re-run each site's
+test with the shared cluster's cells removed from both the member set and the null pool:
+
+```{r shared-cluster}
+#| cache: false
+i5_h  <- which(lab_h == "IS05"); i10_h <- which(lab_h == "IS10")
+shared_clus <- names(which.max(table(clus_h[c(i5_h, i10_h)])))
+sub_h  <- clus_h != shared_clus
+clust_nosh <- knn_site_clustering(
+  pcs_h[sub_h, , drop = FALSE], lab_h[sub_h],
+  paste(tube_h[sub_h], rep_h[sub_h],
+        decile_in(list(tube_h[sub_h], rep_h[sub_h]), nfeat_h[sub_h]), sep = ":"),
+  detection = det_fit, graph = graph_h[sub_h, sub_h],
+  k = 30L, n_perm = 1000L, min_cells = 10L)
+
+dplyr::inner_join(
+  clust |> dplyr::transmute(site_id, `cells, all` = cells, `z, all` = sprintf("%.1f", z),
+                            `p Holm, all` = sprintf("%.3f", p_holm)),
+  clust_nosh |> dplyr::transmute(site_id, `cells, excl.` = cells,
+                                 `z, excl.` = sprintf("%.1f", z),
+                                 `p Holm, excl.` = sprintf("%.3f", p_holm),
+                                 `Moran z, excl.` = sprintf("%.1f", morans_z)),
+  by = "site_id") |>
+  dplyr::arrange(as.numeric(`p Holm, excl.`)) |>
+  knitr::kable(align = "lrrrrrrr")
+```
+
+```{r shared-readout}
+#| echo: false
+zz <- function(tb, s) tb$z[tb$site_id == s]
+hh <- function(tb, s) tb$p_holm[tb$site_id == s]
+```
+
+**IS05 survives and IS10 collapses.** Excluding cluster `r shared_clus` costs IS05 twenty of its
+forty-eight cells and it still clears at *z* = `r sprintf("%.1f", zz(clust_nosh, "IS05"))`, Holm
+`r sprintf("%.3f", hh(clust_nosh, "IS05"))`. IS10 goes from *z* =
+`r sprintf("%.1f", zz(clust, "IS10"))` to `r sprintf("%.1f", zz(clust_nosh, "IS10"))`, Holm
+`r sprintf("%.2f", hh(clust_nosh, "IS10"))` — **its enrichment was the shared cluster.** IS10 is
+demoted: it is not an independent instance of clonal confinement, and the two-sites-one-mouse worry
+resolves by one of them not being a finding.
+
+So **there is one surviving result, not two**: IS05's cells are transcriptionally confined beyond
+what its animal, its tube, its depth and the shared B0304 state account for. It is the
+best-controlled claim in this report and it rests on 28 cells after the exclusion, which is the
+honest denominator for it.
+
+### The *cis* artefact: measured, subtracted, and not fully removable
+
+A junction read is a read-through transcript overlapping the host gene, so at an intragenic
+same-sense site — what `cis_confound` marks — the junction molecules are counted as host-gene UMIs
+in exactly the cells carrying that site. Those cells then differ transcriptionally at that gene for a
+purely technical reason. Three things have to be separated: whether the inflation exists, whether it
+can reach the clustering statistic, and whether it can be removed.
+
+```{r cis-artefact}
+#| cache: false
+cis_sites <- c("IS10", "IS11", "IS04", "IS03", "IS02", "IS01")
+host_genes <- sites$gene[match(cis_sites, sites$site_id)]
+# Genes within 1 Mb of IS10, for the window scan further down, read from the same GTF the pipeline
+# annotates with so the two cannot disagree about what a gene is.
+is10_row <- sites[sites$site_id == "IS10", ]
+gtf_genes <- rtracklayer::import(gtf_path, format = "gtf", feature.type = "gene")
+win_gr <- gtf_genes[as.character(GenomicRanges::seqnames(gtf_genes)) == is10_row$chrom[1] &
+                      abs((GenomicRanges::start(gtf_genes) +
+                             GenomicRanges::end(gtf_genes)) / 2 - is10_row$pos[1]) <= 1e6]
+win_genes <- unique(stats::na.omit(win_gr$gene_name))
+# is_hsc_counts is the RNA assay's counts, already subset to the cells that pass QC, so the only
+# subsetting left here is to the genes this chunk asks about. Read and dropped rather than held: the
+# full matrix is wanted again much further down, and holding it across everything between would be
+# the one large object this report was split up to avoid.
+cnt_all <- tar_read(is_hsc_counts)
+# Reordered by name, for the reason given at the graph above: every per-cell vector in this chunk is
+# indexed positionally against cells_h.
+stopifnot(setequal(colnames(cnt_all), cells_h))
+want_g  <- intersect(unique(c(host_genes, win_genes, "Klf6")), rownames(cnt_all))
+cnt_h   <- as.matrix(cnt_all[want_g, cells_h, drop = FALSE])
+tot_h   <- hsc_md$nCount_RNA
+rm(cnt_all); invisible(gc(verbose = FALSE))
+
+# Subtract a site's junction UMIs from its own host gene's counts, at two strengths. `umis_genomic`
+# is the channel whose reads carry 120-140 bases of host and so are the ones Cell Ranger would count
+# to the gene; `molecules` is every junction UMI at that cell and site, which over-corrects.
+#
+# AND ONLY AT SAME-SENSE SITES, which the first version of this got wrong in a way that manufactured
+# the result below. A read-through transcript is counted as host-gene expression only when it runs
+# in the gene's own direction; at an antisense site it is not counted there at all. Subtracting
+# regardless therefore deletes real expression from exactly the cells being tested, and it shows: at
+# IS02 the "correction" drove Ddx10 from -0.27 to -0.74 to -1.22 as more was taken away, monotone in
+# how much was subtracted. That is the signature of over-correction, not of a stronger effect, and it
+# was about to be written up as the headline finding.
+#
+# So the correct value for a site is the fully subtracted one if it is same-sense and the unadjusted
+# one if it is antisense. `orientation_corrected()` below picks per site rather than leaving a reader
+# to notice which column to read.
+strip_junctions <- function(m, column, same_sense_only = TRUE) {
+  removed <- 0L
+  same <- sites$site_id[isTRUE_vec(sites$cis_confound)]
+  for (r in seq_len(nrow(assign))) {
+    if (same_sense_only && !assign$site_id[r] %in% same) next
+    hg <- sites$gene[match(assign$site_id[r], sites$site_id)]
+    if (is.na(hg) || !(hg %in% rownames(m))) next
+    j <- match(paste0(assign$tube[r], "_", assign$barcode[r]), cells_h)
+    if (is.na(j)) next
+    u <- assign[[column]][r]
+    if (is.na(u) || u == 0L) next
+    removed <- removed + min(m[hg, j], u)
+    m[hg, j] <- max(0, m[hg, j] - u)
+  }
+  attr(m, "removed") <- removed
+  m
+}
+cnt_gen <- strip_junctions(cnt_h, "umis_genomic")
+cnt_all <- strip_junctions(cnt_h, "molecules")
+
+set.seed(20261119L)
+# No cluster matching from here on. Cluster membership is DOWNSTREAM of the hypothesis - if a
+# provirus alters its neighbourhood's expression and that is why the cells sit together, the cluster
+# is the mediator - so matching on it conditions on the mediator and bounds only the direct effect.
+host_scan <- function(m, tag) dplyr::bind_rows(lapply(seq_along(cis_sites), function(k) {
+  if (!(host_genes[k] %in% rownames(m))) return(NULL)
+  matched_expression_test(host_genes[k], cis_sites[k], m, tot_h, lab_h, rep_h, tube_h,
+                          rep("all", length(clus_h)), nfeat_h)
+})) |> dplyr::mutate(adjustment = tag)
+
+cis_tbl <- dplyr::bind_rows(
+  host_scan(cnt_h,  "none"),
+  host_scan(cnt_gen, "genome channel"),
+  host_scan(cnt_all, "all junction UMIs"))
+
+# The value to read per site: fully subtracted where subtraction is valid, unadjusted where it is
+# not. Nothing else in this report should quote a single "corrected" column across all six sites.
+orientation_corrected <- function() {
+  same <- sites$site_id[isTRUE_vec(sites$cis_confound)]
+  dplyr::bind_rows(
+    cis_tbl |> dplyr::filter(adjustment == "all junction UMIs", site_id %in% same) |>
+      dplyr::mutate(basis = "junction UMIs subtracted"),
+    cis_tbl |> dplyr::filter(adjustment == "none", !site_id %in% same) |>
+      dplyr::mutate(basis = "unadjusted (subtraction invalid)"))
+}
+
+cis_tbl |>
+  dplyr::transmute(site_id, `host gene` = gene, adjustment,
+                   `log2 FC` = sprintf("%+.2f", log2fc),
+                   `% detected` = sprintf("%.0f%% vs %.0f%%", 100 * pct_site, 100 * pct_ctl),
+                   p = sprintf("%.1g", p_value),
+                   `in the PCA?` = ifelse(gene %in% vf_h, "**yes**", "no")) |>
+  tidyr::pivot_wider(id_cols = c(site_id, `host gene`, `in the PCA?`),
+                     names_from = adjustment,
+                     values_from = c(`log2 FC`, p)) |>
+  knitr::kable(align = "lllrrrrrr")
+```
+
+**The inflation is real and large**, up to +2.5 log₂ at IS10's host gene with 96% of its cells
+detected against 18% of matched controls. **It cannot reach the clustering statistic**, and the
+reason is one column: the PCA is built on 3,000 variable features, and the inflated host genes of the
+sites that mattered are not among them. An inflated gene absent from the PCA cannot load a component.
+Checking membership is cheaper and more direct than rebuilding the counts matrix, and it is the check
+to run first.
+
+### Orientation predicts the sign, which says what the effect is
+
+Two of the six host genes move the *other* way, and that looked like an oddity until the insertions'
+orientations were put beside them. It is not an oddity; it is the mechanism.
+
+```{r cis-orientation}
+#| cache: false
+orient <- sites |>
+  dplyr::filter(site_id %in% cis_sites) |>
+  dplyr::transmute(site_id, gene, site = strand, host = gene_strand,
+                   orientation = ifelse(strand == gene_strand, "same sense", "**antisense**"),
+                   cis_confound) |>
+  dplyr::left_join(
+    orientation_corrected() |> dplyr::transmute(site_id, log2fc, p_value, basis),
+    by = "site_id") |>
+  dplyr::arrange(dplyr::desc(log2fc))
+
+orient |>
+  dplyr::transmute(site_id, `host gene` = gene, orientation,
+                   `cis_confound` = cis_confound,
+                   `log2 FC` = sprintf("%+.2f", log2fc),
+                   p = sprintf("%.1g", p_value),
+                   `corrected how` = basis) |>
+  knitr::kable(align = "lllrrrl")
+```
+
+```{r cis-orientation-test}
+#| echo: false
+tb <- table(sign(orient$log2fc), grepl("antisense", orient$orientation))
+ft <- stats::fisher.test(tb)
+n_anti <- sum(grepl("antisense", orient$orientation))
+```
+
+**Every same-sense site goes up and every antisense site goes down — `r nrow(orient)` of
+`r nrow(orient)`, and the split holds on the unadjusted counts too** (+2.20, +2.40, +1.27, +1.00
+against −0.27, −0.18), which matters because it means the pattern is not produced by the correction. With `r nrow(orient) - n_anti` same-sense and `r n_anti` antisense sites, the
+chance of the negatives falling exactly on the antisense pair is
+1/`r choose(nrow(orient), n_anti)` = `r sprintf("%.3f", ft$p.value)`. **Suggestive, not significant**,
+and on six sites it cannot be more than that — but the direction is what a mechanism predicts rather
+than what noise predicts, and the mechanism is specific:
+
+- **Same-sense.** A read-through transcript continues in the host gene's own direction, so Cell
+  Ranger counts it as that gene's expression. The elevation *is* the artefact, by construction — and
+  `cis_confound`, derived from annotation alone and with no knowledge of any of this, flags exactly
+  these four.
+- **Antisense.** The read-through runs against the gene, so it cannot be counted to it. No inflation
+  is possible, and the decrease that remains is uncontaminated.
+
+**This changes the reading of the residual.** Subtracting every extractable junction UMI left 0.8–2.4
+log₂ at IS10, IS11 and IS03 and that was recorded as not separable from a real *cis* effect. It is
+now separable in one direction: the residual occurs **only at same-sense sites**, which is where the
+artefact lives and nowhere else. A genuine *cis* effect has no reason to track orientation that
+perfectly — a provirus can perturb a neighbouring gene whichever way it points. So incomplete
+correction is now the better-supported reading, and the three "surviving" elevations should not be
+quoted as *cis* effects.
+
+**The antisense decrease is much weaker than the uncorrected columns suggest, and that is a
+correction this report had to make to itself.** Subtracting junction UMIs at an antisense site
+deletes expression that was never added, so the "fully corrected" value there is over-corrected. The
+three-level table above shows the damage directly: at IS02 the subtraction drove *Ddx10* from
+**−0.27** to −0.74 to −0.92 as more was taken away — monotone in how much was removed, which is the
+signature of over-correction rather than of a stronger effect.
+
+```{r antisense-readout}
+#| echo: false
+# Computed in a chunk, not inline. The first version of this was a single inline `r {...}` holding
+# an assignment, a paste() and three subsets - and it was missing its closing brace, which no chunk
+# checker caught because inline expressions are not chunks. It cost a 25-minute render. Inline code
+# in this report should reference a value, not build one.
+anti <- orientation_corrected() |>
+  dplyr::filter(basis != "junction UMIs subtracted")
+anti_txt <- paste(sprintf("*%s* %+.2f (*p* = %.2g)", anti$gene, anti$log2fc, anti$p_value),
+                  collapse = " and ")
+```
+
+Read on the basis that is valid for each site, the antisense pair is `r anti_txt`.
+
+So **one small decrease and one that is not significant**, not two clean effects. Antisense insertion
+reducing a gene's expression is an ordinary mechanism and these are the only two measurements here
+the artefact cannot inflate — but two sites, one of them null, is not a result, and both are B0303's
+largest clones so a shared state effect is not excluded either.
+
+**And it is only partly removable.** Subtracting the genome channel's junction UMIs
+(`r attr(cnt_gen, "removed")` of them) shrinks every effect; subtracting *all* junction UMIs
+(`r attr(cnt_all, "removed")`) removes **IS04's entirely** — from +1.33 to +0.55 at *p* = 0.9 — while
+IS10's, IS11's and IS03's survive at 1–2.4 log₂ and *p* < 10⁻⁶. Either those three are genuine *cis*
+effects on the host gene, or the subtraction is still incomplete: the clip table holds only molecules
+whose soft clip was long enough to extract, and a read-through whose clip fell below that threshold
+is counted by Cell Ranger and not subtracted here. **This data cannot separate the two**, because the
+artefact and the label are the same event — every cell of a site is, by definition, a cell that
+yielded a junction molecule there, so there is no uncontaminated within-site comparison to make.
+
+One route is closed for good, though: junction UMIs cannot move anything through library size.
+`r attr(cnt_all, "removed")` UMIs against a median `nCount_RNA` of
+`r scales::comma(round(stats::median(tot_h)))` is under 0.01% of the total, so every *other* gene is
+untouched.
+
+This also retires a claim made here earlier. The *cis*-loading screen flagged the two sites carrying
+`cis_confound = TRUE` and cleared the one flagged `FALSE`, which was described as independent
+validation of the annotation. It is agreement over three sites, which is evidence of nothing, and
+IS04 — one of the two it flagged — turns out to have no host-gene effect at all once the artefact is
+subtracted. The claim is withdrawn.
+
+### *Klf6*, and the window around IS10
+
+IS10 sits 239 kb from *Klf6*, a haematopoietic transcription factor, in an MPN-to-AML model — within
+enhancer-activation range, where the *LMO2* events in the X-SCID trials worked. *Klf6* loaded three of
+IS10's five most discriminating PCs. But a loading is a screen, not a test: PCs are global, so a gene
+loading a discriminating component varies across the dataset, which is not the same as differing in
+IS10's cells. And *Klf6* is immune to the artefact above, because IS10's junction reads land in its
+own host gene 239 kb away.
+
+```{r klf6-window}
+#| cache: false
+set.seed(20261119L)
+win_scan <- dplyr::bind_rows(lapply(intersect(win_genes, rownames(cnt_all)), function(gg)
+  matched_expression_test(gg, "IS10", cnt_all, tot_h, lab_h, rep_h, tube_h,
+                          rep("all", length(clus_h)), nfeat_h))) |>
+  dplyr::mutate(p_holm = stats::p.adjust(p_value, "holm")) |>
+  dplyr::arrange(p_value)
+ctrl <- matched_expression_test("Klf6", "IS05", cnt_all, tot_h, lab_h, rep_h, tube_h,
+                                rep("all", length(clus_h)), nfeat_h)
+
+dplyr::bind_rows(win_scan, dplyr::mutate(ctrl, gene = "Klf6 (IS05, off-chromosome control)")) |>
+  dplyr::transmute(gene, `cells / controls` = sprintf("%d / %d", n_site, n_ctl),
+                   `mean CPM` = sprintf("%.2f vs %.2f", mean_site, mean_ctl),
+                   `log2 FC` = sprintf("%+.2f", log2fc),
+                   p = sprintf("%.2g", p_value),
+                   `p Holm` = ifelse(is.na(p_holm), "—", sprintf("%.3f", p_holm))) |>
+  knitr::kable(align = "lrrrrr")
+```
+
+```{r klf6-readout}
+#| echo: false
+kl <- win_scan[win_scan$gene == "Klf6", ]
+hit <- win_scan |> dplyr::filter(p_holm < 0.05, abs(log2fc) > 0.3)
+```
+
+***Klf6* does not clear the bar.** +`r sprintf("%.2f", kl$log2fc)` log₂ at raw
+*p* = `r sprintf("%.3f", kl$p_value)`, which is Holm `r sprintf("%.2f", kl$p_holm)` across the
+`r nrow(win_scan)` genes in the window — and the effect sits at the 0.3 log₂ threshold rather than
+above it. The off-chromosome control is `r sprintf("%+.2f", ctrl$log2fc)` at
+*p* = `r sprintf("%.2f", ctrl$p_value)`, so **the design's resolution is roughly 0.2–0.3 log₂, and
+the honest statement is that it resolves nothing below that** — not that the effect is +0.26.
+
+*A note on the earlier version of this test.* It matched controls on transcriptional cluster as well,
+and returned +0.09 at *p* = 0.36 with the control at −0.33, *p* = 0.06. Cluster is the mediator here:
+if the provirus alters *Klf6* and that is why the cells sit together, matching on cluster conditions
+on the very thing being tested, bounding only the effect *net of state*. Dropping it both raised the
+estimate and cleaned up the control, which is the signature of having conditioned on a mediator.
+
+**The window scan finds one Holm-significant gene and it is the artefact.**
+`r if (nrow(hit)) paste0("*", hit$gene[1], "*, at ", sprintf("%+.2f", hit$log2fc[1]), " log2") else "none"`
+— IS10's own host gene, which the section above shows cannot be cleanly separated from junction-read
+contamination. So nothing in ±1 Mb is a clean candidate. The scan is also thin: of
+`r length(win_genes)` annotated genes in the window only `r nrow(win_scan)` are in the expression
+matrix at all, the rest being undetected in this tissue.
+
+**None of which now needs to explain anything**, because IS10's confinement did not survive the
+shared-cluster test. The *cis* question at IS10 is closed as unsupported rather than open: no gene in
+reach shows a clean effect, and there is no longer a confinement for one to account for. A targeted
+measurement — *Klf6* by qPCR or 4C in sorted IS10 cells — would be the way to pursue it, and is
+outside what this data can do.
+
+
+### What makes IS05's cells sit together
+
+With IS10 demoted, IS05 is the one surviving confinement, and until now nothing had been asked about
+its locus — it appeared in the section above only as the *off-chromosome control* for the IS10
+*Klf6* test. It is also the cleanest case available: `cis_confound = FALSE`, and its host gene is
+absent from the PCA's variable features, so the junction-read artefact cannot reach it.
+
+Two questions, in order. Is anything differentially expressed in its cells at all, and is any of it
+near the integration site?
+
+```{r is05-de}
+#| cache: false
+# The FULL counts matrix, not cnt_h: that one holds only the host genes and the IS10 window, and an
+# unbiased scan needs every gene. Kept sparse - matched_de() does its arithmetic on Matrix columns,
+# and densifying 11,000 x 50,000 here would cost gigabytes for no gain.
+cnt_full <- tar_read(is_hsc_counts)[, cells_h, drop = FALSE]   # aligned by name; see above
+
+set.seed(20261119L)
+# Controls matched on animal, tube and depth but NOT cluster. Cluster is the mediator: if the clone
+# occupies a transcriptional state, matching on it conditions on the thing being measured.
+is05_de <- matched_de("IS05", cnt_full, tot_h, lab_h, rep_h, tube_h,
+                      cluster = NULL, depth = nfeat_h)
+is05_de |>
+  dplyr::filter(p_holm < 0.05) |>
+  dplyr::transmute(gene, `mean CPM` = sprintf("%.2f vs %.2f", mean_site, mean_ctl),
+                   `% detected` = sprintf("%.0f%% vs %.0f%%", 100 * pct_site, 100 * pct_ctl),
+                   `log2 FC` = sprintf("%+.2f", log2fc),
+                   p = sprintf("%.1g", p_value), `p Holm` = sprintf("%.1g", p_holm)) |>
+  knitr::kable(align = "lrrrrr")
+```
+
+**`r sum(is05_de$p_holm < 0.05)` genes, out of `r scales::comma(is05_de$n_tested[1])` tested.** The
+up-regulated set — *Vwf*, *Clu*, *Clec11a*, *Selenom*, *Neo1* — is the **Vwf⁺ platelet-biased
+long-term HSC** programme, which is a coherent thing for a clone to occupy in a
+myeloproliferative model rather than a grab-bag of unrelated genes.
+
+```{r is05-cis}
+#| cache: false
+is05_row <- sites[sites$site_id == "IS05", ]
+win05 <- gtf_genes[as.character(GenomicRanges::seqnames(gtf_genes)) == is05_row$chrom[1] &
+                     abs((GenomicRanges::start(gtf_genes) +
+                            GenomicRanges::end(gtf_genes)) / 2 - is05_row$pos[1]) <= 1e6]
+win05_genes <- unique(stats::na.omit(win05$gene_name))
+is05_de |>
+  dplyr::filter(gene %in% win05_genes) |>
+  dplyr::mutate(p_holm_window = stats::p.adjust(p_value, "holm")) |>
+  dplyr::slice_head(n = 6) |>
+  dplyr::transmute(gene, `log2 FC` = sprintf("%+.2f", log2fc),
+                   p = sprintf("%.3f", p_value),
+                   `p Holm, within window` = sprintf("%.2f", p_holm_window)) |>
+  knitr::kable(align = "lrrr")
+```
+
+**Nothing in ±1 Mb.** Of `r length(win05_genes)` annotated genes in the window,
+`r sum(win05_genes %in% is05_de$gene)` are expressed enough to test and the best of them does not
+survive correction within the window. So IS05's confinement is **not *cis***, which agrees with its
+`cis_confound = FALSE` flag arrived at from annotation alone.
+
+```{r is05-mediation}
+#| cache: false
+set.seed(20261119L)
+# The same test WITH cluster matched. A gene that loses significance here was explained by which
+# cluster the cells are in; one that survives differs within the state as well.
+is05_de_cl <- matched_de("IS05", cnt_full, tot_h, lab_h, rep_h, tube_h,
+                         cluster = clus_h, depth = nfeat_h)
+dplyr::inner_join(
+  dplyr::filter(is05_de, p_holm < 0.05) |>
+    dplyr::transmute(gene, `log2 FC` = sprintf("%+.2f", log2fc),
+                     `p Holm, cluster free` = sprintf("%.1g", p_holm)),
+  is05_de_cl |> dplyr::transmute(gene, holm_cl = p_holm),
+  by = "gene") |>
+  dplyr::mutate(`p Holm, cluster matched` = sprintf("%.2g", holm_cl),
+                `survives?` = ifelse(holm_cl < 0.05, "**within state**",
+                                     "explained by state")) |>
+  dplyr::select(-holm_cl) |>
+  knitr::kable(align = "lrrrl")
+```
+
+```{r is05-mediation-readout}
+#| echo: false
+surv05 <- is05_de_cl$gene[is05_de_cl$p_holm < 0.05 &
+                            is05_de_cl$gene %in% is05_de$gene[is05_de$p_holm < 0.05]]
+i5_cl <- table(clus_h[lab_h == "IS05" & !is.na(lab_h)])
+bg_cl <- table(clus_h[!is.na(rep_h) & rep_h == "B0304" & tube_h == "Rx_4"])
+top_cl <- names(which.max(i5_cl))
+```
+
+**The confinement is part cell-state and part within-state, and the split is the answer.**
+`r length(surv05)` of the `r sum(is05_de$p_holm < 0.05)` genes survive matching on cluster; the rest
+are explained by *which* cluster IS05's cells are in. And they are concentrated in one:
+`r sprintf("%.0f%%", 100 * max(i5_cl) / sum(i5_cl))` of IS05's cells sit in cluster `r top_cl`
+against `r sprintf("%.0f%%", 100 * bg_cl[top_cl] / sum(bg_cl))` of its animal's background.
+
+So the open question closes as follows. **IS05's cells cluster because the clone occupies a Vwf⁺ HSC
+state, disproportionately but not exclusively, and because within that state it is still
+*Vwf*-higher than its neighbours.** What this does *not* establish is direction of causation: a
+provirus that pushed its cell into that state and a clone that happened to arise in such a cell
+predict the same picture, and the *cis* result rules out only the simplest version of the first.
+
+**One gene does not fit and is reported rather than explained.** *Rnf17* is the strongest hit by a
+wide margin — `r sprintf("%+.1f", is05_de$log2fc[is05_de$gene == "Rnf17"])` log₂,
+detected in `r sprintf("%.0f%%", 100 * is05_de$pct_site[is05_de$gene == "Rnf17"])` of IS05's cells
+and **`r sprintf("%.0f%%", 100 * is05_de$pct_ctl[is05_de$gene == "Rnf17"])`** of controls — and it is
+a piRNA-pathway gene with no known haematopoietic role. It is on a different chromosome from IS05, so
+it is not *cis*, and its *p* is unchanged by cluster matching, so it is not a state effect. A gene
+absent from 240 matched cells and present in a quarter of a clone's is either a real clone-specific
+expression or an artefact this report has not identified; it needs a targeted look rather than a
+sentence here.
+
+
+## Cells carrying more than one site
+
+```{r ambiguous}
+amb <- labelled %>%
+  dplyr::filter(pass_cell) %>%
+  dplyr::distinct(tube, barcode, n_sites_in_cell)
+
+dplyr::count(amb, n_sites_in_cell, name = "cells") %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+These are flagged rather than resolved, deliberately. A cell showing two strong junctions is either a
+genuine multi-copy integrant or a doublet, and no single cell tells you which. Treating them as
+multi-copy clones would inflate clone counts; dropping them would deflate them. They are marked
+`ambiguous` so downstream analyses can make that choice explicitly.
+
+Across all cells the two explanations make different predictions, so the comparison below is worth
+making — but the denominator decides the answer, and the obvious choice for it is wrong.
+
+Taking `n` to be the number of *labelled* barcodes builds the detection rate into the expectation
+and all but guarantees the verdict "below chance". Under the same-clone hypothesis the right
+denominator is the clone's **true size** `N`, which is far larger than the number of cells in which
+a site was detected: cells showing both sites is then `|A| × |B| / N`. Inverting that is informative
+in itself — 146 × 190 / 12 = 2,312 is the clone size in Rx_4 *if* IS01 and IS02 mark one clone, and
+3,164 is the same figure for Rx_6, which are numbers to put next to the doublet explanation rather
+than leave implicit.
+
+The table therefore reports both denominators, and the conclusion follows the conservative one.
+
+```{r cooccurrence}
+cooccur <- function(tube_id) {
+  d    <- dplyr::filter(assign, tube == tube_id)
+  n    <- dplyr::n_distinct(d$barcode)
+  sets <- split(d$barcode, droplevels(d$site_id))
+  sets <- sets[lengths(sets) >= 3]
+  ids  <- names(sets)
+  if (length(ids) < 2) return(NULL)
+  pairs <- utils::combn(ids, 2, simplify = FALSE)
+  dplyr::bind_rows(lapply(pairs, function(p) {
+    a <- unique(sets[[p[1]]]); b <- unique(sets[[p[2]]])
+    obs <- length(intersect(a, b))
+    dplyr::tibble(tube = tube_id, pair = paste(p, collapse = " + "),
+                  cells_A = length(a), cells_B = length(b),
+                  observed = obs,
+                  # The denominator that builds in the detection rate, kept only for comparison.
+                  exp_labelled = round(length(a) * length(b) / n, 1),
+                  # Under the same-clone hypothesis, at a plausible true clone size.
+                  exp_if_one_clone_2000 = round(length(a) * length(b) / 2000, 1),
+                  # And the clone size that would be implied if the pair really were one clone.
+                  N_implied = ifelse(obs > 0, round(length(a) * length(b) / obs), NA_integer_))
+  }))
+}
+
+dplyr::bind_rows(lapply(c("Rx_4", "Rx_6"), cooccur)) |>
+  dplyr::arrange(dplyr::desc(cells_A + cells_B)) |>
+  DT::datatable(rownames = FALSE, options = list(dom = "tp", pageLength = 8))
+```
+
+Against the labelled-cell denominator every informative pair falls below expectation, which on its
+own settles nothing: that denominator builds the detection rate into the expectation, and the zeros
+are shared by both hypotheses — same-clone predicts ≈0.1 for a 45 × 5 pair and disjoint clones
+predict 0, so their agreement discriminates nothing.
+
+### The control that does discriminate: pairs from different mice
+
+The hashtag demultiplex supplies a control the earlier analysis did not use. Every site is
+mono-replicate, so **two sites in different mice cannot share a cell.** Any co-occurrence between
+them is a doublet, an ambient pick-up, or a mistake. Splitting the pairs that way turns the doublet
+explanation from an assumption into a measurement.
+
+```{r cooccurrence-by-mouse}
+# Which mouse each site belongs to: the dominant hashtag class, 96-100% of every site's cells.
+site_replicate <- labelled |>
+  dplyr::filter(grepl("^TotalSeq-B03", as.character(replicate))) |>
+  dplyr::count(site_id, replicate) |>
+  dplyr::group_by(site_id) |>
+  dplyr::slice_max(n, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup() |>
+  dplyr::transmute(site_id = as.character(site_id), mouse = sub("^TotalSeq-", "", replicate))
+
+pair_class <- dplyr::bind_rows(lapply(c("Rx_4", "Rx_6"), cooccur)) |>
+  tidyr::separate(pair, into = c("A", "B"), sep = " [+] ", remove = FALSE) |>
+  dplyr::left_join(dplyr::rename(site_replicate, A = site_id, mouseA = mouse), by = "A") |>
+  dplyr::left_join(dplyr::rename(site_replicate, B = site_id, mouseB = mouse), by = "B") |>
+  dplyr::filter(!is.na(mouseA), !is.na(mouseB)) |>
+  dplyr::mutate(class = ifelse(mouseA == mouseB, "same mouse", "different mice"))
+
+pair_class |>
+  dplyr::group_by(tube, class) |>
+  dplyr::summarise(pairs = dplyr::n(), observed = sum(observed),
+                   `expected if independent` = round(sum(exp_labelled), 1),
+                   `obs / exp` = round(sum(observed) / sum(exp_labelled), 4),
+                   .groups = "drop") |>
+  knitr::kable()
+```
+
+A doublet process does not know which mouse a cell came from, so it would hit both classes at the
+same rate. Apply the same-mouse rate to the cross-mouse pairs and it predicts **33.9** co-occurrences;
+**one** was observed (Poisson *p* ≈ 7 × 10⁻¹⁴).
+
+**The obvious objection to that, and why it does not hold here.** A droplet holding cells from two
+mice carries two hashtags, which is exactly what a demultiplexer calls a doublet — so if such
+droplets had been dropped before this test, cross-mouse pairs would have been stripped from the very
+set the test runs on, along the exact axis of the comparison and in the direction of the conclusion.
+That would be fatal. It is not what happened: **this test is run on every labelled barcode,
+hashtag-multiplets included.** Of the 1,131 labelled cells in Rx_4 and Rx_6, 971 are called singlets,
+**130 are called multiplets** and 30 have no call. Splitting the test by the demultiplexer's own
+verdict shows where the one event lives (same minimum site size of three cells throughout, so the
+first row is the table above pooled over both tubes):
+
+| subset of barcodes | cells | cross-mouse obs / exp | same-mouse obs / exp |
+|---|---|---|---|
+| all labelled cells (what the test uses) | 1,131 | 1 / 263.5 | 26 / 202.1 |
+| hashtag **singlets** only | 971 | 0 / 226.0 | 23 / 174.7 |
+| hashtag **multiplets**, negatives, no call | 160 | 1 / 32.8 | 3 / 27.0 |
+
+The single cross-mouse co-occurrence — Rx_4, IS02 + IS10, B0303 + B0304 — **is** a called multiplet,
+precisely as a doublet should be: the demultiplexer caught it rather than hiding it. And in the
+subset most enriched for doublets, cross-mouse co-occurrence is still **33-fold below independence**
+rather than near it, while same-mouse co-occurrence in that same subset sits at the same ratio as
+everywhere else. The depletion is not an artefact of demultiplexing.
+
+**So doublets do not explain the co-occurrences, and the earlier claim that they could is withdrawn.**
+Ambient goes with them: ambient RNA comes from the whole tube's soup, which carries every mouse's
+clones in proportion to their abundance, so it too would produce cross-mouse pairs. One event in 263
+expected is the measured ceiling on both mechanisms together. The reason both are so rare is worth
+stating because it is not obvious: for a doublet to *show* two sites, **both** of its cells must be
+detected, and detection is a few per cent per cell.
+
+What is left is that sites **within one mouse share cells far above that floor**, which is what a
+multi-copy founder looks like. Every one of the 26 co-occurrences is in B0303, and all six
+co-occurring pairs are drawn from IS01, IS02, IS06 and IS08.
+
+**Which expectation came from which model, because the two point opposite ways.** The 202.1 above is
+`|A|·|B| / N_labelled`: the independence expectation *if every cell of every clone were detected*.
+Same-mouse co-occurrence at 26 against that is running at an eighth of it — and read naively that
+argues against sharing, since cells of a multi-copy founder carry both proviruses by construction.
+It is not the right expectation. Under a shared founder the denominator is the clone's **true** size,
+so the prediction is `|A|·|B| / N_true`, and 26 observed is then a statement about how much larger
+`N_true` is than the detected count — the eight-fold shortfall *is* the detection rate. The
+cross-mouse contrast is immune to this, because both classes use the same convention and the
+comparison is between them, which is why the result rests on it.
+
+### The discriminator that uses detection depth
+
+Co-occurrence counts cannot separate "one clone, partly detected" from "two clones plus correlated
+detection", because both are fitted by choosing a denominator. Detection *depth* can. If IS01 and
+IS02 sit in one founder, every cell of it carries both and the only reason both are not seen is how
+many junction molecules that cell yielded. So condition on that count:
+
+```{r dose-response}
+# Depth is DISTINCT MOLECULES per cell, taken from the clip table's one-row-per-molecule shape.
+# It must not be umis_three + umis_genomic: that double-counts the 83 molecules seen in both
+# channels and pushes single-molecule cells into the two-molecule stratum, where a cell cannot show
+# two sites by construction - which deflates sharing exactly where the fraction is read off.
+depth <- clip_tbl |>
+  dplyr::semi_join(called_barcodes, by = c("tube", "barcode")) |>
+  dplyr::filter(tube %in% c("Rx_4", "Rx_6")) |>
+  dplyr::group_by(tube, barcode) |>
+  dplyr::summarise(k = dplyr::n(), .groups = "drop") |>
+  dplyr::inner_join(
+    assign |>
+      dplyr::filter(tube %in% c("Rx_4", "Rx_6")) |>
+      dplyr::group_by(tube, barcode) |>
+      dplyr::summarise(s = list(as.character(site_id)), .groups = "drop"),
+    by = c("tube", "barcode"))
+
+# p comes from the FITTED lambdas, not from each site's share of molecules across both sites' cells:
+# that share includes the non-shared cells and so biases p.
+lam <- stats::setNames(detect_tbl$lambda, detect_tbl$site_id)
+
+depth_curve <- function(a, b, label) {
+  p <- lam[[a]] / (lam[[a]] + lam[[b]])
+  depth |>
+    dplyr::mutate(hasA = purrr::map_lgl(s, ~ a %in% .x),
+                  hasB = purrr::map_lgl(s, ~ b %in% .x)) |>
+    dplyr::filter(hasA | hasB) |>
+    dplyr::mutate(k = pmin(k, 4L)) |>
+    dplyr::group_by(k) |>
+    dplyr::summarise(cells = dplyr::n(), both = sum(hasA & hasB),
+                     observed = mean(hasA & hasB), .groups = "drop") |>
+    dplyr::mutate(pair = label,
+                  `if one clone` = 1 - p^k - (1 - p)^k)
+}
+
+dose <- dplyr::bind_rows(
+  depth_curve("IS01", "IS02", "IS01 + IS02 — same mouse"),
+  depth_curve("IS02", "IS04", "IS02 + IS04 — different mice"))
+
+dose |>
+  dplyr::transmute(pair, `molecules in the cell` = k, cells, both,
+                   observed = round(observed, 3),
+                   `if one clone` = round(`if one clone`, 3)) |>
+  knitr::kable()
+```
+
+```{r dose-plot}
+#| fig-cap: "Sharing against detection depth. The same-mouse pair rises with the number of junction
+#|   molecules a cell yielded; the cross-mouse control is flat at zero at every depth, including the
+#|   deepest cells. The dashed line is what full sharing would predict from the fitted detection
+#|   rates - the gap between it and the observed series bounds the sub-clone fraction."
+#| fig-width: 7.5
+#| fig-height: 4
+
+pair_pal <- c(`IS01 + IS02 — same mouse` = "#D55E00",
+              `IS02 + IS04 — different mice` = "#0072B2")
+
+ggplot(dose, aes(k, observed, colour = pair)) +
+  geom_line(aes(y = `if one clone`), linetype = "22", linewidth = 0.6, na.rm = TRUE) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(size = cells), stroke = 0) +
+  scale_colour_manual(values = pair_pal, name = NULL) +
+  scale_size_area(max_size = 7, breaks = c(10, 100, 500), name = "cells") +
+  scale_x_continuous(breaks = 1:4, labels = c("1", "2", "3", "4+")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "junction molecules in the cell", y = "carrying both sites",
+       title = "Sharing rises with depth for one pair and not the other") +
+  theme(panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+        legend.position = "bottom", legend.box = "horizontal",
+        plot.title = element_text(size = 11))
+```
+
+```{r dose-readout}
+#| echo: false
+# Read off the table above rather than typed. The prose here carried 0.105 and 0.493 for k = 2,
+# which are 12/114 and a p from the superseded "share of molecules" definition - the depth variable
+# was corrected to DISTINCT molecules and these numbers were not. 0.105 is the fingerprint of the
+# old umis_three + umis_genomic denominator, which pushed single-molecule cells into k = 2.
+ds <- dplyr::filter(dose, grepl("same mouse", pair))
+at <- function(kk, col) ds[[col]][ds$k == kk]
+frac <- function(kk) at(kk, "observed") / at(kk, "if one clone")
+fish <- stats::fisher.test(matrix(c(
+  at(2, "both"), at(2, "cells") - at(2, "both"),
+  dose$both[dose$k == 2 & grepl("different", dose$pair)],
+  dose$cells[dose$k == 2 & grepl("different", dose$pair)]), nrow = 2))
+```
+
+**There is a dose–response, and the matched control is flat at zero.** Sharing rises with detection
+depth for the same-mouse pair — `r paste(sprintf("%.1f%%", 100 * ds$observed[order(ds$k)][1:3]), collapse = ", then ")`
+— and stays at exactly zero for the cross-mouse pair at every depth. At matched depth `k = 2` the
+contrast is `r at(2, "both")` of `r at(2, "cells")` against
+`r dose$both[dose$k == 2 & grepl("different", dose$pair)]` of
+`r dose$cells[dose$k == 2 & grepl("different", dose$pair)]`, Fisher exact
+*p* = `r sprintf("%.5f", fish$p.value)`. Doublets and correlated detection do not produce a depth
+gradient in one pair and a flat zero in another; partial detection of a shared founder does.
+
+**But it reaches only part of what full sharing predicts**, and the fraction is not stable:
+`r sprintf("%.2f against %.2f", at(2, "observed"), at(2, "if one clone"))` at `k = 2` — a ratio of
+`r sprintf("%.2f", frac(2))` — and `r sprintf("%.2f against %.2f", at(3, "observed"), at(3, "if one clone"))`
+at `k = 3`, a ratio of `r sprintf("%.2f", frac(3))`. **And at `k = 4` it falls back to
+`r sprintf("%.2f", at(4, "observed"))` on `r at(4, "cells")` cells**, which a dose–response cannot
+do and noise at that count easily can. So the honest reading is a sub-clone fraction somewhere
+between a quarter and two-thirds, bounded by strata of 101, 16 and 9 cells — a double-insertion
+sub-clone inside B0303 rather than a single founder carrying everything, with the *size* of the
+sub-clone essentially unconstrained. An earlier draft of this paragraph quoted "a quarter to a
+third" from the `k = 2` and `k = 3` strata under the superseded counting and stopped before `k = 4`.
+
+That still explains the inconsistent implied sizes the pair-counting produced — IS01 + IS02 implying
+2,312 cells against IS01 + IS06 implying 365 — which the previous draft could only record as a
+caveat.
+
+**One piece of internal consistency, worth stating because the hypothesis has little else.** IS03 is
+a B0303 site with 130 cells and it appears in **none** of the 26 co-occurrences. Under the
+sub-clone reading that is exactly right: IS03 is an independent clone in the same mouse. Under a
+doublet mechanism its absence would be unexplained, since doublets do not know which sites travel
+together.
+
+### Testing the sub-clone on something other than co-occurrence
+
+Everything above is one statistic read several ways. If a double-insertion sub-clone really exists
+inside B0303, its cells are a coherent subpopulation and should look like one in data that the
+co-occurrence test never touched: where they sit on the UMAP, and in what ratio they carry the two
+proviruses. A real sub-clone predicts the sharing cells carry IS01 and IS02 at a balanced ratio and
+occupy the same region as the single-site cells of their own clone; correlated detection predicts no
+such structure, just the deepest cells of a mixed population.
+
+```{r subclone-test}
+#| fig-cap: "Cells carrying IS01, IS02 or both, on the HSC and MNC embeddings, with the within-cell
+#|   molecule ratio for the sharing cells. A sub-clone predicts the both-sites cells sit with the
+#|   single-site cells rather than apart, and carry the two proviruses at a balanced ratio."
+#| fig-width: 8
+#| fig-height: 4.2
+
+share_class <- assign |>
+  dplyr::filter(site_id %in% c("IS01", "IS02")) |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::group_by(cell) |>
+  dplyr::summarise(sites = paste(sort(unique(as.character(site_id))), collapse = "+"),
+                   .groups = "drop") |>
+  dplyr::mutate(class = dplyr::recode(sites, "IS01" = "IS01 only", "IS02" = "IS02 only",
+                                      "IS01+IS02" = "both sites"))
+
+share_pal <- c(`IS01 only` = "#0072B2", `IS02 only` = "#D55E00", `both sites` = "#009E73")
+
+sub_umap <- dplyr::inner_join(share_class, embedding, by = "cell") |>
+  dplyr::filter(pass_cell)
+
+p_umap <- ggplot(dplyr::filter(embedding, pass_cell), aes(UMAP_1, UMAP_2)) +
+  geom_point(colour = "grey90", size = 0.2, stroke = 0) +
+  geom_point(data = sub_umap, aes(colour = class), size = 1.3, alpha = 0.9) +
+  scale_colour_manual(values = share_pal, name = NULL) +
+  facet_wrap(~ panel) +
+  labs(title = "Where the sharing cells sit") +
+  theme(axis.text = element_blank(), panel.grid = element_blank(),
+        legend.position = "bottom", plot.title = element_text(size = 11))
+
+# Within-cell ratio: of a sharing cell's molecules that name one of the two sites, what share is
+# IS01? A sub-clone carrying both predicts a spread around the detection-implied value, not a pile
+# at the extremes.
+ratio <- clip_tbl |>
+  dplyr::filter(match_sites %in% c("IS01", "IS02")) |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::group_by(cell) |>
+  dplyr::summarise(n1 = sum(match_sites == "IS01"), n2 = sum(match_sites == "IS02"),
+                   .groups = "drop") |>
+  dplyr::filter(n1 + n2 >= 2) |>
+  dplyr::mutate(frac1 = n1 / (n1 + n2),
+                class = ifelse(n1 > 0 & n2 > 0, "both sites", "one site only"))
+
+p_ratio <- ggplot(ratio, aes(frac1, fill = class)) +
+  geom_histogram(bins = 9, colour = "white", linewidth = 0.4) +
+  scale_fill_manual(values = c(`both sites` = "#009E73", `one site only` = "grey70"),
+                    name = NULL) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "share of the cell's molecules naming IS01", y = "cells",
+       title = "Within-cell ratio, cells with \u2265 2 molecules") +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom",
+        plot.title = element_text(size = 11))
+
+patchwork::wrap_plots(p_umap, p_ratio, widths = c(2, 1))
+```
+
+**Read this as the weakest link in the finding rather than its confirmation.** The sharing cells are
+too few to settle their own position — 20 of them across both tubes — so the UMAP panel can show
+that they are not obviously a separate island, which is consistent with a sub-clone, and cannot show
+that they form one. The ratio panel is the sharper of the two: a sub-clone carrying both proviruses
+predicts a spread of ratios, while a doublet of two single-site cells predicts the extremes. What it
+cannot do is distinguish a sub-clone from correlated detection within one clone, because both put
+balanced ratios in deep cells.
+
+So the structure remains open, exactly as stated above. This figure is here because the finding
+should be inspectable, not because it closes it — and a cell-barcode-level DNA assay on sorted B0303
+cells is what would.
+
+**Verdict.** Doublets and ambient are excluded as the dominant mechanism, by a control that
+survives the one objection that would have killed it. A **double-insertion sub-clone inside B0303**,
+carrying IS01 and IS02 in perhaps a quarter to a third of its cells, is the reading that fits both
+the cross-mouse contrast and the depth gradient; IS03's absence from every co-occurrence is
+consistent with it. The original "multi-copy founders are absent" was wrong, and the "undetermined"
+that replaced it was too weak.
+
+What is still open is the structure, not the existence: how many founders B0303 holds, whether IS06
+and IS08 belong to the same sub-clone, and how much of the shortfall against full sharing is a real
+sub-clone fraction rather than residual correlated detection. The `ambiguous` flag stays as it is so
+downstream work can decide for itself.
+
+What the data *does* settle is **replicate separation**, and the genome-mapped channel sharpened it
+considerably. Every site is mono-replicate — the dominant hashtag class accounts for 96–100% of each
+site's called cells — and the sites divide three ways:
+
+| replicate | sites | labelled cells |
+|---|---|---|
+| B0303 | IS01, IS02, IS03, IS06, IS07, IS08, IS13 | 819 |
+| B0304 | IS05, IS10, IS11, IS12, IS14, IS15 | 197 |
+| B0301 | IS04, IS09 | 197 |
+| B0302 | none | 0 |
+
+Sites in different animals are necessarily distinct founders, whatever the within-replicate structure
+proves to be. The change from the previous run is B0304: it had exactly one site, and now it has six,
+headed by IS10 at 99 cells. The seven B0303 sites remain unresolved against each other.
+
+#### The other instrument, and why it does not decide this
+
+There is a second way to measure assignment error, and it is tempting because it runs on real reads
+rather than decoys: every site belongs to exactly one mouse and every cell's hashtag names its mouse,
+so **a clip assigned to a site in the wrong mouse is a detectable error**. It needs the hashtag calls,
+which live in the targets store rather than the pipeline's outputs, so it is computed here:
+
+```{r mono-replicate}
+# Every assignment-tier match, with the mouse of its site and the mouse of its cell. A landing in
+# the wrong mouse is an error that real reads can show, at every clip length.
+mono <- clip_site_matches(file.path(sites_dir, "work", "all_clips.fa"),
+                          file.path(sites_dir, "work", "site_flanks.fa"), min_len = 1L) |>
+  dplyr::filter(assign_keep(clip_len, nm, budget)) |>
+  dplyr::semi_join(dplyr::select(sites, site_id), by = "site_id") |>
+  dplyr::mutate(cell = paste0(tube, "_", barcode)) |>
+  dplyr::inner_join(dplyr::select(site_replicate, site_id, site_mouse = mouse), by = "site_id") |>
+  dplyr::inner_join(dplyr::transmute(embedding, cell,
+                                     cell_mouse = sub("^TotalSeq-", "", as.character(replicate))),
+                    by = "cell") |>
+  dplyr::filter(grepl("^B03", cell_mouse)) |>
+  dplyr::mutate(cross = cell_mouse != site_mouse,
+                band = cut(clip_len, c(0, 9, 14, 19, 29, Inf),
+                           labels = c("6–9", "10–14", "15–19", "20–29", "30+")))
+
+dplyr::bind_rows(
+  mono |> dplyr::group_by(band) |> dplyr::summarise(molecules = dplyr::n(),
+            `cross-mouse` = sum(cross), .groups = "drop") |>
+    dplyr::mutate(band = as.character(band)),
+  dplyr::tibble(band = "pooled", molecules = nrow(mono), `cross-mouse` = sum(mono$cross))) |>
+  dplyr::mutate(rate = sprintf("%.2f%%", 100 * `cross-mouse` / molecules)) |>
+  knitr::kable()
+```
+
+It passes at the current floor and it is reported for that. **It cannot set the floor**, for two
+reasons that are structural rather than fixable by more data.
+
+It measures chance matching *plus* hashtag misassignment *plus* doublets. Four of the seven
+cross-mouse landings sit at 23, 27 and 45 bases, where an exact positional match to the wrong flank
+is not a coincidence, so the confound floor is **0.48%** against a 1% tolerance. And the resulting
+power at the band that matters — 94 molecules at 6–9 bp — is not close to sufficient:
+
+| if the true clip error were | power to detect it |
+|---|---|
+| 1% | **8%** |
+| 2% | 20% |
+| 5% | 62% |
+| 10% | 93% |
+
+So it can exclude an error rate above ~5% and cannot certify one below 1%, which is the only decision
+a floor needs. The decoys measure chance matching alone and can be cut in any number, so they have
+the sample size this lacks. **Set the floor from decoys.**
+
+**And do not read this curve's agreement as support for the floor** — it is consistent with almost
+anything. The accepted set expects 0.31 spurious assignments in total, of which roughly 60% would
+land in another mouse, so the expected cross-mouse count among the 96 molecules at 6–9 bp is about
+**0.16**. Observing zero there is what you would see whether the floor were right or wrong. The
+pooled improvement from 0.62% to 0.50% is not about the floor either: it happened because two of the
+five rejected 10–12 bp assignments were themselves errors, which is the mismatch rule doing the work.
+This control earns its place by being an independent check that *could* have objected, not by having
+agreed. One detail worth recording either way: all seven
+cross-mouse landings are on IS01 or IS02, the two largest clones, which is the prior-inflation
+signature — ambiguous evidence drifting onto the biggest hypothesis — showing up even at the current
+floor.
+
+

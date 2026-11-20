@@ -20,7 +20,7 @@ suppressMessages({
   library(targets)
   library(dplyr)
 })
-source("src/R/integration-sites.R")   # for write_csv_checked()
+library(scarab)   # for write_csv_checked(); the pipeline is a package now
 
 args <- commandArgs(trailingOnly = TRUE)
 out  <- if (length(args) >= 1L) args[1] else "output/objects/integration-sites"

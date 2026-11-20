@@ -2345,57 +2345,176 @@ list(
     )
   ),
 
+  # ── Slim views of the Seurat objects, for the integration-site reports ───────
+  # A processed object is ~2 GB and takes minutes to read. What the clone-level reports want out of
+  # it is coordinates, a cluster label and a QC flag - a few megabytes. Deriving those once as
+  # targets means no report loads an object: they tar_read() the small thing instead, and splitting
+  # the report into four does not multiply the cost by four.
+  #
+  # The graph and the counts are here for the same reason rather than being excluded as "too big":
+  # a 50,000-cell SNN graph and a sparse counts matrix are each a fraction of the object that holds
+  # them, and the spatial tests and the differential expression need exactly those two and nothing
+  # else from it.
+  tar_target(
+    is_cell_embedding,
+    local({
+      # Columns that exist in the processed objects but not necessarily in the pre-QC ones, so each
+      # is taken if present rather than assumed. A silent NA column is better than a target that
+      # fails on the raw objects after ten minutes of reading them.
+      coords <- function(srt, panel, stage) {
+        md   <- srt[[]]
+        want <- c("tube", "sample.name", "sample.name.long", "compartment", "dm2_class",
+                  "pass_cell", "nFeature_RNA", "nCount_RNA", "sNN_pca.SCT_30_res.0.5")
+        meta <- lapply(want, function(k) if (k %in% names(md)) md[[k]] else NA)
+        names(meta) <- want
+        umap <- SeuratObject::Embeddings(srt, "umap.nn")[, 1:2, drop = FALSE]
+        colnames(umap) <- c("UMAP_1", "UMAP_2")
+        pca <- if ("pca.SCT" %in% SeuratObject::Reductions(srt)) {
+          m <- SeuratObject::Embeddings(srt, "pca.SCT")
+          m <- m[, seq_len(min(30L, ncol(m))), drop = FALSE]
+          # Renamed, not inherited. Seurat derives these from the reduction's key, so they arrive as
+          # PCSCT_1 or PC_1 depending on how the reduction was created, and a report that selects
+          # them by name would break on a re-run that changed the key. Here the name is the contract:
+          # scarab-exploration takes PC_1..PC_30 with num_range().
+          colnames(m) <- paste0("PC_", seq_len(ncol(m)))
+          m
+        } else NULL
+        out <- dplyr::bind_cols(
+          tibble::tibble(cell = colnames(srt), panel = panel, stage = stage),
+          tibble::as_tibble(meta),
+          tibble::as_tibble(umap))
+        if (!is.null(pca)) out <- dplyr::bind_cols(out, tibble::as_tibble(pca))
+        out
+      }
+      dplyr::bind_rows(
+        coords(mpn_processed_hsc_fullcc, "HSC", "post-QC"),
+        coords(mpn_processed_mnc,        "MNC", "post-QC"),
+        coords(mpn_raw_processed_hsc,    "HSC", "pre-QC"),
+        coords(mpn_raw_processed_mnc,    "MNC", "pre-QC"))
+    })
+  ),
+
+  # The cells that pass QC, which is the only set the spatial tests use. Subsetting here rather than
+  # in the report keeps the stored objects small and means the report cannot accidentally test on
+  # cells the QC rejected.
+  tar_target(
+    is_hsc_counts,
+    SeuratObject::GetAssayData(mpn_processed_hsc_fullcc, assay = "RNA",
+                               layer = "counts")[, which(mpn_processed_hsc_fullcc$pass_cell)]
+  ),
+  tar_target(
+    is_hsc_graph,
+    local({
+      k <- which(mpn_processed_hsc_fullcc$pass_cell)
+      mpn_processed_hsc_fullcc@graphs[["sNN_pca.SCT_30"]][k, k]
+    })
+  ),
+  # Loadings, for asking whether the components that separate a site's cells are built from genes at
+  # that locus. Genes x 30, so tiny.
+  tar_target(
+    is_hsc_loadings,
+    SeuratObject::Loadings(mpn_processed_hsc_fullcc, "pca.SCT")[, 1:30, drop = FALSE]
+  ),
+
   # ── Reports ─────────────────────────────────────────────────────────────────
   # One folder per report under notebooks/, rendered to output/reports/latest/ (quarto_report(),
   # above the list). Each lists the files it reads outside targets, so it re-renders when they change.
 
   quarto_report(report_demultiplex_diagnostics, "demultiplex-diagnostics", utilities_r),
 
-  # Integration sites. Registered so the provenance banner can resolve it: an unregistered report
-  # reports "not a target in _targets.R" and, worse, "0 of 0 input files verified", which reads as a
-  # pass when in fact nothing was checked.
+  # The integration-site analysis, in four reports. One report had reached 3,771 lines and four
+  # questions - what the method is, what was detected, which clones qualify, and what their
+  # expression does - so it is four documents, each registered separately.
   #
-  # The extra files are the ones it reads outside targets. The pipeline that produces them is run by
-  # sbatch (scripts/slurm/analysis/integration-sites.sh), not by targets, so they are listed here as
-  # inputs rather than produced as targets - the report re-renders when the pipeline's output moves.
+  # Registered so the provenance banner can resolve them: an unregistered report reports "not a
+  # target in _targets.R" and, worse, "0 of 0 input files verified", which reads as a pass when in
+  # fact nothing was checked.
   #
-  # NOTE: this puts the report in tar_make(). If that is not wanted, comment this line out as the
-  # block at the end of this list does for other reports - but then the provenance banner goes back
-  # to being unable to resolve it.
-  # EVERY file the report reads is listed, not a representative few. This list is what the provenance
-  # banner verifies against the pipeline's manifest.tsv, so a file left out is one whose numbers reach
-  # the report unchecked - and it is also what makes the report re-render when the pipeline's output
-  # moves, so an omission means a stale report that looks current. Keep it in step with the reads:
-  #   grep -oE '"[a-z_0-9]+\.csv(\.gz)?"' notebooks/integration-sites/integration-sites.qmd | sort -u
-  quarto_report(
-    report_integration_sites, "integration-sites",
-    utilities_r, "src/R/integration-sites.R",
-    "metadata/integration_site_registry.csv",
-    "metadata/tube_sample_map.csv",
-    "output/objects/integration-sites/integration_sites.csv",
-    "output/objects/integration-sites/cell_site_assignments.csv",
-    "output/objects/integration-sites/site_evidence.csv",
-    "output/objects/integration-sites/detection_model.csv",
-    "output/objects/integration-sites/clip_floor_curve.csv",
-    "output/objects/integration-sites/repertoire_completeness.csv",
-    "output/objects/integration-sites/vector_expression.csv",
+  # EACH DECLARES ONLY WHAT IT READS, which is the point of splitting them and also the thing most
+  # likely to drift. Three of them source notebooks/integration-sites/_setup.R, so they inherit its
+  # eleven reads and declare _setup.R itself as well; scarab-methods sources nothing and declares
+  # nothing. These lists were generated from the reports rather than typed - to refresh one:
+  #   grep -oE '"[a-z_0-9]+\.csv(\.gz)?"' notebooks/<report>/<report>.qmd | sort -u
+  # and remember _setup.R's own reads for anything that sources it.
+
+  # The method, the parameters and the evidence rules. It declares NO data files
+  # because it reads none - it reports no result. Declaring any would make the methods section
+  # rebuild every time a number moved, and `_setup.R` is not sourced for the same reason.
+  quarto_report(report_scarab_methods, "scarab-methods"),
+
+  # Every detection, every candidate locus, the depth and coverage behind it, and the
+  # floor the sites were called at.
+  quarto_report(report_scarab_qc, "scarab-qc",
+    "notebooks/integration-sites/_setup.R",
     "output/objects/integration-sites/ambient_rate.csv",
     "output/objects/integration-sites/anchor_ends.csv",
+    "output/objects/integration-sites/cell_site_assignments.csv",
+    "output/objects/integration-sites/clip_floor_curve.csv",
+    "output/objects/integration-sites/clip_table.csv.gz",
+    "output/objects/integration-sites/clip_waterfall.csv",
+    "output/objects/integration-sites/cluster_support.csv",
+    "output/objects/integration-sites/detection_model.csv",
+    "output/objects/integration-sites/detection_regression.csv",
+    "output/objects/integration-sites/integration_sites.csv",
+    "output/objects/integration-sites/junction_coverage.csv",
+    "metadata/tube_sample_map.csv",
+    "output/objects/integration-sites/orphan_evidence.csv",
+    "output/objects/integration-sites/repertoire_completeness.csv",
+    "output/objects/integration-sites/site_calling_summary.csv",
+    "output/objects/integration-sites/site_evidence.csv",
+    "output/objects/integration-sites/site_floor_curve.csv",
+    "output/objects/integration-sites/tsd_chance_rate.csv",
+    "output/objects/integration-sites/tsd_check.csv",
+    "output/objects/integration-sites/work/called_barcodes.csv.gz",
+    "output/objects/integration-sites/work/discovery.sam",
+    "output/objects/integration-sites/work/five_prime.sam",
+    "output/objects/integration-sites/work/hashtag_calls.csv.gz",
+    "output/objects/integration-sites/work/site_flanks.fa"),
+
+  # The clones that qualify, their size, and their distribution across samples and
+  # replicates.
+  quarto_report(report_scarab_clones, "scarab-clones",
+    "notebooks/integration-sites/_setup.R",
+    "output/objects/integration-sites/anchor_ends.csv",
+    "output/objects/integration-sites/cell_site_assignments.csv",
     "output/objects/integration-sites/channel_capture_recapture.csv",
     "output/objects/integration-sites/clip_table.csv.gz",
     "output/objects/integration-sites/clip_waterfall.csv",
-    "output/objects/integration-sites/junction_coverage.csv",
-    "output/objects/integration-sites/site_calling_summary.csv",
-    "output/objects/integration-sites/tsd_check.csv",
-    "output/objects/integration-sites/unassigned_molecules.csv",
-    "output/objects/integration-sites/cluster_support.csv",
-    "output/objects/integration-sites/site_floor_curve.csv",
-    "output/objects/integration-sites/orphan_evidence.csv",
-    "output/objects/integration-sites/tsd_chance_rate.csv",
+    "output/objects/integration-sites/detection_model.csv",
     "output/objects/integration-sites/detection_regression.csv",
     "output/objects/integration-sites/discovery_power.csv",
+    "output/objects/integration-sites/integration_sites.csv",
+    "output/objects/integration-sites/junction_coverage.csv",
+    "metadata/tube_sample_map.csv",
+    "output/objects/integration-sites/repertoire_completeness.csv",
+    "output/objects/integration-sites/site_calling_summary.csv",
+    "output/objects/integration-sites/site_evidence.csv",
+    "output/objects/integration-sites/tsd_check.csv",
+    "output/objects/integration-sites/unassigned_molecules.csv",
+    "output/objects/integration-sites/vector_expression.csv",
     "output/objects/integration-sites/work/called_barcodes.csv.gz",
     "output/objects/integration-sites/work/hashtag_calls.csv.gz"),
+
+  # Expression around and within clones: the cis artefact, the clustering test,
+  # and the matched DE scan.
+  quarto_report(report_scarab_exploration, "scarab-exploration",
+    "notebooks/integration-sites/_setup.R",
+    "output/objects/integration-sites/anchor_ends.csv",
+    "output/objects/integration-sites/cell_site_assignments.csv",
+    "output/objects/integration-sites/clip_table.csv.gz",
+    "output/objects/integration-sites/clip_waterfall.csv",
+    "output/objects/integration-sites/detection_model.csv",
+    "output/objects/integration-sites/detection_regression.csv",
+    "output/objects/integration-sites/integration_sites.csv",
+    "output/objects/integration-sites/junction_coverage.csv",
+    "metadata/tube_sample_map.csv",
+    "output/objects/integration-sites/site_calling_summary.csv",
+    "output/objects/integration-sites/site_evidence.csv",
+    "output/objects/integration-sites/tsd_check.csv",
+    "output/objects/integration-sites/work/all_clips.fa",
+    "output/objects/integration-sites/work/called_barcodes.csv.gz",
+    "output/objects/integration-sites/work/hashtag_calls.csv.gz",
+    "output/objects/integration-sites/work/site_flanks.fa"),
 
   # TEST (temporary): delete these two targets, notebooks/test_report_target/ and
   # output/reports/latest/notebooks/test_report_target/ afterwards
