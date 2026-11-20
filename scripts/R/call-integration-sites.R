@@ -217,19 +217,101 @@ if (stage == "extract") {
 
   # What the floor admits and what it turns away, written BEFORE the floor is applied - otherwise the
   # outputs cannot be used to question it, since call_sites() returns only what passed.
-  write_csv_checked(cluster_support(discovery), file.path(out, "cluster_support.csv"))
-  write_csv_checked(site_floor_curve(discovery), file.path(out, "site_floor_curve.csv"))
+  # The vector-transcript table is the floor's quality axis, so it is read here if the `vector` stage
+  # has run. Without it the floor curve still writes, with the quality columns NA - a floor argued on
+  # counts alone, which is the state this measurement was added to end.
+  vcell_f0 <- file.path(out, "vector_expression_cells.csv.gz")
+  vcells0  <- if (file.exists(vcell_f0))
+    readr::read_csv(vcell_f0, show_col_types = FALSE, progress = FALSE) else NULL
+  if (is.null(vcells0)) message("!!! no vector_expression_cells.csv.gz: floor curve has no ",
+                                "quality axis (run the `vector` stage first)")
+  # Cell Ranger's called barcodes. The floor is tested on CALLED cells, not on every droplet that
+  # carried a junction read - without this a cluster clears a two-cell floor on one cell plus one
+  # empty droplet, and three of the four sites a relaxed floor admitted did precisely that.
+  cb_f0 <- file.path(work, "called_barcodes.csv.gz")
+  called_bc <- if (file.exists(cb_f0))
+    readr::read_csv(cb_f0, show_col_types = FALSE, progress = FALSE) else NULL
+  if (is.null(called_bc)) stop("work/called_barcodes.csv.gz missing: the floor would count droplets")
+
+  write_csv_checked(cluster_support(discovery, vector_cells = vcells0, called = called_bc),
+                    file.path(out, "cluster_support.csv"))
+  write_csv_checked(site_floor_curve(discovery, vector_cells = vcells0, called = called_bc),
+                    file.path(out, "site_floor_curve.csv"))
+
+  # `called_hits`, not `called`: the assign stage uses `called` for the BARCODE table, and one
+  # name meaning two things across stages is how a wrong object gets passed to a new argument.
+  called_hits <- call_sites(discovery, called = called_bc)
+
+  # RULE C': a cluster below the floor in every discovery channel is admitted if, and only if, a 5'
+  # junction supplies a strand-matched TSD partner and the pooled count then reaches the floor. The
+  # 5' channel still cannot call on its own - its largest orphan here is the chr19 Hells fusion at 14
+  # cells - but it can corroborate, because a signed 4 bp offset agreeing with the 3' alignment's
+  # strand is a signature of integrase 3' processing that no splice or mismapping produces.
+  #
+  # The price of the rule is written beside the rule: tsd_chance_rate.csv is the expected number of
+  # chance admissions given the genome, the cluster count and the accepting width, computed from the
+  # reference's own .fai. Read it before trusting a single match.
+  five_sam <- file.path(work, "five_prime.sam")
+  five_pre <- if (file.exists(five_sam)) read_bwa_hits(five_sam, channel = "five_prime")
+              else discovery[0, , drop = FALSE]
+  promoted <- tsd_rescued_clusters(discovery, five_pre, called_hits, called_bc = called_bc)
+  # The footprint as well as the genome. A chance rate over integration sites computed against 2.73 Gb
+  # understates it, because lentivirus prefers transcribed gene bodies and both the orphans and the
+  # clusters they are tested against live there. Measured from this run's own GTF: 1.04 Gb, so x2.6.
+  chance   <- tsd_chance_rate(discovery, attr(promoted, "candidates_tested"), genome_fa = genome_fa,
+                              footprint_bases = transcribed_footprint(gtf))
+  write_csv_checked(chance, file.path(out, "tsd_chance_rate.csv"))
+  message(">>> TSD rescue: ", chance$candidates_tested, " orphan 5' junction(s) tested, ",
+          length(promoted), " promoted; expected by chance ",
+          signif(chance$expected_chance_rescues, 3))
+  if (length(promoted)) {
+    extra  <- dplyr::filter(cluster_hits(discovery, IS_DEFAULTS), site_id %in% promoted)
+    called_hits <- dplyr::distinct(dplyr::bind_rows(called_hits, extra))
+    message("    promoted cluster(s): ", paste(promoted, collapse = ", "))
+  }
 
   # metadata/, not output/: output/ is gitignored, and a label registry that does not survive a
   # clean checkout cannot pin anything. See label_sites().
-  sites      <- label_sites(dplyr::mutate(call_sites(discovery), tier = "discovery"),
+  sites      <- label_sites(dplyr::mutate(called_hits, tier = "discovery"),
                             registry = "metadata/integration_site_registry.csv")
+  site_table_promoted <- promoted
   site_table <- summarise_sites(sites, gtf, tubes)
 
   # Which channel called each site on its own. Carried in the table because "15 sites" is not one
   # kind of claim: two of them clear the floor only on the two channels' reads summed.
   prov <- site_provenance(discovery, site_table)
   site_table <- dplyr::left_join(site_table, prov, by = "site_id")
+
+  # Which labels came from C'. Recovered by locus rather than carried through label_sites(), because
+  # that function's whole job is to replace cluster ids with registry ids and threading a second key
+  # through it would give two things to keep in step.
+  site_table$tsd_rescued <- FALSE
+  if (length(site_table_promoted)) {
+    cl  <- dplyr::filter(cluster_hits(discovery, IS_DEFAULTS), site_id %in% site_table_promoted)
+    pos <- dplyr::summarise(dplyr::group_by(cl, site_id),
+                            chrom = dplyr::first(chrom), pos = min(pos), .groups = "drop")
+    for (i in seq_len(nrow(pos))) {
+      k <- which(site_table$chrom == pos$chrom[i] &
+                   abs(site_table$pos - pos$pos[i]) <= IS_DEFAULTS$cluster_window)
+      site_table$tsd_rescued[k] <- TRUE
+    }
+    stopifnot(sum(site_table$tsd_rescued) == length(site_table_promoted))
+    # site_provenance() has no way to know about C', so it reports a rescued site as "pooled only" -
+    # true in the loose sense and wrong in the one that matters, since it did not clear the floor on
+    # the two discovery channels summed the way IS14 and IS15 did. Relabel it and clear the flag, so
+    # the two disqualifications stay one-to-one with the reasons for them.
+    site_table$called_by[site_table$tsd_rescued]   <- "TSD-rescued"
+    site_table$pooled_only[site_table$tsd_rescued] <- FALSE
+    message("    TSD-rescued site(s): ", paste(site_table$site_id[site_table$tsd_rescued],
+                                               collapse = ", "),
+            "  (NOT defensible: corroborated as an integration, untested as a clone)")
+  }
+  # After the relabel, not before: until C' has had its say a rescued site reads as pooled-only, and
+  # this line named it as such.
+  if (any(site_table$pooled_only)) {
+    message("    POOLED ONLY across the two discovery channels (exclude from repertoire counts): ",
+            paste(site_table$site_id[site_table$pooled_only], collapse = ", "))
+  }
   message(">>> called by: ",
           paste(sprintf("%s = %d", names(table(prov$called_by)), table(prov$called_by)),
                 collapse = ", "))
@@ -240,9 +322,7 @@ if (stage == "extract") {
 
   # TSD BEFORE the flanks are cut, so it can vouch for a site sitting at the cell floor. The flank
   # gate in write_site_flanks() needs this column; without it the gate is skipped entirely.
-  five_sam <- file.path(work, "five_prime.sam")
   if (file.exists(five_sam)) {
-    five_pre <- read_bwa_hits(five_sam, channel = "five_prime")
     tsd_pre  <- tsd_check(site_table, five_pre, genome_fa = genome_fa)
     pass     <- unique(tsd_pre$site_id[tsd_pre$tsd %in% c("PASS", "near") & !is.na(tsd_pre$site_id)])
     site_table$tsd_pass <- site_table$site_id %in% pass
@@ -393,8 +473,38 @@ if (stage == "extract") {
       v <- readr::read_csv(vec_f, show_col_types = FALSE)
       sum(v$vector_positive[v$tube %in% c("Rx_4", "Rx_6")], na.rm = TRUE)
     } else NA_integer_
-    write_csv_checked(repertoire_completeness(det, mch, vpos),
-                      file.path(out, "repertoire_completeness.csv"))
+    # Detection for the nine sites where the ZTP is degenerate, PREDICTED from vector expression
+    # rather than filled with the median of the six that fit. The median was a model - exchangeable
+    # detection across sites - that was unstated, carried no uncertainty, and was fitted on a sample
+    # selected for high lambda. The regression is still fitted on that same selected sample, so the
+    # direction of the bias is unchanged; what it adds is a covariate that is measured independently
+    # of the junction data, and a prediction interval wide enough to show what is not known.
+    vcell_f <- file.path(out, "vector_expression_cells.csv.gz")
+    if (file.exists(vcell_f)) {
+      vcells <- readr::read_csv(vcell_f, show_col_types = FALSE, progress = FALSE)
+      detr   <- detection_regression(det, cell_table, vcells)
+      write_csv_checked(detr, file.path(out, "detection_regression.csv"))
+      write_csv_checked(repertoire_completeness(detr, mch, vpos),
+                        file.path(out, "repertoire_completeness.csv"))
+
+      # What this assay can see at all, by clone size. Chao1 and ACE are undefined here - min_cells
+      # discards every singleton and doubleton, so f1 = f2 = 0 by construction - but the detection
+      # rate they would have to infer is measured, so the question can be asked directly.
+      write_csv_checked(discovery_power(detr$detection_used),
+                        file.path(out, "discovery_power.csv"))
+      message("=== detection predicted for ", sum(detr$imputed), " site(s) from vector expression",
+              "  (R2 = ", signif(detr$r2[1], 3), " on ", detr$n_fit[1], " fitted sites)")
+      print(as.data.frame(detr |> dplyr::transmute(
+        site_id, cells, vector_umis_mean = round(vector_umis_mean, 1),
+        lambda_source, lambda = round(lambda_used, 3),
+        detection = round(detection_used, 3),
+        detection_lo = round(detection_lo, 3), detection_hi = round(detection_hi, 3),
+        size = round(size_used), size_lo = round(size_lo), size_hi = round(size_hi))),
+        row.names = FALSE)
+    } else {
+      message("!!! no vector_expression_cells.csv.gz: completeness not written ",
+              "(run the `vector` stage first)")
+    }
     if (nrow(det)) {
       message("=== detection model (NA where the truncated mean is too close to 1 to fit)")
       print(as.data.frame(det |> dplyr::transmute(
@@ -427,6 +537,12 @@ if (stage == "extract") {
   tsd <- tsd_check(site_table, five, genome_fa = genome_fa)
   write_csv_checked(tsd, file.path(out, "tsd_check.csv"))
 
+  ht_ev_f <- file.path(work, "hashtag_calls.csv.gz")
+  ht_ev <- if (file.exists(ht_ev_f)) {
+    dplyr::mutate(readr::read_csv(ht_ev_f, show_col_types = FALSE, progress = FALSE),
+                  barcode = sub("^.*_([ACGT]+-1)$", "\\1", cell))
+  } else NULL
+
   # One row per site with every flag that bears on trusting it, so downstream work can filter on
   # `defensible` instead of re-deriving a judgement this analysis has now made three times. Placed
   # here because it needs both tsd and the detection model, and an earlier placement referenced tsd
@@ -434,7 +550,12 @@ if (stage == "extract") {
   write_csv_checked(
     site_evidence(site_table, tsd = tsd,
                   detection = if (exists("det")) det else NULL,
-                  flank_fa = file.path(work, "site_flanks.fa")),
+                  flank_fa = file.path(work, "site_flanks.fa"),
+                  # Clonality is part of `defensible` now, so the hashtag calls are a dependency of
+                  # this table rather than an optional extra.
+                  cell_table = cell_table,
+                  hashtag_calls = if (exists("ht_ev")) ht_ev else NULL,
+                  called_barcodes = if (exists("called")) called else NULL),
     file.path(out, "site_evidence.csv"))
 
   # Orphan 5' junctions, tested at the one position their partner must occupy. Reports the

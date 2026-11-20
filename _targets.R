@@ -2486,6 +2486,9 @@ list(
     "output/objects/integration-sites/cluster_support.csv",
     "output/objects/integration-sites/site_floor_curve.csv",
     "output/objects/integration-sites/orphan_evidence.csv",
+    "output/objects/integration-sites/tsd_chance_rate.csv",
+    "output/objects/integration-sites/detection_regression.csv",
+    "output/objects/integration-sites/discovery_power.csv",
     "output/objects/integration-sites/work/called_barcodes.csv.gz",
     "output/objects/integration-sites/work/hashtag_calls.csv.gz"),
 

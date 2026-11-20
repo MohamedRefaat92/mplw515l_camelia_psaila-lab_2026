@@ -88,8 +88,49 @@ IS_DEFAULTS <- list(
   max_softclip   = 2L,      # an assignment clip must align end to end, not partially
   min_mapq       = 30L,     # bwa: a unique placement
   cluster_window = 20L,     # hits this close are one site
-  min_cells      = 3L,
-  min_umis       = 3L,
+  # THE FLOOR IS 2 AND 2, AND IT WAS 3 AND 3 UNTIL IT WAS MEASURED PROPERLY.
+  #
+  # The old value rested on one argument about one cluster: chr11:69,817,658 has 8 of its 10 UMIs in
+  # a single barcode, so "it is one integration seen repeatedly rather than a clone". True of that
+  # cluster, and not an argument about a threshold. What settles a threshold is the gain and the loss
+  # at every value, and the loss needs a quality axis rather than a count.
+  #
+  # The axis is VECTOR TRANSCRIPT. A cell with no vector transcript cannot emit a read-through
+  # junction, so the share of a cluster's cells carrying any is a direct measure of whether that
+  # cluster could be what it claims. It is measured per cell, independently of the junction data, and
+  # cluster_support() now carries it. Against it, over min_cells 6 down to 1 at min_umis = 2:
+  #
+  #   mc   sites  cells   mean vec-share   min   single-tube   single-channel
+  #    6      13   1016             0.84  0.33             1                2
+  #    3      15   1022             0.82  0.33             1                2
+  #    2      20   1032             0.79  0.33             3                4
+  #    1      21   1033             0.80  0.33             4                5
+  #
+  # There is no cliff. And every one of the five clusters admitted by moving 3 -> 2 has a vector
+  # share of 0.5 or 1.0, against 0.33 for IS07 and 0.43 for IS13 - both of which the old floor
+  # CALLED. A threshold that excludes better-supported positions than the ones it admits is not
+  # conservative, it is arbitrary, so the relaxed value is the defensible one and the evidence tier
+  # carries the difference.
+  #
+  # min_umis moves 3 -> 2 for a sharper reason: at 3 it admitted the WORSE of the two best marginal
+  # clusters and rejected the better. chr11:69,817,658 passes a 3-UMI floor on 10 UMIs concentrated
+  # in one cell and one tube (share 0.5); chr1:156,241,543 fails it on 2 UMIs spread over two tubes
+  # and both channels with 2 of 2 cells vector-positive. The floor was selecting for molecules in one
+  # cell over cells in two tubes, which is backwards. At 2 and 2 both parts do work and neither is
+  # inert, which was the other complaint about 3 and 3.
+  #
+  # THE LIMIT OF THE AXIS, stated because it bounds the whole argument: vector share has resolution
+  # 1/n, so at two cells it can only read 0, 0.5 or 1. None of the five admitted clusters reads 0,
+  # and two read 1.0 - but 0.5 means one cell of two, which is thin. These are tier-D sites and the
+  # mini-reference still refuses them, so nothing quantitative rests on them.
+  min_cells      = 2L,
+  min_umis       = 2L,
+  # The mini-reference's "comfortably clear of the floor" threshold, held SEPARATE from the floor
+  # itself. It used to be written as `cells <= min_cells`, which tied two unrelated decisions
+  # together: relaxing discovery would have silently let 3-cell sites into the reference that assigns
+  # cells to flanks, which is the one place a wrong site manufactures a clone. The gate's job does
+  # not change when the discovery floor changes.
+  mini_ref_floor = 3L,
   polya_fraction = 0.8,
   # Decoys measure the assignment tier's error rate instead of arguing about it. They are flanks cut
   # from random positions carrying no provirus, passed through the identical positional test, so
@@ -482,9 +523,14 @@ clip_waterfall <- function(classified) {
 #'
 #' Every clip, whatever its class: the figure's whole point is to show the polyA pile at the cleavage
 #' site next to the junction pile, so filtering here would hide what it is meant to demonstrate.
-anchor_end_histogram <- function(classified) {
+anchor_end_histogram <- function(classified, opt = IS_DEFAULTS) {
   classified |>
-    dplyr::mutate(polya = polya_frac >= IS_DEFAULTS$polya_fraction) |>
+    # opt$polya_fraction, NOT IS_DEFAULTS$polya_fraction. Every other use of this threshold reads it
+    # from the options object (classify_clips, classify_five_prime_clips); this one read the defaults
+    # directly, so a run that overrode polya_fraction got the override in the two filters and the
+    # default in this figure - with no warning, and the figure and the filter disagreeing silently.
+    # Found while packaging the pipeline, where the same line could not be given an `opt` at all.
+    dplyr::mutate(polya = polya_frac >= opt$polya_fraction) |>
     dplyr::count(tube, anchor_end, clip_len, polya, name = "reads")
 }
 
@@ -628,12 +674,29 @@ cluster_hits <- function(hits, opt = IS_DEFAULTS) {
 }
 
 #' Sites supported by enough independent cells and UMIs, from the discovery tier alone.
-call_sites <- function(discovery_hits, opt = IS_DEFAULTS) {
-  cluster_hits(discovery_hits, opt) |>
+#'
+#' THE FLOOR COUNTS CELL RANGER'S CALLED CELLS, NOT RAW BARCODES, and until it did the threshold was
+#' being applied to a different quantity from every number downstream of it. A junction read carries
+#' whatever barcode its droplet had; the cell table, the clone sizes, the detection model and the
+#' completeness figures all restrict to called barcodes. So a cluster could clear a two-CELL floor on
+#' one real cell plus one empty droplet - and three of the four sites a relaxed floor admitted did
+#' exactly that, arriving in the site table with `cells = 1` and, in one case, `cells = 0`.
+#'
+#' Pass `called` and the floor means what it says. Leave it NULL and the old behaviour returns, with
+#' the units mismatched; the driver always passes it, and `cluster_support()` reports both counts side
+#' by side so the gap is auditable rather than discovered later.
+call_sites <- function(discovery_hits, opt = IS_DEFAULTS, called = NULL) {
+  cl <- cluster_hits(discovery_hits, opt)
+  if (!nrow(cl)) return(cl)
+  ok <- if (is.null(called)) rep(TRUE, nrow(cl)) else
+    paste(cl$tube, cl$barcode) %in% paste(called$tube, called$barcode)
+  cl |>
+    dplyr::mutate(.called = ok) |>
     dplyr::group_by(site_id) |>
-    dplyr::filter(dplyr::n_distinct(paste(tube, barcode)) >= opt$min_cells,
-                  dplyr::n_distinct(paste(tube, barcode, umi)) >= opt$min_umis) |>
-    dplyr::ungroup()
+    dplyr::filter(dplyr::n_distinct(paste(tube, barcode)[.called]) >= opt$min_cells,
+                  dplyr::n_distinct(paste(tube, barcode, umi)[.called]) >= opt$min_umis) |>
+    dplyr::ungroup() |>
+    dplyr::select(-.called)
 }
 
 #' Every discovery cluster with the support behind it, called or not.
@@ -645,24 +708,52 @@ call_sites <- function(discovery_hits, opt = IS_DEFAULTS) {
 #'
 #' `channels` matters for reading it: a cluster supported by both the 3' and the genome-mapped
 #' channel is a different proposition from one seen by a single channel at the same depth.
-cluster_support <- function(discovery_hits, opt = IS_DEFAULTS) {
+cluster_support <- function(discovery_hits, opt = IS_DEFAULTS, vector_cells = NULL,
+                            called = NULL) {
   if (!nrow(discovery_hits)) return(dplyr::tibble())
   chan <- if ("channel" %in% names(discovery_hits)) discovery_hits$channel else "three_prime"
-  cluster_hits(dplyr::mutate(discovery_hits, channel = chan), opt) |>
+  clustered <- cluster_hits(dplyr::mutate(discovery_hits, channel = chan), opt)
+  # `cells` is CALLED cells, because that is what the floor tests and what everything downstream
+  # counts; `barcodes` is every droplet, so the difference between them is visible in the table
+  # rather than only in a site that arrives with no cells.
+  clustered$.called <- if (is.null(called)) TRUE else
+    paste(clustered$tube, clustered$barcode) %in% paste(called$tube, called$barcode)
+
+  # THE QUALITY AXIS, not another count. A cell with no vector transcript cannot emit a read-through
+  # junction, so the share of a cluster's cells carrying any is a direct measure of whether the
+  # cluster could be what it claims - and it is measured per cell, independently of the junction
+  # data that produced the cluster. Without it the floor can only be argued from how many positions
+  # each value admits, which says nothing about whether they are real. Resolution is 1/n, so read it
+  # with `cells`: 0.5 at two cells is one cell of two.
+  vshare <- if (is.null(vector_cells)) NULL else {
+    clustered |>
+      dplyr::filter(.called) |>
+      dplyr::distinct(site_id, tube, barcode) |>
+      dplyr::left_join(dplyr::select(vector_cells, tube, barcode, vector_umis),
+                       by = c("tube", "barcode")) |>
+      dplyr::group_by(site_id) |>
+      dplyr::summarise(vector_cells = sum(!is.na(vector_umis) & vector_umis > 0L),
+                       vector_share = mean(!is.na(vector_umis) & vector_umis > 0L),
+                       .groups = "drop")
+  }
+
+  out <- clustered |>
     dplyr::group_by(site_id) |>
     dplyr::summarise(
       chrom    = dplyr::first(chrom),
       pos      = as.integer(stats::median(pos)),
       strand   = dplyr::first(strand),
       reads    = dplyr::n(),
-      cells    = dplyr::n_distinct(paste(tube, barcode)),
-      umis     = dplyr::n_distinct(paste(tube, barcode, umi)),
-      tubes    = dplyr::n_distinct(tube),
+      cells    = dplyr::n_distinct(paste(tube, barcode)[.called]),
+      umis     = dplyr::n_distinct(paste(tube, barcode, umi)[.called]),
+      barcodes = dplyr::n_distinct(paste(tube, barcode)),
+      tubes    = dplyr::n_distinct(tube[.called]),
       channels = paste(sort(unique(channel)), collapse = "+"),
       max_mapq = max(mapq),
       .groups  = "drop") |>
-    dplyr::mutate(called = cells >= opt$min_cells & umis >= opt$min_umis) |>
-    dplyr::arrange(dplyr::desc(cells), dplyr::desc(umis))
+    dplyr::mutate(called = cells >= opt$min_cells & umis >= opt$min_umis)
+  if (!is.null(vshare)) out <- dplyr::left_join(out, vshare, by = "site_id")
+  dplyr::arrange(out, dplyr::desc(cells), dplyr::desc(umis))
 }
 
 #' The site count as a function of the cell and UMI floor - the cost of the threshold, as a grid.
@@ -671,9 +762,11 @@ cluster_support <- function(discovery_hits, opt = IS_DEFAULTS) {
 #' doing work, and if it plateaus the floor is in a flat region and the exact value does not matter
 #' much. `n_both_channels` separates the two readings, because single-channel clusters at low depth
 #' are where artefacts live.
-site_floor_curve <- function(discovery_hits, opt = IS_DEFAULTS, max_cells = 6L, max_umis = 6L) {
-  sup <- cluster_support(discovery_hits, opt)
+site_floor_curve <- function(discovery_hits, opt = IS_DEFAULTS, max_cells = 6L, max_umis = 6L,
+                             vector_cells = NULL, called = NULL) {
+  sup <- cluster_support(discovery_hits, opt, vector_cells = vector_cells, called = called)
   if (!nrow(sup)) return(dplyr::tibble())
+  has_v <- "vector_share" %in% names(sup)
   grid <- expand.grid(min_cells = seq_len(max_cells), min_umis = seq_len(max_umis))
   rows <- lapply(seq_len(nrow(grid)), function(i) {
     keep <- sup[sup$cells >= grid$min_cells[i] & sup$umis >= grid$min_umis[i], , drop = FALSE]
@@ -683,6 +776,11 @@ site_floor_curve <- function(discovery_hits, opt = IS_DEFAULTS, max_cells = 6L, 
       n_both_channels = sum(grepl("\\+", keep$channels)),
       n_single_tube   = sum(keep$tubes == 1L),
       cells_covered   = sum(keep$cells),
+      # The LOSS side of the trade-off. A count of admitted positions says what a value gains; the
+      # mean and the minimum vector share say what it costs. Both are needed - an extra site whose
+      # cells carry no vector transcript is not a gain at all.
+      mean_vector_share = if (has_v && nrow(keep)) mean(keep$vector_share) else NA_real_,
+      min_vector_share  = if (has_v && nrow(keep)) min(keep$vector_share)  else NA_real_,
       is_current      = grid$min_cells[i] == opt$min_cells & grid$min_umis[i] == opt$min_umis)
   })
   dplyr::bind_rows(rows)
@@ -723,10 +821,11 @@ write_site_flanks <- function(sites, genome_fa, path, opt = IS_DEFAULTS) {
   # EXACTLY the floor admitted only if the 5' channel vouches for them. Certainty can come from
   # weight of evidence as well as from a second channel.
   if (!is.null(sites$tsd_pass) && nrow(sites)) {
-    at_floor <- sites$cells <= opt$min_cells
+    at_floor <- sites$cells <= opt$mini_ref_floor
     gated    <- at_floor & !isTRUE_vec(sites$tsd_pass)
     if (any(gated)) {
-      message("    held out of the mini-reference (at the cell floor, no 5' confirmation): ",
+      message("    held out of the mini-reference (<= ", opt$mini_ref_floor,
+              " cells, no 5' confirmation): ",
               paste(sites$site_id[gated], collapse = ", "))
       seqs  <- seqs[!gated]
       sites <- sites[!gated, , drop = FALSE]
@@ -1162,6 +1261,22 @@ exon_boundary_context <- function(chrom, pos, gtf, genome_fa) {
 #' different predictions, and only one of them is about an integration. A read that splices from a
 #' host exon into the PROVIRUS continues with vector sequence; one that splices to the next host exon
 #' continues with that exon. Reporting the position makes the claim checkable by hand.
+#'
+#' READ THE RESULT WITH ITS CHANCE RATE, WHICH IS HIGH. The handoff and the report both said "the
+#' vector contig contains exactly one AG|ATTC" as though a unique hit were the finding. It is not.
+#' The contig is 3,236 bp, so a specific 6-mer is expected 1.58 times in it counting both strands,
+#' and P(at least one) = 0.79. Finding one is a coin flip; finding none would have been the
+#' informative outcome. That leg of the chr19 fusion argument is worth approximately nothing and it
+#' was presented as a prediction that held.
+#'
+#' It also cannot be strengthened from this data. All 32 reads at that junction carry exactly FOUR
+#' bases beyond it - `clip_beyond_n = 32`, every one "ATTC" - and four bases cannot pin an acceptor
+#' in 3 kb. A read reaching ~10 bases into the vector would make the placement unique; none does.
+#' So the chr19 fusion rests on the three legs that are actually load-bearing: the junction sitting
+#' on an exon's last base (0.28% of the genome lies within 5 bp of an annotated exon end, so one
+#' position carries p ~ 0.003), IS03 lying inside that same intron, and 13 of 13 non-multiplet cells
+#' being IS03's own mouse at p = 3.6e-06. The GT donor is a consistency check rather than evidence:
+#' conditional on sitting at an exon end, GT is what ~99% of introns begin with.
 vector_splice_acceptor <- function(tail, genome_fa, contig = IS_DEFAULTS$contig) {
   if (!nzchar(tail) || is.na(tail)) return(dplyr::tibble(acceptor_pos = NA_integer_, acceptor_seq = NA_character_))
   v <- as.character(Rsamtools::scanFa(genome_fa, GenomicRanges::GRanges(
@@ -1219,6 +1334,16 @@ replicate_confinement <- function(hits, hashtag_calls, called_barcodes) {
 #' Reports its own denominator, without which one match is unfalsifiable: `candidates` is how many
 #' orphan 5' junctions were tested and `rescued` how many found a partner. Forty tested and one
 #' rescued is compelling; forty and eight is a coincidence rate.
+#'
+#' `rescued` REQUIRES `strand_ok`, not `abs(delta) == expect` alone, and the warrant for that is not
+#' that it happens to reject the chr19 Hells fusion - that is a result of the rule, not its basis. A
+#' target-site duplication is a signature of integrase-mediated insertion and of nothing else: 3'
+#' processing cuts the two host strands with a 5 bp stagger, so the two junctions of one provirus
+#' must sit `expect` bases apart AND on the orientation that stagger implies. A spliced fusion, a
+#' mismapping and a chimeric read can each put two features 4 bp apart; none of them can make the
+#' SIGN of that offset agree with the strand of the 3' alignment. Taking the modulus throws away the
+#' half of the test that carries the specificity - the same mistake tsd_check() documents.
+#' `tsd_chance_rate()` puts a number on what remains.
 rescue_orphan_junctions <- function(five_hits, discovery_hits, sites, opt = IS_DEFAULTS,
                                     expect = 4L, tol = 2L) {
   if (nrow(five_hits) == 0L) return(dplyr::tibble())
@@ -1253,10 +1378,19 @@ rescue_orphan_junctions <- function(five_hits, discovery_hits, sites, opt = IS_D
       cells_3p = if (nrow(hit)) dplyr::n_distinct(paste(hit$tube, hit$barcode)) else 0L,
       umis_3p  = if (nrow(hit)) dplyr::n_distinct(paste(hit$tube, hit$barcode, hit$umi)) else 0L,
       max_mapq = if (nrow(hit)) max(hit$mapq) else NA_integer_,
+      strand_5p = cand$strand_5p[i],
+      # The modal strand, not the first: a cluster with two reads on opposite strands is not a
+      # provirus end and must not be allowed to pick whichever one agrees with the sign.
+      strand_3p = if (nrow(hit)) names(sort(table(hit$strand), decreasing = TRUE))[1] else NA_character_,
       delta    = if (nrow(hit)) as.integer(cand$pos_5p[i] - stats::median(hit$pos)) else NA_integer_)
   })
   out <- dplyr::bind_rows(rows)
-  out$rescued <- !is.na(out$pos_3p) & abs(out$delta) == expect
+  # Identical to the rule in tsd_check(): a plus-strand provirus has its 5' junction ABOVE its 3'
+  # junction and a minus-strand one below. Written once there and once here rather than shared,
+  # because the two take their strand from different tables; they are checked against each other in
+  # the report, where every called site appears in both.
+  out$strand_ok <- ifelse(is.na(out$delta), NA, (out$delta > 0L) == (out$strand_3p == "+"))
+  out$rescued <- !is.na(out$pos_3p) & abs(out$delta) == expect & isTRUE_vec(out$strand_ok)
   # The denominator travels AS COLUMNS. It used to be set as attributes, with a comment claiming they
   # survive a write_csv of the rows - they do not: readr writes the data, not the attributes, so the
   # one number without which a single match is unfalsifiable was reaching the CSV as nothing at all.
@@ -1266,6 +1400,149 @@ rescue_orphan_junctions <- function(five_hits, discovery_hits, sites, opt = IS_D
   attr(out, "candidates") <- nrow(cand)   # kept: the driver's message reads these
   attr(out, "rescued")    <- sum(out$rescued)
   out |> dplyr::arrange(dplyr::desc(rescued), dplyr::desc(cells_5p + cells_3p))
+}
+
+#' What a strand-matched TSD partner would cost by chance - the warrant for the rescue rule.
+#'
+#' A rule that admits a site must say how often it would admit a position with nothing there, or it
+#' is an assertion. This is that number, computed from the run rather than quoted.
+#'
+#' The accepting region is narrow and its width is not a matter of opinion. A candidate 5' junction
+#' at q accepts a 3' cluster at p when `abs(q - p)` is within `tol` of `expect`, which is
+#' `2 * (2 * tol + 1)` positions - but `strand_ok` then requires the SIGN of `q - p` to agree with
+#' the 3' cluster's strand, and only one of the two sides can satisfy that for a given strand. So the
+#' effective target is `2 * tol + 1` bases wide, 5 at the defaults, out of a genome read from the
+#' reference's own `.fai` rather than remembered.
+#'
+#' The null is a discovery cluster landing there with no provirus to put it there. Clusters are not
+#' uniform over the genome - they sit in transcribed, mappable sequence - so a uniform null
+#' understates the rate somewhat; stated because it is the one approximation here, and it is not
+#' close to load-bearing at 1e-7. Both the per-candidate rate and the expected number across the
+#' whole test are reported, because the second is the one a reader should compare against the
+#' observed count.
+tsd_chance_rate <- function(discovery_hits, n_candidates, genome_fa = NULL,
+                            opt = IS_DEFAULTS, expect = 4L, tol = 2L, genome_bases = NA_real_,
+                            footprint_bases = NA_real_) {
+  if (is.na(genome_bases) && !is.null(genome_fa)) {
+    fai <- paste0(genome_fa, ".fai")
+    if (file.exists(fai)) {
+      genome_bases <- sum(as.numeric(
+        data.table::fread(fai, select = 2L, header = FALSE, showProgress = FALSE)[[1]]))
+    }
+  }
+  n_clusters <- if (nrow(discovery_hits)) {
+    dplyr::n_distinct(cluster_hits(discovery_hits, opt)$site_id)
+  } else 0L
+  width <- 2L * tol + 1L              # one side only; strand_ok rejects the other
+  per   <- n_clusters * width / genome_bases
+  # A NULL or empty denominator must become 0, not vanish: as.integer(NULL) is integer(0), which
+  # makes every column of the tibble below zero-length and prints as nothing at all.
+  if (is.null(n_candidates) || !length(n_candidates)) n_candidates <- 0L
+  # The GENOME-WIDE rate is not the relevant one, because neither integration clusters nor 5'
+  # orphans are uniform over the genome - lentivirus strongly prefers transcribed gene bodies, and
+  # both the candidates and the clusters they are tested against live there. The honest denominator
+  # is that footprint, which raises the rate. Measured rather than estimated: the union of
+  # protein-coding gene bodies is 1.04 Gb, 38% of this reference, so the correction is x2.6 and the
+  # rate goes 2.05e-07 -> 5.4e-07. It was put at "5-10x" from intuition; gene bodies are too large a
+  # share of the mouse genome for that, and the conclusion is unaffected either way.
+  per_fp <- if (is.na(footprint_bases)) NA_real_ else n_clusters * width / footprint_bases
+  dplyr::tibble(
+    expect_bp        = expect,
+    tolerance_bp     = tol,
+    accepting_width  = width,
+    strand_required  = TRUE,
+    genome_bases     = genome_bases,
+    footprint_bases  = footprint_bases,
+    discovery_clusters = n_clusters,
+    candidates_tested  = as.integer(n_candidates),
+    p_per_candidate  = per,
+    expected_chance_rescues = per * n_candidates,
+    p_per_candidate_footprint = per_fp,
+    expected_chance_rescues_footprint = per_fp * n_candidates)
+}
+
+#' Bases covered by gene bodies in a GTF - the denominator a chance rate over integration sites needs.
+#'
+#' `reduce()` first: overlapping and nested genes would otherwise be counted several times, and in
+#' mouse that is a ~15% error. `gene_type` filters to the classes a provirus can land in and be
+#' transcribed from; passing NULL takes every gene.
+transcribed_footprint <- function(gtf, gene_types = "protein_coding") {
+  # rtracklayer::import, not a shelled-out awk: annotate_positions() already reads this file that
+  # way, so the two cannot disagree about what counts as a gene, and there is no quoting to get
+  # wrong between R, the shell and awk.
+  genes <- rtracklayer::import(gtf, format = "gtf", feature.type = "gene")
+  if (!is.null(gene_types)) genes <- genes[genes$gene_type %in% gene_types]
+  if (!length(genes)) return(NA_real_)
+  sum(as.numeric(GenomicRanges::width(GenomicRanges::reduce(genes, ignore.strand = TRUE))))
+}
+
+
+#' The clusters C' admits: below the floor in every discovery channel, but with a TSD partner.
+#'
+#' The floor is applied WITHIN the discovery tier, which is why chrX:100,691,113 - two cells in the
+#' 3' channel, one more in the 5' - was not called while IS14 and IS15, which reach three cells on
+#' the two discovery channels summed, were. Pooling all three channels indiscriminately is not the
+#' fix: the largest 5' orphan in this dataset is the chr19 Hells fusion at 14 cells, and a
+#' pooled-across-everything floor would call it a site bigger than six real ones. The 5' channel
+#' cannot be trusted to call on its own.
+#'
+#' What it can be trusted to do is corroborate. A strand-matched TSD partner is a signature no
+#' splice, mismapping or chimera produces, and `tsd_chance_rate()` prices it at the 1e-7 level, so a
+#' single match is evidence rather than a coincidence waiting to be found. This admits a cluster on
+#' that basis and on no other - the pooled count must still reach the floor, and the partner must
+#' still pass `strand_ok`.
+#'
+#' A site admitted here is NOT defensible: it is quantification-grade evidence that an integration
+#' happened, not that a clone exists. chrX reaches 3 cells, all B0301, at p = 0.10 against that
+#' replicate's share - which establishes nothing. `site_evidence()` carries `tsd_rescued` so the
+#' exclusion travels with the row.
+tsd_rescued_clusters <- function(discovery_hits, five_hits, called, opt = IS_DEFAULTS,
+                                 expect = 4L, tol = 2L, called_bc = NULL) {
+  if (!nrow(five_hits) || !nrow(discovery_hits)) return(character())
+  sites <- if (nrow(called)) {
+    dplyr::summarise(dplyr::group_by(called, site_id),
+                     chrom = dplyr::first(chrom), pos = min(pos), .groups = "drop")
+  } else dplyr::tibble(chrom = character(), pos = integer())
+  resc <- rescue_orphan_junctions(five_hits, discovery_hits, sites, opt, expect = expect, tol = tol)
+  # The denominator is attached BEFORE the early return, because 0 promoted out of N tested is only
+  # a statement with N beside it - and N is exactly what the early return used to drop. Relaxing the
+  # floor made this path live for the first time (chrX now clears the floor on its own, so C' has
+  # nothing to promote) and the driver printed "  orphan 5' junction(s) tested, 0 promoted" with the
+  # counts blank.
+  tested <- if (nrow(resc)) resc$candidates_tested[1] else 0L
+  with_n <- function(x) { attr(x, "candidates_tested") <- tested; x }
+  resc <- resc[isTRUE_vec(resc$rescued), , drop = FALSE]
+  if (!nrow(resc)) return(with_n(character()))
+
+  clustered <- cluster_hits(discovery_hits, opt)
+  keep <- character()
+  for (i in seq_len(nrow(resc))) {
+    # The 3' cluster the partner belongs to, found by position rather than carried, because the
+    # rescue summarises its hits to a median and the cluster id is the thing needed here.
+    near <- clustered[clustered$chrom == resc$chrom[i] &
+                        abs(clustered$pos - resc$pos_3p[i]) <= opt$cluster_window, , drop = FALSE]
+    if (!nrow(near)) next
+    id <- names(sort(table(near$site_id), decreasing = TRUE))[1]
+    cl <- clustered[clustered$site_id == id, , drop = FALSE]
+    # POOLED across the 3' partner's cells and the 5' junction's, which is the whole point: neither
+    # reaches the floor alone. 5' reads at the junction are counted as cells in their own right.
+    n5 <- five_hits[five_hits$chrom == resc$chrom[i] &
+                      abs(five_hits$pos - resc$pos_5p[i]) <= opt$cluster_window, , drop = FALSE]
+    # Called cells on both sides, for the same reason call_sites() uses them: a pooled floor met by
+    # an empty droplet is not met.
+    keep_called <- function(h) if (is.null(called_bc) || !nrow(h)) h else
+      h[paste(h$tube, h$barcode) %in% paste(called_bc$tube, called_bc$barcode), , drop = FALSE]
+    cl <- keep_called(cl); n5 <- keep_called(n5)
+    cells <- dplyr::n_distinct(c(paste(cl$tube, cl$barcode), paste(n5$tube, n5$barcode)))
+    umis  <- dplyr::n_distinct(c(paste(cl$tube, cl$barcode, cl$umi),
+                                 paste(n5$tube, n5$barcode, n5$umi)))
+    if (cells >= opt$min_cells && umis >= opt$min_umis) keep <- c(keep, id)
+  }
+  # The denominator rides along as an attribute, which is safe ONLY because the caller reads it in
+  # the next statement of the same session. The same trick through a write_csv() lost this exact
+  # number once: readr writes the data, not the attributes. Anything that persists it must make it
+  # a column, as rescue_orphan_junctions() now does.
+  with_n(unique(keep))
 }
 
 #' Each orphan 5' junction with the evidence that decides what it is, and a verdict.
@@ -1379,6 +1656,20 @@ summarise_sites <- function(hits, gtf, tubes) {
     # but not counted. Checked against the data at six sites and the rule predicted all six - the
     # three same-sense intragenic ones carry 2-24% junction UMIs, the three antisense ones 0.0%,
     # 0.4% and 0.0%.
+    # cis_confound = intragenic AND SAME SENSE, and the same-sense half is the load-bearing one. It
+    # was written as a flag for "the provirus might be acting on its host gene"; it turned out to
+    # predict the SIGN of the measured host-gene effect perfectly, 6 of 6:
+    #
+    #   same sense  (4 sites)  host gene UP   +0.55 to +2.42 log2
+    #   antisense   (2 sites)  host gene DOWN -0.28, -0.37
+    #
+    # The mechanism is why. A read-through transcript continues in the host gene's own direction, so
+    # at a same-sense site Cell Ranger counts it as that gene's expression and the elevation IS an
+    # artefact of the assay. At an antisense site the read-through runs against the gene, cannot be
+    # counted to it, and no inflation is possible - so an antisense measurement is clean and a
+    # same-sense one is not. Treat this flag as "host-gene expression at this site is contaminated",
+    # not as "this site may have a cis effect": those are different claims and only the first is
+    # supported. 1/choose(6,2) = 0.067, so suggestive on this dataset rather than established.
     dplyr::mutate(cis_confound = grepl("^intragenic", context) & strand == gene_strand) |>
     dplyr::select(site_id, chrom, pos, strand, gene, gene_type, gene_strand, context, cis_confound,
                   reads, cells, umis, dplyr::starts_with("cells_"))
@@ -1515,6 +1806,28 @@ write_csv_checked <- function(x, path, ...) {
 #' The commit is the full 40-character SHA, not the short one, because a short hash is often a valid
 #' number: `8e55518` is 8 x 10^55518, so anything that guesses column types reads it as `Inf`. Read
 #' this file with every column as character.
+#' The commit a file was written at, with "-dirty" when the tree was modified.
+#'
+#' Separated from record_in_manifest() so the not-a-git-repository case is handled in one place.
+#' Outside a checkout this returns NA rather than warning: writing a manifest into a scratch
+#' directory is a legitimate thing to do and must not emit noise, and `system2("git", ...)` in a
+#' non-repo does exactly that.
+#'
+#' THE "-dirty" SUFFIX IS NOT COSMETIC. A bare HEAD recorded for a file produced by uncommitted code
+#' is a provenance claim that is false, and worse than no claim at all: a reader who checks out that
+#' commit gets different numbers with no warning. Every output of the 2026-11-19 run carried a hash
+#' that did not contain the code that made it, which is how this was noticed.
+git_stamp <- function(dir = ".") {
+  if (!nzchar(Sys.which("git"))) return(NA_character_)
+  run <- function(args) suppressWarnings(tryCatch(
+    system2("git", c("-C", shQuote(dir), args), stdout = TRUE, stderr = FALSE),
+    error = function(e) character()))
+  h <- run(c("rev-parse", "HEAD"))
+  if (!length(h) || !nzchar(h[1]) || !grepl("^[0-9a-f]{40}$", h[1])) return(NA_character_)
+  d <- run(c("status", "--porcelain", "--untracked-files=no"))
+  if (length(d) && any(nzchar(d))) paste0(h[1], "-dirty") else h[1]
+}
+
 record_in_manifest <- function(path, rows) {
   man <- file.path(dirname(path), "manifest.tsv")
   entry <- data.frame(
@@ -1523,9 +1836,7 @@ record_in_manifest <- function(path, rows) {
     bytes   = as.character(file.info(path)$size),
     md5     = unname(tools::md5sum(path)),
     written = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-    commit  = tryCatch(system2("git", c("rev-parse", "HEAD"),
-                               stdout = TRUE, stderr = FALSE)[1],
-                       error = function(e) NA_character_),
+    commit  = git_stamp(dirname(path)),
     stringsAsFactors = FALSE
   )
   old <- if (file.exists(man)) {
@@ -1813,12 +2124,48 @@ vector_expression_cells <- function(bam_dir, tubes, genes = c("mCherry", "DRE", 
 #' Collected here, downstream work can filter to the defensible set without reconstructing the
 #' reasoning: `defensible` is the single column to filter on, and the columns beside it say why.
 #'
-#' `defensible` is FALSE for a site that clears the cell floor only on the two channels' reads pooled
-#' (`pooled_only`) or whose flank cannot support quantification (`flank_gated`). It is deliberately
-#' not a quality score - there is no threshold being applied to a continuum here, just two named
-#' disqualifications and the evidence for each.
+#' `defensible` is FALSE for a site that clears the cell floor only on pooled reads (`pooled_only`
+#' across the two discovery channels, or `tsd_rescued` across all three) or whose flank cannot
+#' support quantification (`flank_gated`). It is deliberately not a quality score - there is no
+#' threshold being applied to a continuum here, just named disqualifications and the evidence for
+#' each.
+#'
+#' `evidence_tier` is the ORDERED version of the same information, and it exists because `defensible`
+#' is a binary over a range that is not binary at all. The evidence behind a site runs from two
+#' independent channels plus a sequence-verified target-site duplication down to a cluster that only
+#' exists once three channels are summed, and collapsing that to in/out forces every figure to either
+#' quote one number or re-derive the distinction. Four tiers, each the answer to one question:
+#'
+#'   A  both discovery channels AND a TSD  - two instruments agree on the locus and the provirus's
+#'                                           own 5' end confirms the junction
+#'   B  both discovery channels            - two instruments, no 5' reads to ask
+#'   C  one discovery channel              - one instrument
+#'   D  pooled or TSD-rescued              - no single channel reaches the floor
+#'
+#' `flank_gated` is orthogonal and stays its own column: it disqualifies a site from quantification
+#' without saying anything about whether the site is there. IS07 is tier C and gated.
+#'
+#' AND `defensible` NOW REQUIRES CLONALITY TO BE DEMONSTRATED, not inferred from the floor. Until it
+#' did, the three disqualifications were all consequences of where `min_cells` sat - so relaxing the
+#' floor silently promoted IS16 into the defensible set, a site whose three cells are all one
+#' replicate at p = 0.10, which establishes nothing. The floor had been standing in for a clonality
+#' criterion that was never written down.
+#'
+#' The criterion is the instrument this analysis already built: a clone arises once, in one
+#' transduced cell, in one animal, so its cells must be confined to one replicate beyond chance.
+#' `replicate_confinement()` tests that against the replicate's own share of called cells in the
+#' same tubes, and `defensible` requires p < `clonal_alpha`. It costs nothing at the sites that
+#' matter - every other defensible site passes, IS13 at p = 2.8e-05 on 7 of 7 cells - and it removes
+#' exactly the one that should never have been in. `defensible` is now a statement about the
+#' evidence rather than about the threshold, and it does not move when the threshold does.
+#'
+#' The count then states its own basis - "16 across four tiers, 12 at A-C" - instead of appearing as
+#' 15, 13 or 12 depending on which caveat the writer had in mind. All three of those numbers have
+#' been in this report's prose at once.
 site_evidence <- function(site_table, tsd = NULL, detection = NULL, five = NULL,
-                          flank_fa = NULL, opt = IS_DEFAULTS) {
+                          flank_fa = NULL, opt = IS_DEFAULTS,
+                          cell_table = NULL, hashtag_calls = NULL, called_barcodes = NULL,
+                          clonal_alpha = 0.05) {
   if (nrow(site_table) == 0L) return(dplyr::tibble())
   in_mini <- if (!is.null(flank_fa) && file.exists(flank_fa)) {
     nm <- grep("^>", readLines(flank_fa), value = TRUE)
@@ -1836,6 +2183,7 @@ site_evidence <- function(site_table, tsd = NULL, detection = NULL, five = NULL,
     called_by    = site_table$called_by,
     pooled_only  = site_table$pooled_only,
     cis_confound = site_table$cis_confound,
+    tsd_rescued  = if (is.null(site_table$tsd_rescued)) FALSE else site_table$tsd_rescued,
     flank_gated  = if (length(in_mini) == 1L && is.na(in_mini[1])) NA
                    else !site_table$site_id %in% in_mini)
 
@@ -1854,12 +2202,38 @@ site_evidence <- function(site_table, tsd = NULL, detection = NULL, five = NULL,
                            lambda_estimable = !is.na(lambda), detection, clone_size),
       by = "site_id")
   }
+
+  # The clonality test, per site, from the hashtag calls - evidence that uses no junction data at all
+  # and so is independent of everything above it.
+  if (!is.null(cell_table) && !is.null(hashtag_calls) && !is.null(called_barcodes)) {
+    conf <- dplyr::bind_rows(lapply(ev$site_id, function(sid) {
+      h <- cell_table[cell_table$site_id == sid, c("tube", "barcode"), drop = FALSE]
+      r <- replicate_confinement(h, hashtag_calls, called_barcodes)
+      if (!nrow(r)) dplyr::tibble(site_id = sid) else dplyr::mutate(r, site_id = sid)
+    }))
+    ev <- dplyr::left_join(ev, conf, by = "site_id")
+  } else {
+    message("!!! site_evidence(): no hashtag calls, so clonality is NOT tested and `defensible` ",
+            "falls back to the threshold-derived flags")
+    ev$replicate <- NA_character_; ev$replicate_p <- NA_real_
+  }
   ev |>
     dplyr::mutate(
       tsd_status = tidyr::replace_na(tsd_status, "no 5' reads"),
       n_5prime_reads = tidyr::replace_na(n_5prime_reads, 0L),
-      defensible = !pooled_only & !tidyr::replace_na(flank_gated, FALSE)) |>
-    dplyr::arrange(dplyr::desc(cells))
+      evidence_tier = dplyr::case_when(
+        pooled_only | tsd_rescued            ~ "D pooled or TSD-rescued",
+        called_by != "both channels"         ~ "C one discovery channel",
+        tsd_status %in% c("PASS", "near")    ~ "A both channels + TSD",
+        TRUE                                 ~ "B both channels"),
+      # NA replicate_p means the test could not be run, which is not a pass. Where the hashtag calls
+      # are absent entirely the message above says so and this term is dropped rather than failing
+      # every site silently.
+      clonal = if (all(is.na(replicate_p))) NA else
+        !is.na(replicate_p) & replicate_p < clonal_alpha,
+      defensible = !pooled_only & !tsd_rescued & !tidyr::replace_na(flank_gated, FALSE) &
+        (if (all(is.na(replicate_p))) TRUE else tidyr::replace_na(clonal, FALSE))) |>
+    dplyr::arrange(evidence_tier, dplyr::desc(cells))
 }
 
 #' Cells carrying vector transcript, per tube, from the filtered feature-barcode matrix.
@@ -1909,6 +2283,152 @@ vector_expression <- function(bam_dir, tubes, genes = c("mCherry", "DRE", "WPRE-
     dplyr::mutate(vector_share = vector_positive / cells)
 }
 
+#' Detection for the sites where the ZTP is degenerate, predicted rather than imputed from a median.
+#'
+#' WHAT THIS REPLACES. `repertoire_completeness()` used to fill the nine NA sites with the median
+#' detection of the six estimable ones. That is a model - it assumes detection is exchangeable across
+#' sites - and it was an unstated one doing load-bearing work in the headline completeness figure. It
+#' is also the worst available model of the three ways it can be wrong at once: the six are SELECTED
+#' for high lambda (that is why they are estimable), so the median is biased upward; it carries no
+#' uncertainty, so the corrected share arrived with a false precision; and it uses none of the
+#' information that is actually available about why detection differs between sites.
+#'
+#' WHAT REPLACES IT. Detection is set by how much vector transcript a site's cells make - a junction
+#' read is a read-through of that transcript, so a site whose cells carry ten times the vector UMIs
+#' has ten times the chance of yielding one. That quantity is measured per cell, independent of the
+#' junction data, and it spans ~7x across these sites. So: regress log lambda on log mean vector
+#' expression over the sites where lambda is estimable, and predict the rest with a PREDICTION
+#' interval, which is the quantity that answers "where would this site's lambda be", as against a
+#' confidence interval on the line.
+#'
+#' Six points support one slope and an intercept, and not more. This is a two-parameter model
+#' reported with its residual spread, not a claim to have explained detection.
+#'
+#' AND THE RESULT IS THAT THE CEILING GOES AWAY. The fitted slope is 1.04 (SE 0.72), which is where
+#' the mechanism says it should be - proportionality - but p = 0.22 and R^2 = 0.34 on six points, so
+#' the covariate is not distinguishable from no covariate at all. The prediction intervals that
+#' follow span roughly two orders of magnitude, and summed across the sixteen sites they put the
+#' corrected cell count ABOVE the denominator. That is not a failure of the method; it is the
+#' measurement the median was concealing. The honest reading is that this data bounds completeness
+#' from BELOW only: the 5.3% floor stands and the 12.5% ceiling it used to be quoted against was
+#' never more than the median's false precision. `ceiling_uninformative` in the completeness table
+#' says so in a column rather than in prose.
+#'
+#' THE DIRECTION OF THE REMAINING BIAS IS UNCHANGED, and must still be stated wherever the corrected
+#' number appears. The regression is fitted on a sample selected for high lambda, so its intercept
+#' sits above the population's; predictions for the nine are therefore too high, their clone sizes
+#' too low, and completeness too optimistic. The improvement over the median is that the prediction
+#' interval now at least shows how wide the uncertainty is, and that the point estimate uses a
+#' covariate rather than assuming exchangeability. `floor_share` remains the only model-free figure.
+#'
+#' The honest version of this is partial pooling - fit lambda hierarchically across all sites so the
+#' degenerate ones shrink toward a population mean with correctly wide posteriors. That needs a
+#' sampler and a prior argued for in public; this is the version that uses only data already on disk.
+detection_regression <- function(detection_tbl, cell_table, vector_cells, min_fit = 4L) {
+  if (!nrow(detection_tbl)) return(dplyr::tibble())
+
+  # Mean vector UMIs over the cells assigned to each site. A cell absent from the vector table
+  # carries no vector transcript rather than an unknown amount, so it enters as 0 - dropping those
+  # cells would condition the covariate on the outcome.
+  expr <- cell_table |>
+    dplyr::distinct(site_id, tube, barcode) |>
+    dplyr::left_join(dplyr::select(vector_cells, tube, barcode, vector_umis),
+                     by = c("tube", "barcode")) |>
+    dplyr::mutate(vector_umis = tidyr::replace_na(vector_umis, 0L)) |>
+    dplyr::group_by(site_id) |>
+    dplyr::summarise(vector_umis_mean = mean(vector_umis),
+                     vector_cells_n   = dplyr::n(), .groups = "drop")
+
+  d <- detection_tbl |>
+    dplyr::select(site_id, cells, lambda, detection, clone_size) |>
+    dplyr::left_join(expr, by = "site_id") |>
+    dplyr::mutate(vector_umis_mean = tidyr::replace_na(vector_umis_mean, 0))
+
+  fit_rows <- !is.na(d$lambda) & d$vector_umis_mean > 0
+  out <- dplyr::mutate(d,
+    lambda_source = ifelse(!is.na(lambda), "fitted (ZTP)", "no estimate"),
+    lambda_used = lambda, lambda_used_lo = NA_real_, lambda_used_hi = NA_real_,
+    r2 = NA_real_, slope = NA_real_, slope_se = NA_real_, slope_p = NA_real_,
+    residual_sd = NA_real_, n_fit = sum(fit_rows))
+
+  if (sum(fit_rows) >= min_fit) {
+    m  <- stats::lm(log(lambda) ~ log(vector_umis_mean), data = d[fit_rows, , drop = FALSE])
+    sm <- summary(m)
+    need <- is.na(d$lambda) & d$vector_umis_mean > 0
+    if (any(need)) {
+      pr <- stats::predict(m, newdata = d[need, , drop = FALSE],
+                           interval = "prediction", level = 0.95)
+      out$lambda_used[need]    <- exp(pr[, "fit"])
+      out$lambda_used_lo[need] <- exp(pr[, "lwr"])
+      out$lambda_used_hi[need] <- exp(pr[, "upr"])
+      out$lambda_source[need]  <- "predicted (vector expression)"
+    }
+    # Reported, not just used. The mechanism predicts a slope of 1 - a junction read is a
+    # read-through of the vector transcript, so lambda should be proportional to how much of it a
+    # site's cells make - and the point estimate lands there. With six points it is also not
+    # distinguishable from zero, and both of those facts have to travel with the predictions.
+    out$r2          <- sm$r.squared
+    out$slope       <- unname(stats::coef(m)[2])
+    out$slope_se    <- unname(sm$coefficients[2, 2])
+    out$slope_p     <- unname(sm$coefficients[2, 4])
+    out$residual_sd <- sm$sigma
+  }
+
+  # ZTP: a cell is detected if it yields at least one molecule, so detection = 1 - exp(-lambda). The
+  # same transform as detection_model() uses, applied to the predicted lambdas so the two columns
+  # mean the same thing.
+  out |>
+    dplyr::mutate(
+      detection_used = 1 - exp(-lambda_used),
+      detection_lo   = 1 - exp(-lambda_used_lo),
+      detection_hi   = 1 - exp(-lambda_used_hi),
+      size_used      = cells / detection_used,
+      size_lo        = cells / detection_hi,   # a HIGHER detection implies a SMALLER clone
+      size_hi        = cells / detection_lo,
+      imputed        = is.na(lambda)) |>
+    dplyr::arrange(dplyr::desc(cells))
+}
+
+#' What fraction of clones of each size this assay can see at all - the completeness question, asked
+#' the way the detection model allows and a richness estimator does not.
+#'
+#' WHY NOT CHAO1. Chao1 and ACE estimate unseen richness from the singletons and doubletons, f1 and
+#' f2. This pipeline's floor is `min_cells = 3`, so every cluster seen in one or two cells is
+#' discarded before the site table exists: f1 = f2 = 0 BY CONSTRUCTION. Chao1 is then not biased, it
+#' is undefined - and computing it on the surviving counts would silently estimate the richness of
+#' the post-floor sample rather than of the repertoire. Same for ACE. The usual critique of these
+#' estimators on denoised sequence data is that the pipeline removes singletons as a side effect;
+#' here the pipeline removes them deliberately, which is the same problem with no ambiguity about it.
+#'
+#' WHAT IS AVAILABLE INSTEAD. Ecology has to infer the detection process; this assay measures it. A
+#' clone of N cells is discovered when at least `min_cells` of its cells yield a junction molecule,
+#' and that is a binomial with a per-cell detection rate the ZTP estimates:
+#'
+#'     P(discovered | N, d) = 1 - pbinom(min_cells - 1, N, d)
+#'
+#' So completeness can be reported STRATIFIED BY CLONE SIZE - "clones above size X are discovered
+#' with probability p, we see K of them, so the repertoire above X is about K/p" - which is a bounded
+#' statement about a defined subpopulation rather than a point estimate of total richness. It also
+#' makes the 87% unaccounted share legible rather than alarming: at d = 0.4 a clone of 3 is found 6%
+#' of the time and a clone of 5 32% of the time, so a repertoire dominated by small clones is mostly
+#' invisible to this assay by arithmetic, with no further hypothesis required.
+#'
+#' Independence across a clone's cells is assumed, and it is the one real approximation: cells of one
+#' clone share a provirus, so their detection rates are correlated through its expression. That makes
+#' the real probabilities more extreme than these - clones are found or missed more wholesale than a
+#' binomial implies - so this is a mid-range approximation and not a bound in either direction.
+discovery_power <- function(detection_rates, sizes = c(2L, 3L, 5L, 10L, 20L, 50L, 100L),
+                            opt = IS_DEFAULTS) {
+  d <- sort(unique(round(detection_rates[is.finite(detection_rates) & detection_rates > 0], 2)))
+  if (!length(d)) return(dplyr::tibble())
+  grid <- expand.grid(clone_size = sizes, detection = d)
+  dplyr::tibble(
+    clone_size = grid$clone_size,
+    detection  = grid$detection,
+    min_cells  = opt$min_cells,
+    p_discovered = 1 - stats::pbinom(opt$min_cells - 1L, grid$clone_size, grid$detection))
+}
+
 #' Repertoire completeness: what share of the transduced population the called sites account for.
 #'
 #' The denominator this needed turned out to be in hand all along - the mCherry-positive cells
@@ -1927,11 +2447,17 @@ vector_expression <- function(bam_dir, tubes, genes = c("mCherry", "DRE", "WPRE-
 #' site's detected count by its own per-cell detection rate first, and so inherits lambda's
 #' uncertainty.
 #'
-#' THE IMPUTATION HAS A DIRECTION, and it is the one that flatters the result. lambda is estimable
+#' THE CORRECTION HAS A DIRECTION, and it is the one that flatters the result. lambda is estimable
 #' only at the six sites with the highest molecules per cell - a sample selected for high detection -
-#' so imputing their median to the other nine OVERSTATES detection, understates those clone sizes and
-#' overstates completeness. `corrected_share` is therefore an UPPER bound and `floor_share` the only
-#' model-free figure. Never quote the corrected number without the floor beside it.
+#' so any model fitted on them OVERSTATES detection at the other nine, understates those clone sizes
+#' and overstates completeness. `corrected_share` is therefore an UPPER bound and `floor_share` the
+#' only model-free figure. Never quote the corrected number without the floor beside it.
+#'
+#' It takes `detection_regression()`'s table, which predicts the nine from vector expression with a
+#' prediction interval, and reports `corrected_lo`/`corrected_hi` from those bounds. It previously
+#' took the raw detection table and filled the nine with the median of the six: a model, unstated,
+#' with no uncertainty and no covariate. The bias direction above was true of that too; what is new
+#' is that the width is now visible.
 #'
 #' What it cannot do, stated because this was got wrong once: the unassigned-molecule census does NOT
 #' bound the hidden population. A clone that yields no junction molecule leaves none to count, so a
@@ -1939,23 +2465,35 @@ vector_expression <- function(bam_dir, tubes, genes = c("mCherry", "DRE", "WPRE-
 repertoire_completeness <- function(detection_tbl, mcherry_cells,
                                    vector_positive_cells = NA_integer_) {
   if (nrow(detection_tbl) == 0L) return(dplyr::tibble())
-  med <- stats::median(detection_tbl$detection, na.rm = TRUE)
-  d <- dplyr::mutate(detection_tbl,
-                     detection_used = ifelse(is.na(detection), med, detection),
-                     imputed = is.na(detection),
-                     size_used = cells / detection_used)
+  # detection_regression() has done the work; this only aggregates it. If handed the raw detection
+  # table instead - the shape this took before - it stops rather than silently reverting to the
+  # median, because that median is the thing being retired.
+  stopifnot("size_used" %in% names(detection_tbl))
+  d <- detection_tbl
   corrected <- sum(d$size_used)
+  lo <- sum(ifelse(is.na(d$size_lo), d$size_used, d$size_lo))
+  hi <- sum(ifelse(is.na(d$size_hi), d$size_used, d$size_hi))
   dplyr::tibble(
     denominator = c("sorted mCherry+ cells", "cells carrying vector transcript"),
     cells = c(mcherry_cells, vector_positive_cells),
     sites = nrow(d),
     detected_cells = sum(d$cells),
     floor_share = sum(d$cells) / c(mcherry_cells, vector_positive_cells),
-    median_detection_used = med,
-    sites_with_imputed_detection = sum(d$imputed),
+    sites_with_predicted_detection = sum(d$imputed),
+    prediction_r2 = d$r2[1],
+    prediction_slope = d$slope[1],
+    prediction_slope_p = d$slope_p[1],
+    # TRUE when the prediction interval puts the corrected count above the denominator - i.e. the
+    # model is too weak to bound the hidden population at all, and only floor_share may be quoted.
+    ceiling_uninformative = NA,
     corrected_cells = round(corrected),
+    corrected_cells_lo = round(lo),
+    corrected_cells_hi = round(hi),
     corrected_share = corrected / c(mcherry_cells, vector_positive_cells),
-    unaccounted_share = 1 - corrected / c(mcherry_cells, vector_positive_cells))
+    corrected_share_lo = lo / c(mcherry_cells, vector_positive_cells),
+    corrected_share_hi = hi / c(mcherry_cells, vector_positive_cells),
+    unaccounted_share = 1 - corrected / c(mcherry_cells, vector_positive_cells)) |>
+    dplyr::mutate(ceiling_uninformative = corrected_cells_hi >= cells)
 }
 
 #' The floor curve: what a clip of each length matches, real sites and decoy flanks alike.
@@ -2521,6 +3059,448 @@ tsd_check <- function(sites, five_hits, opt = IS_DEFAULTS, search = 2000L, expec
                   reads_5p, cells_5p)
 }
 
+#' Is a site's cells clustered in transcriptional space beyond what its sampling explains?
+#'
+#' IS05's 53 cells look clustered on the HSC UMAP, and the eye is not admissible evidence. Four
+#' things have to be right before a test of this is worth running, and each of them has a wrong
+#' version that returns a confident answer:
+#'
+#'   1. NOT IN UMAP SPACE. UMAP distances are not metric-faithful - the algorithm is free to tear and
+#'      stretch neighbourhoods to make the picture readable - so clustering in the picture is not
+#'      clustering in the data. The test runs on the PCA coordinates the UMAP was built from, and the
+#'      autocorrelation version runs on the shared-nearest-neighbour graph itself. The UMAP stays a
+#'      picture.
+#'   2. THE NULL IS STRATIFIED BY ANIMAL, NOT BY TUBE, and this is the correction that matters most.
+#'      Tubes are hashtag-multiplexed: Rx_4 holds four mice. Every site in this dataset is
+#'      mono-replicate by construction, so **every clone is perfectly confounded with its animal**,
+#'      and a tube-level stratum can never separate the two. It is not a hypothetical risk here:
+#'      IS05 and IS10 are both B0304, which contributes 1,614 of ~20,500 called cells in Rx_4 - a
+#'      tenth-sized, separately processed population - so a tube-stratified null compares B0304
+#'      cells against a background that is 92% other animals, and ANY animal-level difference
+#'      (batch, processing, disease stage) reads out as clonal clustering. The caller must pass a
+#'      stratum that includes the replicate. The first version of this analysis did not, and
+#'      reported two B0304 sites as the only significant results without noticing they were the
+#'      same mouse.
+#'   3. AND BY DEPTH. Labelled cells are systematically deeper than unlabelled ones (HSC median 4,725
+#'      genes against 3,728), because a junction read needs depth to be seen at all. A depth-blind
+#'      null recovers that bias. Depth enters as a decile WITHIN the stratum pool, not within tube:
+#'      once the stratum is tube x animal the pool is a tenth the size, and a tube-wide decile would
+#'      put most of a small animal's cells into two or three bins.
+#'
+#'      The pool must stay big enough to draw from. `knn_site_clustering()` samples
+#'      `min(n_wanted, pool_size)` per stratum and so degrades quietly if a stratum runs out;
+#'      `strata_pool` in the output is the smallest pool a site drew from, so that failure is
+#'      visible rather than silent.
+#'   4. THE EXCESS IS DIVIDED BY DETECTION BEFORE SITES ARE COMPARED, and the formula is
+#'      `excess_per_detection = (enrichment - null_mean) / detection`. A clone detected at 92% has
+#'      nearly all its cells in hand; one detected at 27% has a random quarter of them, and random
+#'      thinning dilutes true neighbourhood enrichment in proportion to the detection rate, because
+#'      each true clonemate is observed with probability d. Comparing raw enrichment across sites
+#'      would rank them by detection and call it biology - IS05 has a ~3.3x advantage over IS01
+#'      before any difference in their clones.
+#'
+#'      SUBTRACT THE NULL FIRST, THEN DIVIDE. The signal scales with d; the null does not, because
+#'      it is drawn from the stratum pool rather than from the clone. Dividing the raw enrichment
+#'      therefore rescales a null component that needs no rescaling, and it changes the answer:
+#'      enrichment / detection puts IS01 (0.0253) ABOVE IS05 (0.0226), while
+#'      (enrichment - null) / detection puts IS05 (0.0207) above IS01 (0.0118). An earlier version
+#'      of this function added the null back afterwards - (e - n)/d + n - which is the right
+#'      statistic plus a site-specific offset, and that offset contaminates exactly the between-site
+#'      comparison the column exists for. It also made the column unreconstructable from its own
+#'      printed inputs, which is the defect rather than the arithmetic.
+#'
+#' Returns one row per site: observed enrichment, the permutation null, a p-value, a multiplicity-
+#' corrected p-value, and the detection-adjusted excess for ranking. The corrected p is the test;
+#' the excess is for ordering sites and is not itself tested.
+#'
+#' IT IS NA WHERE DETECTION IS NOT ESTIMABLE, AND THAT INCLUDES A SURVIVOR. IS10 has no fitted
+#' lambda - its truncated mean is 1.09, where the ZTP is degenerate - so it has no
+#' `excess_per_detection` at all, and the two sites that survive the test therefore CANNOT be ranked
+#' against each other. Do not read the column as a ranking of the survivors. The direction, stated
+#' because it is the plausible one: IS10's molecules per cell are low, so its detection is likely low
+#' too, and a low divisor would put its adjusted excess ABOVE IS05's rather than below.
+#'
+#' MULTIPLICITY IS CORRECTED HERE, not left to the reader, and ONE correction is reported. Nine sites
+#' clear `min_cells` in this dataset, so an uncorrected 0.05 is nine chances at it. Holm, and only
+#' Holm: it dominates Bonferroni uniformly, so printing both adds no information and does add a
+#' choice - the two disagree at exactly one site (IS04, 0.042 against 0.054), and showing a reader
+#' both numbers there is handing them the decision after the fact. Pre-registered as Holm.
+#'
+#' The useful finding about IS04 survives either way and is worth keeping: multiplicity would NOT
+#' have excluded it, since its Holm value clears 0.05. The animal stratum did.
+knn_site_clustering <- function(pcs, labels, strata, detection = NULL, graph = NULL,
+                                k = 30L, n_perm = 1000L, min_cells = 10L, seed = 20261119L) {
+  stopifnot(nrow(pcs) == length(labels), length(strata) == length(labels))
+  nn  <- RANN::nn2(pcs, k = k + 1L)$nn.idx[, -1, drop = FALSE]   # drop self
+  sites <- names(which(table(labels[!is.na(labels)]) >= min_cells))
+  if (!length(sites)) return(dplyr::tibble())
+
+  enrich <- function(idx) {
+    # Fraction of each member cell's k neighbours that are also members. Averaged over members, so
+    # a site contributes once per cell and not once per pair.
+    mem <- logical(nrow(pcs)); mem[idx] <- TRUE
+    mean(rowMeans(matrix(mem[nn[idx, , drop = FALSE]], nrow = length(idx))))
+  }
+
+  # Once, not once per permutation: the row sums, column sums and total of a 50,000-cell graph do
+  # not depend on which cells a draw picked.
+  gpre <- if (is.null(graph)) NULL else morans_pre(graph)
+
+  set.seed(seed)
+  rows <- lapply(sites, function(sid) {
+    idx <- which(labels == sid)
+    obs <- enrich(idx)
+    # The permutation: re-draw the same number of cells from the same (tube, depth-decile) cells,
+    # which is what makes the null a statement about this clone rather than about Rx_4 or about read
+    # depth. Sampling is per stratum so the draw matches the observed stratum profile exactly.
+    tab <- table(strata[idx])
+    pool <- split(seq_along(strata), strata)
+    obs_i <- if (is.null(graph)) NA_real_ else morans_i_binary(graph, idx, pre = gpre)
+    draws <- lapply(seq_len(n_perm), function(i) {
+      unlist(lapply(names(tab), function(st) {
+        p <- pool[[st]]
+        if (is.null(p)) return(integer())
+        sample(p, min(tab[[st]], length(p)))
+      }), use.names = FALSE)
+    })
+    null   <- vapply(draws, enrich, numeric(1))
+    null_i <- if (is.null(graph)) rep(NA_real_, n_perm) else
+      vapply(draws, function(d) morans_i_binary(graph, d, pre = gpre), numeric(1))
+    dplyr::tibble(
+      site_id = sid, cells = length(idx), k = k, n_perm = n_perm,
+      # The smallest stratum pool this site drew from, against how many cells it wanted there. A
+      # ratio near 1 means the "permutation" was re-drawing almost the same cells and the test has
+      # no null left; it degrades silently otherwise.
+      strata_pool = min(vapply(names(tab), function(st) length(pool[[st]]), integer(1))),
+      strata_want = max(as.integer(tab)),
+      enrichment = obs,
+      null_mean = mean(null), null_sd = stats::sd(null),
+      # (r + 1) / (n + 1): the permutation p-value that cannot return 0, because 0 would claim more
+      # resolution than n_perm draws have.
+      p_value = (sum(null >= obs) + 1) / (n_perm + 1),
+      z = (obs - mean(null)) / stats::sd(null),
+      morans_i = obs_i,
+      morans_i_null = mean(null_i),
+      morans_p = (sum(null_i >= obs_i) + 1) / (n_perm + 1),
+      morans_z = (obs_i - mean(null_i)) / stats::sd(null_i))
+  })
+  out <- dplyr::bind_rows(rows)
+  out <- dplyr::mutate(out,
+                       p_holm = stats::p.adjust(p_value, "holm"),
+                       morans_p_holm = stats::p.adjust(morans_p, "holm"),
+                       n_tested = nrow(out))
+  if (!is.null(detection)) {
+    out <- out |>
+      dplyr::left_join(detection, by = "site_id") |>
+      dplyr::mutate(excess_per_detection = ifelse(is.na(detection), NA_real_,
+                                                  (enrichment - null_mean) / detection))
+  }
+  dplyr::arrange(out, p_value)
+}
+
+#' A gene's expression in one site's cells against MATCHED cells, and why matching is the whole test.
+#'
+#' Two questions need this and they pull in opposite directions.
+#'
+#' THE ARTEFACT QUESTION. A junction read is a read-through transcript that overlaps the host gene,
+#' so at an intragenic same-sense site - the `cis_confound` flag - the junction molecules are counted
+#' as host-gene UMIs in exactly the cells carrying that site. Measured here, the inflation is large:
+#' +2.54 log2 at IS10's Gm35330 (96% of its cells detected against 23% of matched controls) and
+#' +2.89 at IS11's Stau2. So any transcriptional comparison involving a site's own host gene is
+#' contaminated by construction, and the contamination is not small.
+#'
+#' Whether it can reach a clustering statistic is a separate question with a different answer, and it
+#' is answered by asking whether the inflated gene is in the PCA at all. For the two sites whose
+#' clustering survives an animal-stratified null, it is not: Gm35330 and Abhd17c are absent from the
+#' 3,000 variable features the PCA is built on, so the inflation cannot load a component. Checking
+#' that is cheaper and more direct than rebuilding the counts matrix without junction reads, and it
+#' is the check to run first.
+#'
+#' THE CIS-EFFECT QUESTION. A provirus can act on a NEIGHBOUR of its host gene, which is a biological
+#' claim rather than an artefact, and it is immune to the above: junction reads at IS10 land in
+#' Gm35330, 239 kb from Klf6, so they cannot inflate Klf6. PC loadings cannot answer this - PCs are
+#' global, so a gene loading a discriminating component says it varies across the dataset, not that
+#' it differs in one site's cells. This is the test. Run at IS10 it returns +0.09 log2, p = 0.36:
+#' no effect, so the enhancer hypothesis for Klf6 is unsupported and IS10's confinement is
+#' unexplained rather than attributed.
+#'
+#' WHAT IS MATCHED, AND WHY EACH ONE. Animal, because every site here is mono-replicate and so
+#' perfectly confounded with its mouse. Tube, because it carries the sort fraction and the batch.
+#' Transcriptional cluster, because otherwise this measures cell-type composition. Depth decile,
+#' because labelled cells are systematically deeper. Drop any one and the test answers a different
+#' question with the same confidence.
+#'
+#' Reports `pct_site`/`pct_ctl` beside the means: a difference in detection rate and a difference in
+#' level are different claims, and the artefact shows up most clearly in the first.
+matched_expression_test <- function(gene, site, counts, totals, labels, replicate, tube,
+                                    cluster, depth, n_ctl_per = 5L, n_decile = 10L,
+                                    min_pool = 50L) {
+  i <- which(labels == site)
+  if (!length(i) || !(gene %in% rownames(counts))) return(dplyr::tibble())
+  an <- names(sort(table(replicate[i]), decreasing = TRUE))[1]
+  tu <- names(sort(table(tube[i]), decreasing = TRUE))[1]
+  i  <- i[replicate[i] == an & tube[i] == tu]
+  # Controls come from UNLABELLED cells of the same animal and tube. Not from cells at other sites:
+  # those carry their own junction-read inflation and their own clone structure.
+  pool <- which(replicate == an & tube == tu & is.na(labels))
+  if (length(i) < 3L || length(pool) < min_pool) return(dplyr::tibble())
+
+  br  <- stats::quantile(depth[pool], probs = seq(0, 1, length.out = n_decile + 1L), na.rm = TRUE)
+  bin <- function(x) pmin(pmax(findInterval(x, br[-c(1, length(br))]) + 1L, 1L), n_decile)
+  dp  <- bin(depth[pool]); di <- bin(depth[i])
+  ctl <- unlist(lapply(seq_along(i), function(k) {
+    cand <- pool[dp == di[k] & cluster[pool] == cluster[i[k]]]
+    # Depth alone if no control shares the cluster - stated in the output rather than silent, since
+    # an unmatched cluster turns this into a cell-type comparison.
+    if (!length(cand)) cand <- pool[dp == di[k]]
+    if (length(cand)) sample(cand, min(n_ctl_per, length(cand))) else integer()
+  }), use.names = FALSE)
+  if (!length(ctl)) return(dplyr::tibble())
+
+  cpm <- function(j) 1e4 * counts[gene, j] / totals[j]
+  a <- cpm(i); b <- cpm(ctl)
+  w <- suppressWarnings(stats::wilcox.test(a, b))
+  dplyr::tibble(
+    site_id = site, gene = gene, animal = an, tube = tu,
+    n_site = length(i), n_ctl = length(ctl),
+    mean_site = mean(a), mean_ctl = mean(b),
+    pct_site = mean(counts[gene, i] > 0), pct_ctl = mean(counts[gene, ctl] > 0),
+    log2fc = log2((mean(a) + 0.01) / (mean(b) + 0.01)),
+    p_value = w$p.value)
+}
+
+#' Many genes against ONE matched control set - the unbiased version of the single-gene test.
+#'
+#' `matched_expression_test()` answers "is this gene different", and it draws its own controls. Asking
+#' it about twenty thousand genes would redraw the control set twenty thousand times, which adds
+#' sampling noise ACROSS genes and makes the multiplicity correction wrong: the tests would no longer
+#' be comparable, because each is against a different background. The control set is a property of
+#' the site, not of the gene, so it is drawn once here and every gene is tested against the same
+#' cells.
+#'
+#' Matched on animal, tube, transcriptional cluster and depth decile, for the reasons
+#' `matched_expression_test()` sets out - except that `cluster` can be dropped, and for an unbiased
+#' scan it should be. Cluster membership is downstream of any hypothesis about what makes a site's
+#' cells sit together, so matching on it conditions on the mediator and bounds only the direct effect.
+#'
+#' Genes are filtered before testing, not after: a gene detected in a handful of cells cannot reach
+#' significance and only costs multiplicity. `min_detect` is the share of the site's cells OR the
+#' controls that must carry it.
+#'
+#' Holm across the genes actually tested, reported in the table rather than left to the reader.
+matched_de <- function(site, counts, totals, labels, replicate, tube, cluster, depth,
+                       n_ctl_per = 5L, n_decile = 10L, min_detect = 0.1, seed = 20261119L) {
+  i <- which(labels == site)
+  if (!length(i)) return(dplyr::tibble())
+  an <- names(sort(table(replicate[i]), decreasing = TRUE))[1]
+  tu <- names(sort(table(tube[i]), decreasing = TRUE))[1]
+  i  <- i[replicate[i] == an & tube[i] == tu]
+  pool <- which(replicate == an & tube == tu & is.na(labels))
+  if (length(i) < 3L || length(pool) < 50L) return(dplyr::tibble())
+
+  set.seed(seed)
+  br  <- stats::quantile(depth[pool], probs = seq(0, 1, length.out = n_decile + 1L), na.rm = TRUE)
+  bin <- function(x) pmin(pmax(findInterval(x, br[-c(1, length(br))]) + 1L, 1L), n_decile)
+  dp  <- bin(depth[pool]); di <- bin(depth[i])
+  ctl <- unlist(lapply(seq_along(i), function(k) {
+    cand <- pool[dp == di[k] & (is.null(cluster) | cluster[pool] == cluster[i[k]])]
+    if (!length(cand)) cand <- pool[dp == di[k]]
+    if (length(cand)) sample(cand, min(n_ctl_per, length(cand))) else integer()
+  }), use.names = FALSE)
+  if (!length(ctl)) return(dplyr::tibble())
+
+  # CPM on the two blocks at once, then test row by row. Matrix arithmetic rather than a per-gene
+  # subset: at twenty thousand genes the difference is minutes against hours.
+  cs <- 1e4 / totals
+  A <- counts[, i,   drop = FALSE] * rep(cs[i],   each = nrow(counts))
+  B <- counts[, ctl, drop = FALSE] * rep(cs[ctl], each = nrow(counts))
+  det_a <- Matrix::rowMeans(counts[, i,   drop = FALSE] > 0)
+  det_b <- Matrix::rowMeans(counts[, ctl, drop = FALSE] > 0)
+  keep <- which(det_a >= min_detect | det_b >= min_detect)
+  if (!length(keep)) return(dplyr::tibble())
+
+  pv <- vapply(keep, function(g) suppressWarnings(
+    stats::wilcox.test(A[g, ], B[g, ])$p.value), numeric(1))
+  ma <- Matrix::rowMeans(A[keep, , drop = FALSE])
+  mb <- Matrix::rowMeans(B[keep, , drop = FALSE])
+  dplyr::tibble(
+    site_id = site, gene = rownames(counts)[keep], animal = an, tube = tu,
+    n_site = length(i), n_ctl = length(ctl),
+    mean_site = ma, mean_ctl = mb,
+    pct_site = det_a[keep], pct_ctl = det_b[keep],
+    log2fc = log2((ma + 0.01) / (mb + 0.01)),
+    p_value = pv) |>
+    dplyr::mutate(p_holm = stats::p.adjust(p_value, "holm"),
+                  n_tested = length(keep)) |>
+    dplyr::arrange(p_value)
+}
+
+#' Moran's I for a 0/1 membership vector on a cell-cell graph, from edge sums alone.
+#'
+#' The autocorrelation counterpart of the kNN test, and it takes the SAME care about space: the
+#' weights are the shared-nearest-neighbour graph Seurat already built, not distances between UMAP
+#' coordinates. Reported alongside the kNN enrichment because the two fail differently - enrichment
+#' is local and binary, Moran's I is graph-wide and weighted - and agreement between them is worth
+#' more than either alone.
+#'
+#' AND IT IS MEANINGLESS WITHOUT A NULL, which is why this returns a number to permute rather than a
+#' number to read. With 50,000 cells and 50 members the statistic is dominated by the graph's own
+#' structure: the raw values for nine sites here span 0.065 to 0.080, which looks like no difference
+#' at all and is in fact the difference between p < 0.001 and p = 0.4. The permutation in
+#' `knn_site_clustering()` is what makes it interpretable.
+#'
+#' Computed from four scalars rather than a quadratic form. For a binary indicator every term
+#' reduces to sums over the membership block:
+#'
+#'     A  = sum of W[M, M]        R = sum of W[M, ]        C = sum of W[, M]        s0 = sum(W)
+#'     z  = 1 - p on members, -p elsewhere, with p = m / n
+#'     num = A(1-p)^2 - ((R - A) + (C - A)) p (1-p) + (s0 - R - C + A) p^2
+#'     sum(z^2) = m (1 - p)
+#'
+#' R and C are kept separate rather than assumed equal: Seurat's SNN graph is symmetric, but this
+#' function does not need to know that and would be wrong in silence if it ever stopped being true.
+#'
+#' AND NONE OF THOSE SUMS SUBSETS THE MATRIX, which is the difference between a usable function and
+#' an unusable one. `sum(W[member, member])` builds a |M| x |M| submatrix; at |M| = 16,982 and a
+#' thousand permutations that allocated its way through a render until the job was killed. Written
+#' as an indicator instead - A = x'Wx by one sparse mat-vec, R and C by indexing precomputed row and
+#' column sums - each permutation is O(nnz) with no allocation, and `pre` carries the sums that do
+#' not depend on the draw so they are computed once per test rather than once per permutation.
+#' Algebraically identical; verified equal to the subsetting form on this dataset's graph.
+morans_i_binary <- function(W, member, pre = morans_pre(W)) {
+  n <- nrow(W)
+  m <- length(member)
+  if (m == 0L || m == n) return(NA_real_)
+  p <- m / n
+  x <- numeric(n); x[member] <- 1
+  A <- as.numeric(Matrix::crossprod(x, W %*% x))
+  R <- sum(pre$rs[member])
+  C <- sum(pre$cs[member])
+  num <- A * (1 - p)^2 - ((R - A) + (C - A)) * p * (1 - p) + (pre$s0 - R - C + A) * p^2
+  n / pre$s0 * num / (m * (1 - p))
+}
+
+#' The parts of Moran's I that do not depend on which cells are in the set. Computed once per test.
+morans_pre <- function(W) {
+  rs <- Matrix::rowSums(W)
+  list(rs = rs, cs = Matrix::colSums(W), s0 = sum(rs))
+}
+
+#' REMOVED: cis_loading_check(), which screened a site's discriminating PCs for nearby loaded genes.
+#'
+#' Kept as a note so it is not reinvented. It was used to ask whether a site's clustering was the
+#' insertion acting in cis, and it is the wrong instrument for that question twice over.
+#'
+#'   - PCs ARE GLOBAL. A gene loading a component that separates one site's cells says the gene
+#'     varies across the whole dataset; it says nothing about whether it differs in those cells. The
+#'     test is matched differential expression - `matched_expression_test()`.
+#'   - IT SELECTS THE GENE IT THEN TESTS. Klf6 was picked because it loaded IS10's discriminating
+#'     PCs, and that is a biased pick: an enhancer event perturbs whatever is within reach, so the
+#'     window has to be scanned with a multiplicity correction, not mined for one name.
+#'
+#' Its one apparent success was also its clearest failure. It flagged exactly the two sites carrying
+#' `cis_confound = TRUE` and cleared the one flagged FALSE, which was written up as independent
+#' validation of the annotation. That is agreement over three sites, and one of the two it flagged
+#' (IS04) has no host-gene effect at all once junction UMIs are subtracted.
+
+#' The target-site duplication tested across BOTH channels' observed sequence, three ways.
+#'
+#' WHAT THE EXISTING CHECK DOES NOT SHOW. `tsd_check()` reports `tsd_obs`: the fraction of 5' reads
+#' whose sequence contains the span derived from the two junction coordinates. That number is 1 at
+#' every site that has it, and it is close to uninformative, because the 5' read ALIGNS to that span
+#' - its bases match the reference there by construction of a clean alignment. Reporting it as
+#' "independent confirmation" was wrong and the claim is withdrawn.
+#'
+#' WHAT THIS DOES, AND WHAT IT STILL CANNOT DO. The informative form is three-way: the last `expect`
+#' + 1 bases of the 5' clip's host, the first `expect` + 1 bases of the 3' clip's host, and the
+#' reference at [pos_3p, pos_5p] must all be the same string. That is a real check and it catches a
+#' class of bug this analysis has had three times - an off-by-one in either channel, a 0- versus
+#' 1-based slip, or the wrong end of a minus-strand alignment - because a mis-derived coordinate in
+#' either channel makes the two observed strings disagree.
+#'
+#' It is NOT independent evidence that a TSD exists. Both clips align to the same reference span, so
+#' both matching the reference is guaranteed by their alignments; the agreement between them is the
+#' Delta = expect relationship restated in bases rather than coordinates. The evidence that an
+#' integrase made these two junctions is the coordinate relationship and its chance rate
+#' (`tsd_chance_rate()`), and nothing in the sequence adds to it. What a reader gets here is the
+#' assurance that the coordinate arithmetic behind that claim is self-consistent across two
+#' independently aligned read sets.
+#'
+#' Returns NA rather than FALSE where a channel has no reads at the locus: absent evidence and
+#' contradicted evidence must not print the same.
+tsd_three_way <- function(sites, five_hits, three_hits, genome_fa, opt = IS_DEFAULTS,
+                          expect = 4L) {
+  if (!nrow(sites) || is.null(genome_fa) || !file.exists(genome_fa)) return(dplyr::tibble())
+  fa <- Rsamtools::FaFile(genome_fa)
+  w  <- expect + 1L
+
+  # The host bases abutting the junction, in reference-forward orientation.
+  #
+  # DO NOT REVERSE-COMPLEMENT. SAM stores SEQ already in reference-forward orientation - it is
+  # reverse-complemented by the aligner when FLAG 0x10 is set - so `x[1]` is always the lowest
+  # reference coordinate of the alignment and `x[n]` the highest. tsd_check() says this in as many
+  # words ("SEQ is stored reference-forward") and the first version of this function flipped it
+  # anyway, which made every minus-strand site report a mismatch.
+  #
+  # WHICH END abuts the junction does still depend on the channel AND the strand, in the mirrored
+  # pattern read_bwa_hits() works through for the coordinate itself:
+  #
+  #   3' channel: junction = POS when forward (low end -> head), far end when reverse (-> tail)
+  #   5' channel: junction = far end when forward (-> tail),     POS when reverse (-> head)
+  #
+  # A fixed end per channel is right for plus-strand sites and silently wrong for minus-strand ones:
+  # it reads the far end of the clip, 25-50 bp away. Either mistake makes this function invent a
+  # coordinate bug in the pipeline it exists to check, which is worse than having no check, because
+  # someone will go looking for it.
+  host_at <- function(h, channel) {
+    if (!nrow(h)) return(character())
+    vapply(seq_len(nrow(h)), function(i) {
+      x <- h$seq[i]
+      if (is.na(x) || !nchar(x)) return(NA_character_)
+      at_head <- if (channel == "three_prime") h$strand[i] == "+" else h$strand[i] == "-"
+      if (at_head) substr(x, 1L, w) else substr(x, nchar(x) - w + 1L, nchar(x))
+    }, character(1))
+  }
+
+  rows <- lapply(seq_len(nrow(sites)), function(i) {
+    ch <- sites$chrom[i]; p3 <- as.integer(sites$pos[i])
+    n5 <- five_hits[five_hits$chrom == ch &
+                      abs(five_hits$pos - p3) <= expect + 2L, , drop = FALSE]
+    n3 <- three_hits[three_hits$chrom == ch &
+                       abs(three_hits$pos - p3) <= opt$cluster_window &
+                       !is.na(three_hits$seq), , drop = FALSE]
+    if (!nrow(n5)) return(dplyr::tibble(
+      site_id = sites$site_id[i], chrom = ch, pos_3p = p3, pos_5p = NA_integer_,
+      delta = NA_integer_, ref_span = NA_character_, five_span = NA_character_,
+      three_span = NA_character_, n_five = 0L, n_three = nrow(n3),
+      five_eq_ref = NA, three_eq_ref = NA, five_eq_three = NA, three_way = NA))
+
+    p5 <- as.integer(stats::median(n5$pos))
+    lo <- min(p3, p5); hi <- max(p3, p5)
+    # unname(): scanFa() returns a NAMED character vector, and identical() against an unnamed string
+    # is FALSE however well the sequences match. Three sites printed "NO" with visibly equal columns.
+    ref <- unname(as.character(Rsamtools::scanFa(
+      fa, GenomicRanges::GRanges(ch, IRanges::IRanges(lo, hi)))))
+    f_obs <- host_at(n5, "five_prime")
+    t_obs <- host_at(n3, "three_prime")
+    # The modal observed string, not the first: one mismatching read must not decide the answer, and
+    # the fraction agreeing is reported beside it.
+    modal <- function(x) { x <- x[!is.na(x)]; if (!length(x)) NA_character_
+                           else names(sort(table(x), decreasing = TRUE))[1] }
+    fm <- modal(f_obs); tm <- modal(t_obs)
+    dplyr::tibble(
+      site_id = sites$site_id[i], chrom = ch, pos_3p = p3, pos_5p = p5,
+      delta = p5 - p3, ref_span = ref, five_span = fm, three_span = tm,
+      n_five = nrow(n5), n_three = nrow(n3),
+      five_eq_ref  = if (is.na(fm)) NA else identical(fm, ref),
+      three_eq_ref = if (is.na(tm)) NA else identical(tm, ref),
+      five_eq_three = if (is.na(fm) || is.na(tm)) NA else identical(fm, tm),
+      three_way = if (is.na(fm) || is.na(tm)) NA
+                  else identical(fm, ref) && identical(tm, ref))
+  })
+  dplyr::bind_rows(rows)
+}
+
 #' One row per cell per site: the table that joins onto the Seurat metadata.
 #'
 #' A cell at more than one site is flagged, not resolved: a genuine multi-copy integrant and a
@@ -2528,7 +3508,7 @@ tsd_check <- function(sites, five_hits, opt = IS_DEFAULTS, search = 2000L, expec
 #' `channel` and `tier` are carried through per cell, not collapsed. The capture-recapture argument
 #' needs, per site, the 3' cell set, the genomic cell set and their overlap, and a single label per
 #' cell destroys that irrecoverably - cheap to keep now, a re-run to recover later.
-summarise_cells <- function(hits) {
+summarise_cells <- function(hits, opt = IS_DEFAULTS) {
   if (nrow(hits) == 0L) return(dplyr::tibble())
   # names(), not hits$channel: a tibble warns on an unknown column rather than returning NULL.
   if (!"channel" %in% names(hits)) hits$channel <- "three_prime"
@@ -2567,5 +3547,18 @@ summarise_cells <- function(hits) {
     dplyr::mutate(n_sites_in_cell = dplyr::n_distinct(site_id),
                   ambiguous = n_sites_in_cell > 1L) |>
     dplyr::ungroup() |>
+    # The per-assignment counterpart of site_evidence()'s evidence_tier, and the same argument: a
+    # cell placed by ~130 bases of host at MAPQ 255 and a cell placed by a 6-base exact match are
+    # both one row here, and every figure that counts rows is averaging over that. Ordered best
+    # first, and derived only from columns already present so it cannot drift from them.
+    #
+    # Three tiers, not four. A fourth for discovery-tier 3' clips was written and removed: `tiers`
+    # holds only "assign" and "genomic" in this table, because a discovery clip reaches a cell by
+    # matching its own site's flank and so arrives labelled "assign". The branch matched nothing and
+    # would have gone on matching nothing in silence.
+    dplyr::mutate(assignment_tier = dplyr::case_when(
+      reads_genomic > 0L                           ~ "A genome-mapped host",
+      max_clip_len >= opt$assign_floor$exact_below ~ "B 3' clip >= 15 bp",
+      TRUE                                         ~ "C 3' clip 6-14 bp, exact")) |>
     dplyr::arrange(tube, barcode, site_id)
 }

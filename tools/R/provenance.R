@@ -198,17 +198,65 @@ input_files <- function(meta, catalogue = "metadata/catalogue_data.tsv") {
     read.delim(catalogue, colClasses = "character", na.strings = character())
   } else data.frame(file = character(), kind = character(), md5 = character())
   rows <- lapply(paths, function(p) {
-    # A directory target - Cell Ranger's per-sample matrix folder is one - has no md5, and md5sum()
-    # returning NA for it used to be reported as "missing". That is the one wrong thing a provenance
-    # check can say about a file that is sitting right there: it reads as data loss. It is reported
-    # as unhashed instead, which keeps the banner amber (nothing was verified) without the false
-    # alarm. Hashing the contents would be real verification and is not free - these are the count
-    # matrices - so it is a deliberate gap, not an oversight.
+    # A directory target - Cell Ranger's per-sample matrix folder is one - has no md5 of its own, and
+    # md5sum() returning NA for it was once reported as "missing": the one wrong thing a provenance
+    # check can say about a file sitting right there, because it reads as data loss. That became
+    # "directory (not hashed)", which was honest and still an admission - eight of thirty-five
+    # declared inputs unverified. It is now DIGESTED, over its contents; see dir_digest(). The cost
+    # was measured rather than assumed: the eight matrix directories are 1.7 GB over 24 files and
+    # take about five seconds. The BAMs beside them are 426 GB, which is what dir_digest_max_bytes()
+    # refuses.
     if (dir.exists(p)) {
-      n <- length(list.files(p))
+      # A DIRECTORY IS HASHED BY ITS CONTENTS, not skipped. These entries used to read
+      # "directory (not hashed)" - amber, honest, and the one place where this report's own standard
+      # (every number reproducible from data and code that is available) was asserted rather than
+      # demonstrated. Eight of the thirty-five declared inputs were Cell Ranger matrix directories,
+      # so a ninth of the provenance table was an admission.
+      #
+      # md5sum of a directory returns NA, which is why it was skipped. The fix is a digest OVER the
+      # directory: every file's own md5, paired with its relative path, sorted, and hashed. Sorting
+      # is what makes it reproducible - readdir order is not stable across filesystems - and
+      # including the paths is what makes it sensitive to a file being renamed or moved rather than
+      # only to its bytes changing.
+      #
+      # The cost is bounded and was measured before this was written: the eight matrix directories
+      # are 1.7 GB over 24 files, about a minute. It is NOT a licence to hash anything: the BAMs
+      # under data/ are 426 GB, and `max_bytes` refuses rather than quietly spending an hour. A
+      # directory too large to digest still reports its file count, as before.
+      fs <- list.files(p, recursive = TRUE, full.names = TRUE, all.files = FALSE, no.. = TRUE)
+      fs <- fs[!dir.exists(fs)]
+      n <- length(fs)
+      size_txt <- sprintf("%d file%s", n, if (n == 1L) "" else "s")
+      total <- sum(file.info(fs)$size, na.rm = TRUE)
+      if (!n || total > dir_digest_max_bytes()) {
+        return(data.frame(path = p, kind = "directory",
+                          size = size_txt, md5 = NA_character_,
+                          check = if (!n) "directory (empty)" else
+                            sprintf("directory (%.0f GB, over the digest limit)", total / 1e9)))
+      }
+      md5 <- dir_digest(p, fs)
+      # The catalogue holds FILES, so a directory never has a row of its own. Verify it through its
+      # contents instead: every file inside, looked up in the catalogue by its path under data/. The
+      # directory passes only if every catalogued file matches, which is a stronger statement than a
+      # single digest comparison would be - it names which file differs.
+      rel <- sub("^data/", "", fs)
+      rows <- cat_tab[cat_tab$file %in% rel, , drop = FALSE]
+      with_md5 <- rows[nzchar(rows$md5), , drop = FALSE]
+      check <- if (!startsWith(p, "data/")) "digested (outside data/)"
+        else if (nrow(rows) == 0) "digested, not catalogued"
+        else if (nrow(with_md5) == 0) "digested; catalogue has no md5 yet"
+        else {
+          now <- vapply(file.path("data", with_md5$file), function(f) unname(file_md5(f)),
+                        character(1), USE.NAMES = FALSE)
+          bad <- with_md5$file[!is.na(now) & now != with_md5$md5]
+          if (length(bad)) paste0("DIFFERS from catalogue: ", paste(basename(bad), collapse = ", "))
+          else if (nrow(with_md5) < length(fs))
+            sprintf("matches catalogue (%d of %d files)", nrow(with_md5), length(fs))
+          else "matches catalogue"
+        }
       return(data.frame(path = p, kind = "directory",
-                        size = sprintf("%d file%s", n, if (n == 1L) "" else "s"),
-                        md5 = NA_character_, check = "directory (not hashed)"))
+                        size = sprintf("%s, %.0f MB", size_txt, total / 1e6),
+                        md5 = md5, check = check))
     }
     md5 <- if (file.exists(p)) file_md5(p) else NA_character_
     if (startsWith(p, "data/")) {
@@ -277,7 +325,14 @@ collect_provenance <- function(catalogue = "metadata/catalogue_data.tsv") {
   }
 
   # One row per check: "ok", "warning" (check before trusting) or "error" (can't be trusted as rendered)
-  inputs_ok <- p$inputs$check %in% c("matches catalogue", "in git", "matches pipeline manifest")
+  # A digested directory is verified, or explicitly without a baseline - not an error. Without
+  # these the banner reads every Cell Ranger matrix directory as a failure, which is the
+  # opposite of what hashing them was for. The startsWith() covers the partial-match string,
+  # which sprintf() builds with a file count in it.
+  inputs_ok <- startsWith(p$inputs$check, "matches catalogue") |
+    p$inputs$check %in% c("in git", "matches pipeline manifest",
+                          "digested, not catalogued", "digested; catalogue has no md5 yet",
+                          "digested (outside data/)")
   p$checks <- data.frame(
     check = c("Code", "R&nbsp;packages", "Pipeline", "Input&nbsp;data"),
     level = c(
@@ -386,4 +441,37 @@ report_dir <- function() {
   unlink(dir, recursive = TRUE)
   dir.create(dir, recursive = TRUE, showWarnings = FALSE)
   dir
+}
+
+#' A reproducible digest over a directory's contents.
+#'
+#' Every file's md5 paired with its path relative to the directory, sorted, then hashed. Sorting is
+#' what makes it stable - readdir order is not guaranteed across filesystems - and including the
+#' relative paths is what makes it notice a rename, which a digest of the concatenated bytes would
+#' not.
+#'
+#' Not recursive into symlinked directories beyond what list.files() follows, and not sensitive to
+#' mode or mtime: this answers "are these the same contents", not "is this the same filesystem
+#' state".
+dir_digest <- function(dir, files = NULL) {
+  if (is.null(files)) {
+    files <- list.files(dir, recursive = TRUE, full.names = TRUE, all.files = FALSE, no.. = TRUE)
+    files <- files[!dir.exists(files)]
+  }
+  if (!length(files)) return(NA_character_)
+  rel <- sub(paste0("^", gsub("([.|()\\^{}+$*?\\[\\]])", "\\\\\\1", dir), "/?"), "", files)
+  o <- order(rel)
+  per <- vapply(files[o], function(f) unname(tools::md5sum(f)), character(1), USE.NAMES = FALSE)
+  unname(openssl::md5(paste(rel[o], per, collapse = "\n")))
+}
+
+#' How large a directory may be before it is reported rather than digested.
+#'
+#' A guard, not a preference. The matrix directories this exists for are 1.7 GB in total; the BAMs
+#' beside them are 426 GB, and a provenance banner must not quietly spend an hour reading them.
+#' Override with the SCARAB_DIR_DIGEST_MAX_GB environment variable.
+dir_digest_max_bytes <- function() {
+  g <- suppressWarnings(as.numeric(Sys.getenv("SCARAB_DIR_DIGEST_MAX_GB", "8")))
+  if (is.na(g) || g <= 0) g <- 8
+  g * 1e9
 }

@@ -5,7 +5,7 @@ why the analysis exists, what was tried and rejected, what is assumed, and where
 code explains *what* it does; this explains *why*, and what already went wrong.
 
 Status as of 2026-11-18: pipeline runs end to end on the cluster (job 35742986, 1 h 49 m), **15
-sites** called, **1,222 cell-site assignments over 1,195 cells**, clip-table gate PASS. Committed
+sites** called, **1,226 cell-site assignments over 1,199 cells**, clip-table gate PASS. Committed
 through the floor change, the called-cell filter and the review responses; the project has a standing
 rule that commits happen only when asked.
 
@@ -38,15 +38,33 @@ Each came from using a denominator that already had the answer built into it:
 
 **Never divide labelled cells by labelled cells.** All three had the shape of a strong result.
 
-**12 sites, not 15, for any repertoire statement.** All three excluded sites fail the
+**EVERY CLONE IS PERFECTLY CONFOUNDED WITH ITS ANIMAL, so any test comparing a site's cells against
+other cells must stratify by replicate.** Each site is mono-replicate by construction - that is what
+makes the hashtag a clonality control in the first place - and the same fact means a site's cells and
+its mouse's cells are the same set. Tubes do not help: they are hashtag-multiplexed, so Rx_4 holds
+four mice. This has already produced one wrong result. The spatial-clustering test was first run with
+a tube-stratified null and reported IS05, IS10, IS04, IS03 and IS01 as transcriptionally confined;
+re-run with tube x animal x depth, only IS05 and IS10 survive, and the other three were animal
+effects. IS05 and IS10 are both B0304, which is 1,614 of ~20,500 called cells in Rx_4 - so the
+original null was comparing a tenth-sized, separately-processed population against a background that
+was 92% other animals. Multiplicity correction would not have caught it (IS04's Holm value is 0.042
+and survives at 0.05); only the stratum did.
+
+**12 sites, not 17, for any repertoire statement.** Four are excluded now, not three: IS16 joins
+them, admitted by rule C′ as an integration but untested as a clone. Three of the four fail the
 flank-complexity gate (`flank_gated`), so their flanks cannot support quantification: IS07 at
 `JH584304.1:35,417`, IS14 at `chr10:19,804,209`, IS15 at `chr9:82,806,975`. IS14 and IS15
 additionally clear the cell floor only on the two channels' reads summed (`pooled_only`) and have no
-5′ junction. Three exclusions, not two — the count read 13 here and throughout the report until the
-rendered output was inspected against the table it claims to summarise.
-`site_evidence.csv` carries one `defensible` column, derived from all three conditions, so the
-judgement is read rather than remembered. Derive the *reason* from that table too if you quote it:
-the first attempt rendered "IS07: NA; IS14: NA; IS15: NA" by subsetting twice.
+5′ junction. The fourth, IS16, is excluded for a different reason: rule C′ admits it on a
+strand-matched target-site duplication, which establishes that an integration happened there and
+says nothing about whether a clone did — its 3 cells are all B0301 at *p* = 0.10.
+
+`site_evidence.csv` carries `defensible` and, beside it, `evidence_tier`. Prefer the tier. A bare
+count has been quoted in this project as 15, 13, 12 and 16, each correct under a caveat recorded
+somewhere else, and the drift is not carelessness but the predictable result of a one-dimensional
+summary of multi-dimensional evidence. **Quote "17 across four tiers, 12 defensible"**, where `defensible` now means
+flank-clean AND mono-replicate beyond chance, not merely above the floor. Derive the *reason* per site from the table too: the first attempt rendered
+"IS07: NA; IS14: NA; IS15: NA" by subsetting twice.
 
 ---
 
@@ -185,7 +203,7 @@ Result: cells labelled rise from 339 to **552** on the 3′ channel alone, and t
 genome-mapped channel's cells are folded in as well. The wild-type tubes stayed at zero through all
 of that except for one called cell, the Rx_1 event at IS04: the Rx_5 cell that used to make it two
 was an index-hopping barcode that Cell Ranger never called, so restricting to called cells removed
-it. The measured cross-tube rate is **1 in 1,222 assignments**.
+it. The measured cross-tube rate is **1 in 1,226 assignments**.
 
 **A third trap, hit on 2026-11-18: the cache that only breaks on restart.** The genomic stage writes
 one CSV a tube so the expensive scan can be resumed. Read back with guessed column types, that cache
@@ -277,7 +295,7 @@ it was a question about what the library contains, now answered.
 
 ## 7. Results, and the validations
 
-15 sites called — **12 defensibly** (`site_evidence.csv` has a `defensible` column; IS14/IS15 are pooled-only, IS07's flank cannot support quantification) — **1,195 distinct cells labelled**. `mouse` is the
+17 sites called — **12 defensibly**, across four `evidence_tier` values (A: 4, B: 6, C: 6, D: 1); IS07's flank cannot support quantification; IS14, IS15, IS16 and IS17 fail the mono-replicate clonality test — **1,199 distinct cells labelled**. `mouse` is the
 dominant hashtag class, which is 96–100% of each site's cells.
 
 | id | locus | gene | cells | mouse | note |
@@ -298,7 +316,7 @@ dominant hashtag class, which is 96–100% of each site's cells.
 | IS14 | chr10:19,804,209 | intergenic | 2 | B0304 | **`pooled_only`** — clears the cell floor only on both channels' reads summed, no 5′ junction, held out of the mini-reference. Exclude from repertoire counts |
 | IS15 | chr9:82,806,975 | *Phip* | 2 | B0304 | as IS14 |
 
-`called_by` in `integration_sites.csv` carries this per site: 9 sites called by both channels, 4 by the genome-mapped channel alone, 2 (IS14, IS15) only on the pooled reads. **The defensible repertoire count is 13.**
+`called_by` in `integration_sites.csv` carries this per site: 9 sites called by both channels, 4 by the genome-mapped channel alone, 2 (IS14, IS15) only on the pooled reads, and 1 (IS16) by rule C′. **The defensible repertoire count is 12**, and `site_evidence.csv` carries `evidence_tier` beside `defensible` so the count travels with its basis. This line read 13 for a week after the third exclusion was added at the top of this file — one place corrected, one place not, which is what an unversioned number in prose does.
 
 **Site IDs are pinned to loci, not to ranks.** `metadata/integration_site_registry.csv` holds the
 mapping; a locus in it keeps its number for good and a new locus takes the lowest number never used.
@@ -330,7 +348,7 @@ first attempt made exactly that mistake.
 | `cluster_window = 20` | hides nothing. All 1,396 genomic reads inside a called site sit at offset exactly 0 |
 | TSD on IS10–IS15 | unreachable, not failing. The whole 5′ channel is 76 reads and none lands within 2 kb of those six loci |
 | 1,186 → figures | 5 cells in the stroma tubes (in neither embedded panel) and 33 in no demultiplexer output, leaving 1,148 before QC. **Closed, and the 33 are gone:** see the demultiplexer row below |
-| the demultiplexer's cell list | **closed.** Cell Ranger calls 161,168 cells, the demultiplexer emits 161,091 — the gap that showed as 20,502 against 20,514 in Rx_4. It is one-directional (no barcode is in the demux output that Cell Ranger did not call) and the 77 missing are **exactly** the 77 cells with zero HTO counts across all four tags: `identical(sort(zero_HTO_called), sort(dropped))` is TRUE. deMULTIplex2 cannot place a cell with no tag reads, so it drops it before classification — which is why they carry no call rather than a "negative" call. **None of the 1,195 labelled cells is among them** (0 observed against 0.57 expected by chance), so nothing in the report is affected. The "33 labelled cells in no demultiplexer output" predated the called-cell filter and is now 0 of 1,195 |
+| the demultiplexer's cell list | **closed.** Cell Ranger calls 161,168 cells, the demultiplexer emits 161,091 — the gap that showed as 20,502 against 20,514 in Rx_4. It is one-directional (no barcode is in the demux output that Cell Ranger did not call) and the 77 missing are **exactly** the 77 cells with zero HTO counts across all four tags: `identical(sort(zero_HTO_called), sort(dropped))` is TRUE. deMULTIplex2 cannot place a cell with no tag reads, so it drops it before classification — which is why they carry no call rather than a "negative" call. **None of the labelled cells is among them** (0 observed against 0.57 expected by chance), so nothing in the report is affected. The "33 labelled cells in no demultiplexer output" predated the called-cell filter and is now 0 of 1,199 |
 | ambient (#43) | holds, and the new channel is a check on it: junction-bearing barcodes went 568 → 669 while the non-cell count stayed at **15**. Signal added without background |
 | metadata queries 1–2 | computed from `demux_res_*`; see INFORMATION-GAPS. Query 3, the FACS mCherry⁺ fraction, is still outside the data |
 
@@ -344,7 +362,7 @@ it matter more than the files:
   per row rather than a 0/1 verdict, which is what lets a view ask a different question — exact
   matching is `nm == 0`, a lower floor is one argument — and lets the gate prove the views agree.
 - **The gate is an equality that stops the run.** Filtered at the current floor, the match table must
-  reproduce the pipeline's own output row for row — currently 15 sites / 1,222 assignments / 1,195
+  reproduce the pipeline's own output row for row — currently 17 sites / 1,226 assignments / 1,199
   cells, but the gate compares against what the run produced rather than against a number written
   here, which is why it survived the floor change. It failed on first run and caught two real bugs:
   a union across a molecule's reads that let a 5-base read's matches through a floor applied to its
@@ -372,7 +390,7 @@ Three stages of being wrong about this are worth knowing, because each looked li
 At `n_decoy = 1000` the measurement exists: **15 observed against 13.5 predicted at 6 bp**,
 obs/exp = 1.11, which validates the matcher against the analytic 4⁻ᴸ rate rather than merely failing
 to contradict it. The floor's licence is reported as an absolute count — **0.31 expected spurious
-across 931 accepted molecules** against 1,222 real, 0.02 per site — because both percentage framings
+across 931 accepted molecules** against 1,226 real, 0.02 per site — because both percentage framings
 invite overreading. Decoy comparisons are capped at `exact_below`, since chance matching at 30 bases
 is 4⁻³⁰ and comparing 1,000 flanks against the 748 longer molecules was paying for nothing: that
 capping is what kept `assign` at 3 m 52 s while the decoy count went up ninefold.
@@ -419,7 +437,9 @@ the reference — says **65.2% of Rx_4 and 43.2% of Rx_6 called cells carry any,
 4 of 26,822 in the wild-type control**. So the gate is about half pure.
 
 `repertoire_completeness()` therefore reports **two** denominators: sorted cells as the upper bound,
-vector-positive cells as the defensible one — a **5.3% floor and a 12.5% ceiling**. Use the second.
+vector-positive cells as the defensible one — a **5.3% floor and NO usable ceiling**; see §9. The
+12.5% ceiling was an artefact of imputing one median detection rate ten times without an error bar,
+and is withdrawn.
 
 **What the unaccounted remainder is, and what cannot be said about it.** Of 1,422 junction-bearing
 cells, 236 carry a molecule matching no called site; of the 76 long enough to place, 67 land at
@@ -465,7 +485,7 @@ cross-mouse landings sitting on IS01 and IS02).
    because it was written into the floor section where `site_replicate` and `embedding` do not yet
    exist and would have failed at render.
 
-Current counts: **15 sites, 1,222 assignments over 1,195 cells**, gate passing.
+Current counts: **17 sites, 1,226 assignments over 1,199 cells**, gate passing.
 
 **The assignment floor is ONE OBJECT, not two constants (2026-11-18).** `IS_DEFAULTS$assign_floor` is
 `list(min_len = 6L, exact_below = 15L)` and there is a load-time assertion that refuses an incoherent
@@ -475,7 +495,7 @@ matching beneath it. Asking a reader not to separate the two numbers is not a gu
 value is. The assertion was tested by feeding it an incoherent policy, and it rejects at `source()`.
 
 **What licenses the floor, and what does not.** 0.31 expected spurious assignments across the 931
-accepted molecules, against 1,222 real — **0.02 per site**, which changes no clone size, interval or
+accepted molecules, against 1,226 real — **0.02 per site**, which changes no clone size, interval or
 figure. Report that absolute count, not a percentage: a rate on the 25 assignments the 6 bp band adds
 reads as a tolerance being brushed when it is 0.26 events. *General rule, since it recurs: a marginal
 error rate is the right frame when the increment will be interpreted on its own, an absolute count
@@ -609,22 +629,305 @@ Figures here are read from the CSV named beside them. The four orphan 5' junctio
 questions until 2026-11-19; `orphan_evidence.csv` now carries the evidence and a verdict per
 junction, so they are listed under *Closed* with what each turned out to be.
 
-1. **IS05 is HSC-only with 53 cells, and its cells look spatially clustered** in the HSC UMAP. The
-   sub-clone test added for T5 (UMAP position plus within-cell molecule ratio) does not close this;
-   53 points on a 50,000-cell map can cluster by chance.
-2. **The floor's value is now measured; what remains open is one site.** See *Closed* below for the
-   grid — the short version is that `min_umis` is inert, `min_cells` does all the work, and the only
-   live decision is `min_cells` 3 against 2, worth exactly one cluster. That cluster
-   (chr11:69,817,658) looks like one integration observed repeatedly rather than a clone, so the
-   recommendation is to leave the floor alone; it is listed as open only because nobody has ruled on
-   it. chrX:100,691,117 is the separate and stronger case, also below.
-3. **Clonality proper** — site counts per compartment as a diversity measure is the intended
-   destination and has not been attempted. Assumption 3 is the obstacle: clone sizes are samples.
-   Note also that clone size is estimable for only **6 of 15** sites; the rest sit at a truncated
-   mean ≤ 1.09 where the zero-truncated Poisson is degenerate and `detection_model()` returns NA.
+1. **`Rnf17` in IS05's cells, which nothing explains.** The strongest hit in IS05's differential
+   expression by a wide margin: **+4.5 log2, detected in 24% of its cells and 0 of 240 matched
+   controls**, *p* = 4e-14, Holm 4e-10 across 9,479 genes tested. It is a piRNA-pathway gene with no
+   known haematopoietic role, it is on a different chromosome from IS05 so it is not *cis*, and its
+   *p* is unchanged by matching on transcriptional cluster so it is not a state effect. A gene absent
+   from 240 matched cells and present in a quarter of a clone's is either real clone-specific
+   expression or an artefact not yet identified. **Flagged, not theorised.**
+2. **Direction of causation for IS05.** Its cells occupy a Vwf⁺ HSC state (see *Closed*), but a
+   provirus that pushed a cell into that state and a clone that arose in such a cell predict the same
+   picture. The *cis* scan rules out only the simplest version of the first. Nothing in this data
+   separates them.
+3. **The chr19 fusion's cells are not IS03's cells — 1 of 14 overlap.** The hashtag leg says these
+   are B0303's cells and IS03 is B0303's site, but at the cell level the fusion junction and IS03's
+   own channels label almost disjoint sets, and 13 of the 14 fusion cells carry no site label at all.
+   Either the junction detects cells IS03's channels missed (consistent with its detection being too
+   low for the ZTP) or they are B0303 cells carrying something else at that locus. **This is the one
+   item flagged to come back**; it does not change the verdict that the junction is not an
+   integration site.
+4. **Whether IS10's, IS11's and IS03's host-gene elevation is real or residual artefact — now
+   leaning strongly to artefact.** It survives subtracting every extractable junction UMI (0.8–2.4
+   log2, *p* < 1e-06), and the clip table holds only molecules whose soft clip was long enough to
+   extract, so the correction is a lower bound. What is new is that **the residual occurs only at
+   SAME-SENSE sites** (see *Closed*), which is precisely where the artefact can operate and nowhere
+   else. A genuine cis effect has no reason to track orientation that perfectly. Do not quote these
+   three as cis effects. Settling it properly still needs an orthogonal measurement — host-gene
+   expression in unlabelled cells of the same clone — which needs a clone membership this assay
+   cannot supply.
+5. **Is the antisense decrease real?** −0.28 at IS02's *Ddx10* and −0.37 at IS01's *Mef2c* are the
+   two measurements the artefact cannot touch, so they are candidates for a real effect — antisense
+   insertion into a gene body reducing its expression is an ordinary mechanism. Both are small, and
+   both sites are B0303's two largest clones, so a shared state effect is not excluded. Two sites is
+   not a result.
+6. **Clonality proper** — site counts per compartment as a diversity measure. Still not attempted,
+   and the obstacle is now better characterised rather than removed: see the completeness entry
+   below. Per-compartment comparison is additionally confounded with tube (IS05 is Rx_4 only,
+   IS13 Rx_3 only), so it is not a matter of running a statistic on the current table.
 
 ### Closed
 
+- **ORIENTATION PREDICTS THE SIGN OF THE HOST-GENE EFFECT, 6 of 6 — which says what the effect IS.**
+  Four host genes are inflated in their site's own cells and two are *deflated*, which was logged as
+  unexplained. Put the insertions' orientations beside them and the split is perfect:
+
+  | site | host gene | orientation | `cis_confound` | log2 FC, fully corrected |
+  |---|---|---|---|---|
+  | IS11 | *Stau2* | same sense | TRUE | **+2.42** |
+  | IS10 | *Gm35330* | same sense | TRUE | **+1.70** |
+  | IS04 | *Abhd17c* | same sense | TRUE | +0.55 (*p* = 0.9) |
+  | IS03 | *Hells* | same sense | TRUE | **+0.84** |
+  | IS02 | *Ddx10* | **antisense** | FALSE | **−0.28** |
+  | IS01 | *Mef2c* | **antisense** | FALSE | **−0.37** |
+
+  With 4 same-sense and 2 antisense, the chance of the negatives landing exactly on the antisense
+  pair is 1/choose(6,2) = **0.067**. *Suggestive, not significant*, and on six sites it cannot be
+  more — but the direction is what a mechanism predicts rather than what noise predicts.
+
+  **Same-sense:** a read-through transcript continues in the host gene's own direction, so Cell
+  Ranger counts it as that gene's expression. The elevation IS the artefact, by construction — and
+  `cis_confound`, derived from annotation alone with no knowledge of any of this, flags exactly those
+  four. **Antisense:** the read-through runs against the gene and cannot be counted to it, so no
+  inflation is possible and what remains is uncontaminated.
+
+  *The consequence for the other open question:* the residual that survived full subtraction appears
+  ONLY at same-sense sites. A real cis effect would not track orientation that way, since a provirus
+  can perturb a neighbour whichever way it points. Incomplete correction is now the better-supported
+  reading of IS10, IS11 and IS03.
+
+- **THE FLOOR WAS COUNTING DROPLETS, NOT CELLS, and that was a bigger problem than its value.** A
+  junction read carries whatever barcode its droplet had; the cell table, the clone sizes, the
+  detection model and every completeness figure restrict to Cell Ranger's CALLED barcodes. So the
+  threshold was applied to one quantity and read as another. Relaxing to two cells exposed it: three
+  of the four positions admitted arrived in the site table with **one** cell and one with **none**,
+  because each was one real cell plus one empty droplet. `call_sites()` and `cluster_support()` now
+  take the called-barcode table and count called cells; `cluster_support.csv` reports `barcodes`
+  beside `cells` so the gap is a column rather than a surprise.
+- **The floor is now `>=2 cells and >=2 UMIs`, chosen from the trade-off rather than argued.** The
+  old value rested on one argument about one cluster (chr11:69,817,658 has 8 of 10 UMIs in a single
+  barcode) which is a statement about that cluster, not about a threshold. What settles a threshold is
+  gain against loss at every value, and the loss needs a quality axis. The axis is **vector
+  transcript**: a cell carrying none cannot emit a read-through junction, so the share of a cluster's
+  cells carrying any measures whether it could be what it claims, measured per cell and independent of
+  the junction data. On called cells, at `min_umis = 2`:
+
+  | min_cells | sites | cells | mean vector share | single-tube | both channels |
+  |---|---|---|---|---|---|
+  | 1 | 19 | 996 | 0.89 | 3 | 15 |
+  | **2** | **17** | **994** | **0.87** | **1** | **14** |
+  | 3 | 14 | 988 | 0.85 | 1 | 12 |
+  | 4-6 | 13 | 985 | 0.86 | 1 | 11 |
+
+  No cliff, and relaxing *improves* mean vector share (0.85 -> 0.87) while adding no single-tube site;
+  both admissions are seen by both channels. So the relaxed value is the defensible one and the
+  evidence tier carries the difference. Tightening to 4 buys nothing.
+
+  `min_umis = 2` is **implied, not inert**: two called cells cannot share one molecule. The only
+  non-trivial setting would be 3, and the data rejects it sharply - at 3 the floor admitted the WORSE
+  of the two best marginal clusters and rejected the better. chr11:69,817,658 passes a 3-UMI floor on
+  10 UMIs in one cell of one tube (vector share 0.5); chr1:156,241,543 fails it on 2 UMIs across two
+  tubes and both channels with 2 of 2 cells vector-positive. Selecting molecules-in-one-cell over
+  cells-in-two-tubes is backwards.
+
+  **The report's prose no longer depends on the value.** The section reads the floor from
+  `IS_DEFAULTS` and the figures from `site_floor_curve.csv`, which now carries `mean_vector_share` and
+  `min_vector_share` per grid point, so changing the floor changes the text.
+- **`defensible` now requires clonality to be demonstrated, because the floor had been standing in
+  for it.** Once chrX cleared the relaxed floor directly, every flag that had excluded IS16 switched
+  off - not `pooled_only`, not `tsd_rescued`, not `flank_gated` - and it became defensible because the
+  THRESHOLD moved. Its three cells are all B0301 against that replicate's 46.8% share, *p* = 0.10,
+  which establishes nothing. `site_evidence()` now runs `replicate_confinement()` per site and
+  `defensible` requires *p* < 0.05. It costs nothing where it matters (every other defensible site
+  passes; IS13 at *p* = 2.8e-05 on 7 of 7) and removes exactly the one that should not have been in.
+  **The defensible count is 12 before and after the floor change** - which is the test of the fix.
+- **A floor change also revealed a lost denominator.** With chrX clearing the floor, rule C' promotes
+  nothing, and `tsd_rescued_clusters()` took an early return that skipped setting the candidate count
+  - so the driver printed "  orphan 5' junction(s) tested, 0 promoted" with the numbers blank. 0 of N
+  is only a statement with N beside it, and N went missing exactly in the case where it matters most.
+  Fixed; `tsd_chance_rate()` also now coerces an empty denominator to 0 rather than emitting
+  zero-length columns.
+- **Rule C' now promotes nothing, and that is the right state for it.** chrX:100,691,113 clears the
+  relaxed floor on its own, so the rule fires on no cluster in this run. It is kept, with its warrant
+  measured (2.05e-07 genome-wide, 5.4e-07 against the transcribed footprint), against the next run.
+- **IS05's confinement is explained, and it is not *cis*.** Matched differential expression - animal,
+  tube and depth matched, NOT cluster, since cluster is the mediator - gives **8 genes at Holm < 0.05
+  over 9,479 tested**. The up-regulated set is *Vwf*, *Clu*, *Clec11a*, *Selenom*, *Neo1*: the Vwf+
+  platelet-biased long-term HSC programme, which is coherent for a clone in a myeloproliferative model
+  rather than a grab-bag. **Nothing in +/-1 Mb survives** (21 of 45 window genes testable, best
+  *Dennd4a* at Holm-within-window 0.11), agreeing with the `cis_confound = FALSE` flag reached from
+  annotation alone.
+  *The split is the answer:* **4 of the 8 survive matching on cluster** (*Rnf17*, *Neo1*, *Selenom*,
+  *Vwf*) and 4 do not (*Clec11a*, *Clu*, *Plek*, *Egr3*). So the confinement is part cell-state - 42%
+  of IS05's cells sit in one cluster against a 24% background, and that cluster is Vwf-positive - and
+  part within-state. What it does NOT establish is direction; see the open list.
+  *A design note worth keeping:* `matched_de()` draws the control set ONCE and tests every gene
+  against it. Redrawing per gene adds sampling noise across genes and makes the multiplicity
+  correction wrong, because each test would be against a different background.
+
+- **ONE site is transcriptionally confined: IS05. Four other results were withdrawn getting there.**
+  The question was open since IS05's cells looked clustered on the HSC UMAP. Three successive
+  versions of the test gave three different answers, and the two wrong ones are recorded because the
+  errors are reusable.
+
+  *Version 1, tube-stratified null:* IS05 13.8, IS10 11.4, IS04 3.4, IS03 2.5, IS01 2.2 — five
+  "confined" sites. Wrong, because tubes are hashtag-multiplexed and every site here is
+  mono-replicate, so **every clone is perfectly confounded with its animal** and no tube stratum can
+  separate them. IS05 and IS10 are both B0304, 1,614 of ~20,500 called cells in Rx_4.
+
+  *Version 2, tube × animal × depth-decile:* IS05 6.5, IS10 5.1 (Holm 0.009 both); IS04 1.6, IS03
+  2.0, IS01 1.4 — **three results were animal effects.** Multiplicity would not have caught them:
+  IS04's Holm value under the tube null is 0.042 and clears 0.05. The stratum did.
+
+  *Version 3, excluding the shared B0304 cluster:* both survivors over-occupied one transcriptional
+  cluster, so the test was re-run with that cluster removed from member set and null pool alike.
+  **IS05 survives at z = 4.4 on 28 of its 48 cells (Holm 0.048); IS10 collapses from 5.1 to 1.2
+  (Holm 0.63).** IS10's enrichment WAS the shared cluster. It is demoted, and the
+  two-survivors-one-mouse worry resolves by one of them not being a finding.
+
+  **So: IS05 only.** Confined beyond its animal, its tube, its depth and the shared B0304 state; 28
+  cells after the exclusion, which is the denominator to quote. `cis_confound = FALSE` and its host
+  gene is absent from the PCA's variable features, so it is also the one site immune to the junction-
+  read artefact below.
+
+  *Two side notes.* IS02 — the largest clone, 137 HSC cells — sits at z = −0.3, indistinguishable
+  from its own animal at matched depth. State that as a fact about IS02; it is n = 1 for any claim
+  relating clone size to confinement. And B0304 as a whole IS enriched for itself (z = 47.7 with no
+  clone label) — which does **not** bear on the result, because the animal-stratified null draws from
+  B0304, so the animal effect is absorbed into the null by construction. That is why IS05's null rose
+  0.0018 → 0.0048 when the stratum changed. Measuring the animal effect outside the null confirms the
+  version-1 error and touches nothing else.
+
+  *And the ranking statistic was wrong in a smaller way.* It was `(e - n)/d + n`, the right statistic
+  plus a site-specific offset, and unreconstructable from its own printed inputs — two plausible
+  guesses give different winners. Now `excess_per_detection = (enrichment - null)/detection`, stated
+  in the table. Subtract first, then divide: the signal scales with d, the null does not. **It is NA
+  for IS10 (no fitted λ), so the survivors were never rankable against each other anyway.** Holm is
+  pre-registered and printed alone; Bonferroni was removed because Holm dominates it and showing both
+  at the one site where they differ hands the reader the decision after the fact.
+- **The junction-read *cis* artefact is large, cannot reach the clustering statistic, and is only
+  partly removable.** A junction read overlaps the host gene, so at an intragenic same-sense site the
+  junction molecules are counted as host-gene UMIs in exactly that site's cells. Against
+  animal/tube/depth-matched controls (NOT cluster-matched — cluster is a mediator):
+
+  | site | host gene | no adjustment | genome-channel UMIs removed | all junction UMIs removed | in the PCA? |
+  |---|---|---|---|---|---|
+  | IS10 | *Gm35330* | +2.53 | +2.28 | **+1.70** (1e-06) | no |
+  | IS11 | *Stau2* | +3.02 | +2.66 | **+2.42** (5e-07) | yes |
+  | IS04 | *Abhd17c* | +1.33 | +1.06 | **+0.55** (*p* = 0.9) | no |
+  | IS03 | *Hells* | +1.12 | +1.06 | **+0.84** (3e-07) | yes |
+
+  **It cannot explain any clustering**, and the reason is one column: the PCA is built on 3,000
+  variable features and the relevant host genes are not among them. Check membership before
+  rebuilding a counts matrix — it is cheaper and more direct.
+
+  **IS04's effect is entirely artefactual** (p = 0.9 after full subtraction). The other three survive
+  at 0.8–2.4 log2, and that is where this data stops: the clip table holds only molecules whose soft
+  clip was long enough to extract, so a read-through below that threshold is counted by Cell Ranger
+  and not subtracted. Genuine cis effect and incomplete correction are **not separable here**, because
+  the artefact and the label are the same event — every cell of a site is by definition a cell that
+  yielded a junction molecule there. One route is closed for good: 270 UMIs against a median
+  nCount_RNA of 13,394 is under 0.01% of library size, so no *other* gene is affected.
+- **The *Klf6* hypothesis is unsupported, and the PC-loading screen that produced it is deleted.**
+  IS10 sits 239 kb from *Klf6* — enhancer range, haematopoietic TF, MPN-to-AML model. Matched DE
+  without cluster matching gives **+0.26 log2, raw *p* = 0.039, Holm 0.11 across the 6 genes in ±1 Mb
+  that are detectable** — below the 0.3 log2 bar and not significant corrected. The off-chromosome
+  control is +0.01 at *p* = 0.81, so **the design resolves nothing below ~0.2–0.3 log2**; quote that,
+  not the point estimate. The window scan's only Holm-significant gene is *Gm35330*, IS10's own host
+  gene, i.e. the artefact. So nothing in reach is a clean candidate — and nothing needs to be, since
+  IS10's confinement did not survive version 3.
+  *An earlier run of this test matched on cluster and returned +0.09, p = 0.36, with the control at
+  −0.33, p = 0.06.* Cluster is the mediator; matching on it bounds only the effect net of state.
+  Dropping it raised the estimate and cleaned the control, which is the signature of having
+  conditioned on a mediator. `cis_loading_check()` is removed: PCs are global, and it selected the
+  gene it then tested.
+- **The splice generalisation, reported as the statistic that has power rather than the one that
+  does not.** Zero of 28 discovery clusters sit on an exon end with a GT donor — and that is **not
+  evidence**, because 0.28% of the genome lies within ±5 bp of an exon end, so 0.08 is expected and a
+  zero is what chance predicts. This family cannot be powered at 28 clusters (a bare GT scan expects
+  ~1.75 chance hits). The powered measurement runs the other way: **1 of the 4 five-prime orphans is
+  a splice artefact**, *p* ≈ 0.01 for ≥1 against the same background. So the 5′ channel's exclusion
+  rests on mechanism plus a **measured contamination rate of roughly 1 in 4** — not on a measured
+  absence of phantoms in the trusted channels, which is unmeasurable at this scale. Run no further
+  variants. Nothing here has power over an unannotated donor.
+- **The chr19 fusion: three legs, not four, and they are not independent.** It was written up as
+  "four predictions, all of which held". Priced: the exon-boundary leg is load-bearing (*p* ≈ 0.003
+  for one position); **the "exactly one `AG|ATTC` in the vector contig" leg is worth nothing** — the
+  contig is 3,236 bp, so a 6-mer is expected 1.58 times counting both strands and P(≥1) = **0.79**;
+  the GT donor is a consistency check, since ~99% of introns begin GT given an exon end. It cannot be
+  strengthened either: all 32 reads carry exactly four bases beyond the junction, and four bases
+  cannot pin an acceptor in 3.2 kb. **And the two surviving sequence legs are not independent of each
+  other** — exon boundary and IS03-in-the-same-intron are both statements about position within
+  *Hells*. The independent leg is hashtag identity: 13 of 13 non-multiplet cells are B0303 against
+  that replicate's 0.382 share, *p* = 3.6e-06, using no annotation, alignment coordinate or sequence.
+
+  **The cell-level check came out the wrong way and is reported, not explained.** If these were
+  transcripts of the IS03 provirus, IS03's own channels should have labelled most of the same cells.
+  **Overlap is 1 of 14**, and only that one fusion cell carries any site label at all. The reading
+  that fits is that the fusion junction detects cells IS03's channels missed — consistent with IS03's
+  detection being too low for the ZTP — but that is an interpretation of a 13-cell discrepancy, and
+  "these are B0303 cells carrying something else at that locus" is not excluded. What it does settle
+  is narrower and sufficient: admitting the junction would have created a sixteenth clone out of a
+  transcript whose cells are almost all unlabelled, rather than double-counting IS03. **Bring this
+  one back.**
+- **The sub-clone fraction was quoted off a stale stratum.** §*The discriminator that uses detection
+  depth* said 0.105 against 0.493 at k = 2 and "a quarter to a third carry both". The depth variable
+  had been corrected to DISTINCT molecules and the prose had not: 0.105 is 12/114, the fingerprint of
+  the superseded `umis_three + umis_genomic` denominator, which pushed single-molecule cells into
+  k = 2. The table itself was already right. Corrected and now computed inline: **12 of 101, observed
+  0.119 against 0.424 expected, ratio 0.28 at k = 2; 0.44 against 0.64, ratio 0.69 at k = 3** — and
+  **at k = 4 it falls back to 0.11 on 9 cells**, which a dose-response cannot do and noise at that
+  count easily can. The prose had stopped at k = 3. Fisher at k = 2 is unchanged at *p* = 0.00056.
+  The honest range for the sub-clone fraction is a quarter to two-thirds on strata of 101, 16 and 9
+  cells, which leaves its size essentially unconstrained.
+- **`chrX:100,691,113` is IS16, admitted by a rule rather than by hand.** The floor is applied
+  WITHIN a discovery channel, so chrX failed at 2 cells in the 3′ channel while IS14 and IS15, which
+  reach 3 on the two discovery channels summed, passed. Pooling all three channels is not the fix:
+  the largest 5′ orphan here is the chr19 *Hells* fusion at 14 cells, and a pooled-across-everything
+  floor would admit it as a site larger than six real ones. **Rule C′** admits a sub-floor cluster
+  only when a 5′ junction supplies a 3′ partner at signed Δ = ±4 *whose sign agrees with the 3′
+  alignment's strand* (`strand_ok`, the same test `tsd_check()` applies) and the pooled count then
+  reaches the floor. The warrant is not that this rejects the *Hells* fusion — that is a consequence
+  of the rule, not its basis — but that a TSD is a signature of integrase 3′ processing and of
+  nothing else: splicing, mismapping and chimeric reads can each put two features 4 bp apart, none
+  can make the sign agree with the strand. And the specificity is computed, not asserted:
+  `tsd_chance_rate.csv` gives 2.05 × 10⁻⁷ expected chance admissions, from the genome read out of the
+  reference's own `.fai` (2.728 Gb), 28 discovery clusters, a 5 bp accepting window and 4 orphans
+  tested — and against the transcribed footprint rather than the whole genome, which is the honest
+  denominator since lentivirus prefers gene bodies, **5.4e-07** (the union of protein-coding gene
+  bodies is 1.04 Gb, 38% of this reference, so x2.6; it had been guessed at "5-10x, so ~1e-06", and
+  gene bodies are too large a share of the mouse genome for that).
+
+  **The sequence half is NOT independent confirmation and that claim is withdrawn.** `tsd_obs = 1`
+  says the duplicated span appears in every 5′ read — but those reads *align* to that span, so their
+  bases match the reference there by construction of a clean alignment. `tsd_three_way()` now
+  compares the 5′ clip's host tail, the 3′ clip's host head and the reference, which is the form
+  originally specified; it is still not independent evidence, because both clips align to the same
+  span and their agreement is the Δ = 4 relationship restated in bases. It is a check on the
+  pipeline — and a worthwhile one, since this analysis has had three coordinate bugs — not evidence
+  about biology. **IS16 rests on the coordinate relationship and its chance rate alone**, which still
+  clears at 5e-07, so the decision is unchanged. **IS16 is tier D and NOT defensible.** Its 3 cells are all
+  B0301, which is 46.8% of called cells in those tubes, so *p* = 0.10. C′ supports that an
+  integration happened, not that a clone exists.
+- **The 12.5% completeness ceiling is withdrawn.** It came from filling in detection at the ten
+  sites where the ZTP is degenerate with the MEDIAN of the six that fit — a model (detection is
+  exchangeable across sites), unstated, with no uncertainty, fitted on a sample selected for high
+  λ. Replaced by a regression of log λ on log mean vector expression, which is measured per cell
+  independently of the junction data. The slope is **1.04 ± 0.72** — proportionality, exactly what
+  the mechanism predicts, since a junction read is a read-through of the vector transcript — but
+  *p* = 0.22 and R² = 0.34 on six points, so the covariate is not distinguishable from no covariate.
+  The prediction intervals span two orders of magnitude and summed across sixteen sites put the
+  corrected count ABOVE the denominator (`ceiling_uninformative = TRUE`). **This data bounds
+  completeness from below only. Quote the 5.3% floor and no ceiling.**
+  *And Chao1 is not the alternative:* `min_cells = 3` discards every singleton and doubleton before
+  the site table exists, so f₁ = f₂ = 0 BY CONSTRUCTION and Chao1 and ACE are undefined rather than
+  biased. What this assay has that ecology does not is a measured detection process, so completeness
+  is reported stratified by clone size instead: P(discovered) = 1 − pbinom(`min_cells` − 1, N, d),
+  in `discovery_power.csv`. At d = 0.39 a clone of 3 is found 6% of the time, of 5 30%, of 10 82%,
+  of 20 99.5%. **So the sixteen sites are close to the complete set of large clones, and the 84%
+  unaccounted share needs no extra hypothesis** — a repertoire of thousands of small clones is
+  invisible here by arithmetic. Silent proviruses remain an equally consistent explanation; the FACS
+  mCherry⁺ fraction per animal still separates them.
 - **`chr19:38,932,385` is not an integration site — it is a spliced host-vector fusion.** Four
   predictions, all of which held. The junction sits on the LAST BASE of a *Hells* exon
   (`exon_end_dist = 0`), not near it. The intron after that base begins **GT**. The bases beyond the
@@ -638,16 +941,13 @@ junction, so they are listed under *Closed* with what each turned out to be.
   the splice junction detects cells IS03's own channels missed — independent evidence that IS03's
   per-cell detection is low, consistent with its clone size being inestimable.
   `chr19:38,932,221` (1 read, 1 cell) carries the same ATTC and is the same fusion, sub-threshold.
-- **`chrX:100,691,117` is the floor's one real casualty, and it is NOT settled.** Pooled across
-  channels it is **3 cells and 3 UMIs — it meets the `≥3 and ≥3` floor** — with a 3' partner at
-  100,691,113, signed delta **+4** (the TSD) at MAPQ 60 on both sides, found by a single-position
-  test rather than a scan. It is not called because the floor is applied *within* a discovery
-  channel and the 5' channel never contributes to calling. That is the same situation as IS14 and
-  IS15, which *are* called as `pooled_only` and which have no 5' junction at all. **But its
-  clonality is not established:** all 3 cells are B0301 singlets, spanning HSC and MNC, and with
-  B0301 at 46% of called cells in those tubes that gives *p* = 0.10. Three cells cannot establish a
-  clone. `orphan_evidence.csv` records the verdict as "candidate site, clonality untested", and
-  promoting it to IS16 is a human decision the pipeline deliberately does not make.
+- *(superseded by the IS16 entry above — kept because the reasoning that was WRONG here is worth
+  not repeating.)* This entry said chrX was "the same situation as IS14 and IS15, which are called".
+  It is not. IS14 and IS15 reach 3 cells on the two DISCOVERY channels summed; chrX reaches 3 only
+  by counting the 5′ channel, which is never allowed to call. The axis on which chrX looked stronger
+  (it has a TSD, they do not) is not the axis the floor uses, and arguing from the wrong axis is how
+  a hand-promotion nearly got made. Rule C′ admits it on the TSD explicitly, which is a different
+  and defensible thing.
 - **`chr14:62,948,717` is unsupported.** Four reads, intergenic, no soft clip at all (32M and 26M,
   both ending exactly at the junction), no 3' partner, and its 3 non-multiplet cells split across
   mice (2 of 3 in B0304, *p* = 0.49) — which a single clone cannot do.
@@ -717,7 +1017,7 @@ junction, so they are listed under *Closed* with what each turned out to be.
 | `scripts/slurm/analysis/integration-sites.sh` | the job. 1 h 49 m for the full five stages (job 35742986); the genome-mapped scan dominates. |
 | `scripts/slurm/setup/bwa-index.sh` | one-off index build, ~50 min |
 | `notebooks/integration-sites/integration-sites.qmd` | the report, registered in `_targets.R` |
-| `output/objects/integration-sites/*.csv` | 22 output tables plus `manifest.tsv`; `work/` holds the per-tube genomic cache, the called-barcode list and the hashtag calls |
+| `output/objects/integration-sites/*.csv` | 25 output tables plus `manifest.tsv`; `work/` holds the per-tube genomic cache, the called-barcode list and the hashtag calls. Three are new: `tsd_chance_rate.csv` (the warrant for rule C′), `detection_regression.csv` (λ predicted from vector expression, replacing the median imputation) and `discovery_power.csv` (completeness stratified by clone size) |
 | `data_hub/10x_resources/reference_additions/README.md` | contig derivation and verification — **outside git, not version controlled** |
 
 ```bash
