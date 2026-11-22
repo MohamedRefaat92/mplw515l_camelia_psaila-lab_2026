@@ -1333,6 +1333,38 @@ ggplot(cells_long, aes(tube, reorder(label, cells, sum), fill = cells)) +
 
 # Limitations
 
+**Everything here depends on the vector contig being in the reference, and the ablation measures what
+that dependence is worth.** Re-running against the host genome alone removes the 3′ and 5′ channels by
+definition — they are *defined* by alignment to a contig the file no longer contains — and the cost
+falls almost entirely on corroboration rather than on detection:
+
+```{r genomic-ablation}
+#| echo: false
+abl_dir <- file.path(dirname(sites_dir), "integration-sites-genomic-ablation")
+abl <- readr::read_csv(file.path(abl_dir, "integration_sites.csv"), show_col_types = FALSE)
+full <- readr::read_csv(file.path(sites_dir, "integration_sites.csv"), show_col_types = FALSE)
+tibble::tibble(
+  quantity = c("sites called", "called by both channels", "tsd_pass"),
+  vector   = c(nrow(full),
+               sum(full$called_by == "both channels", na.rm = TRUE),
+               sum(full$tsd_pass, na.rm = TRUE)),
+  genomic  = c(nrow(abl),
+               sum(abl$called_by == "both channels", na.rm = TRUE),
+               sum(abl$tsd_pass, na.rm = TRUE))
+) %>%
+  DT::datatable(rownames = FALSE, options = list(dom = "t"))
+```
+
+**15 of 17 sites survive; 0 of 10 both-channel calls and 0 of 5 `tsd_pass` do.** Detection is nearly
+intact and every surviving call rests on one channel, with the TSD check gone entirely — which is the
+easier result to misread, because a site count that barely moves looks like a mild degradation. It is
+not: the evidence behind each call is what collapsed.
+
+That matters beyond this dataset, because a reference carrying the vector is the exception. Any
+already-aligned public dataset is in the `genomic` column, and the only route back is a terminus
+recovered from the reads themselves — the 3′ channel needs the terminus, not the whole contig. That
+work is in `projects/integration-site-pilot` and is not part of scarab.
+
 **Only intact proviruses are visible.** The junction filter requires a clean processed `CA`. Integrants
 with deleted or rearranged LTR ends present no such junction and are invisible here. For clonality
 that is arguably a feature, but it means site counts are a floor, not a census.
