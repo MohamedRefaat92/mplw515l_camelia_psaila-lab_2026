@@ -928,6 +928,23 @@ called. Only one of those cells is assigned to IS03, so this junction sees cells
 missed — independent evidence that its per-cell detection is low, consistent with its clone size
 being inestimable.
 
+**What that one-cell overlap does and does not mean.** `orphan_evidence.csv` now carries
+`cells_shared_with_site` and `share_of_orphan_cells` alongside `site_in_same_gene`, so the overlap is
+a number rather than a remark. It is reported and **not** used to decide anything, because the obvious
+rule — most of a fusion's cells should belong to the site it came from — would reject this case, where
+the share is 1 in 14. A low overlap means IS03's own per-cell detection is sparse, which is
+independently true and is why its clone size is inestimable. It does not mean these are different
+events; replicate confinement and the splice geometry are what establish that they are not.
+
+**And two things about the fusion are easy to state backwards.** The provirus *has* a target-site
+duplication — integrase made one — but it is not visible: the duplication lies at the insertion point
+inside the intron, and splicing removed that intron before sequencing, so `delta` is `NA` for want of
+an observable partner rather than a real one. And the fusion junction is a poor clone label even
+though it is perfectly heritable, because the vector acceptor is a **constant** position (875): the
+label is set by which host exon donates, not by where the provirus landed, so two independent
+proviruses anywhere in *Hells* splicing to 875 would give an identical junction. A fusion can label a
+clone, but only via its cell set, never via its sequence.
+
 **Two of those four legs are worth much less than this report previously claimed, and the sum is
 still decisive.** They were presented as "four predictions, all of which held"; two of them hold
 under chance alone.
